@@ -160,7 +160,7 @@ function PtrField({
 }) {
   return (
     <div className="flex items-start gap-2">
-      <span className="text-[11px] text-muted-foreground/70 font-sans w-12 shrink-0 mt-0.5">
+      <span className="text-xs text-muted-foreground/70 font-sans w-12 shrink-0 mt-0.5">
         {fieldLabel}
       </span>
       <div className="flex-1 min-w-0 bg-muted/40 rounded-md px-2 py-1.5 text-foreground/90 break-all">

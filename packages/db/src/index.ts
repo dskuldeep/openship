@@ -21,6 +21,7 @@ export {
   createServerRepo,
   createAnalyticsRepo,
   createTerminalSessionRepo,
+  createServiceTerminalSessionRepo,
   type User,
   type NewUser,
   type Session,
@@ -54,6 +55,18 @@ export {
   type TerminalSession,
   type NewTerminalSession,
   type TerminalExitReason,
+  type ServiceTerminalSession,
+  type NewServiceTerminalSession,
+  type BackupDestination,
+  type NewBackupDestination,
+  type BackupPolicy,
+  type NewBackupPolicy,
+  type BackupRun,
+  type NewBackupRun,
+  type BackupRestore,
+  type NewBackupRestore,
+  type BackupRunStatus,
+  type BackupRestoreStatus,
 } from "./repos";
 
 // ─── Drizzle operators (re-exported for convenience) ─────────────────────────

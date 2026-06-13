@@ -55,6 +55,32 @@ export {
   type NewTerminalSession,
   type TerminalExitReason,
 } from "./terminal-session.repo";
+export {
+  createServiceTerminalSessionRepo,
+  type ServiceTerminalSession,
+  type NewServiceTerminalSession,
+} from "./service-terminal-session.repo";
+export {
+  createCloudHandoffCodeRepo,
+  type HandoffUserData,
+  type HandoffCodeRow,
+} from "./cloud-handoff-code.repo";
+export {
+  createBackupDestinationRepo,
+  createBackupPolicyRepo,
+  createBackupRunRepo,
+  createBackupRestoreRepo,
+  type BackupDestination,
+  type NewBackupDestination,
+  type BackupPolicy,
+  type NewBackupPolicy,
+  type BackupRun,
+  type NewBackupRun,
+  type BackupRestore,
+  type NewBackupRestore,
+  type BackupRunStatus,
+  type BackupRestoreStatus,
+} from "./backup.repo";
 
 // ─── Convenience: pre-bound repos using the singleton db ─────────────────────
 
@@ -74,6 +100,14 @@ import { createServerRepo } from "./server.repo";
 import { createMailServerRepo } from "./mail-server.repo";
 import { createAnalyticsRepo } from "./analytics.repo";
 import { createTerminalSessionRepo } from "./terminal-session.repo";
+import { createServiceTerminalSessionRepo } from "./service-terminal-session.repo";
+import { createCloudHandoffCodeRepo } from "./cloud-handoff-code.repo";
+import {
+  createBackupDestinationRepo,
+  createBackupPolicyRepo,
+  createBackupRunRepo,
+  createBackupRestoreRepo,
+} from "./backup.repo";
 
 /**
  * Pre-bound repository instances using the singleton `db`.
@@ -100,4 +134,10 @@ export const repos = {
   mailServer: createMailServerRepo(db),
   analytics: createAnalyticsRepo(db),
   terminalSession: createTerminalSessionRepo(db),
+  serviceTerminalSession: createServiceTerminalSessionRepo(db),
+  cloudHandoffCode: createCloudHandoffCodeRepo(db),
+  backupDestination: createBackupDestinationRepo(db),
+  backupPolicy: createBackupPolicyRepo(db),
+  backupRun: createBackupRunRepo(db),
+  backupRestore: createBackupRestoreRepo(db),
 } as const;

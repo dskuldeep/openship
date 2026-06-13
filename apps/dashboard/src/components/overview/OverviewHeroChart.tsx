@@ -302,7 +302,7 @@ const OverviewHeroChart: React.FC<OverviewHeroChartProps> = ({
             </div>
             <div>
               <h4 className="text-sm font-semibold text-black">Agents</h4>
-              <p className="text-[11px] text-black/40">Environments</p>
+              <p className="text-xs text-black/40">Environments</p>
             </div>
           </div>
           {agentTrend !== 0 && (

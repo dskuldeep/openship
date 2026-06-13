@@ -26,7 +26,10 @@ import {
   type ResourceUsage,
   type ContainerStatus,
   type ResourceConfig,
+  type ShellOptions,
+  type ShellSession,
 } from "../types";
+import { PassThrough, Writable } from "node:stream";
 
 import {
   compileDockerfileToWorkspacePlan,
@@ -292,6 +295,7 @@ export class CloudRuntime implements MultiServiceRuntimeAdapter {
     "usage",
     "containerIp",
     "rollback",
+    "serviceShell",
   ]);
 
   private readonly client: Oblien;
@@ -1909,6 +1913,130 @@ fi`;
     return ((data as Record<string, unknown>).ip as string) ?? null;
   }
 
+  /**
+   * Open an interactive PTY shell inside an Oblien workspace. Powers
+   * the in-dashboard service terminal — see apps/api/src/modules/service-terminal/.
+   *
+   * Two-step Oblien API:
+   *   1. `rt.terminal.create({shell, cols, rows})` → registers a
+   *      terminal session in the workspace and returns its numeric id.
+   *   2. `rt.ws()` → opens a multiplexed WebSocket carrying binary
+   *      stdin/stdout (prefixed with the terminal id byte) plus JSON
+   *      control frames (resize, exit).
+   *
+   * We bridge that WS into the same ShellSession contract as
+   * SshExecutor and DockerRuntime so the upstream WS bridge in
+   * service-terminal.controller.ts is identical across runtimes.
+   *
+   * Note on workspace id: for the cloud runtime, `containerId` IS the
+   * workspace id (see how cloud.ts already passes containerId into
+   * `this.ws(containerId)` throughout this file).
+   */
+  async openServiceShell(
+    containerId: string,
+    opts?: ShellOptions,
+  ): Promise<ShellSession> {
+    const cols = clampShellWindow(opts?.cols, 80, 1, 1000);
+    const rows = clampShellWindow(opts?.rows, 24, 1, 500);
+    const shellPath = "/bin/sh"; // Oblien workspaces ship busybox; bash often unavailable
+
+    const ws = this.ws(containerId);
+    const rt = await ws.runtime();
+    const session = await rt.terminal.create({
+      shell: shellPath,
+      cols,
+      rows,
+    });
+    const terminalId = String(session.id);
+
+    // Open the multiplexed WS. Disable reconnect — the upstream bridge
+    // owns reconnect via its own xterm/usePtyConnection layer.
+    const wsConn = rt.ws({ reconnect: false });
+
+    const stdout = new PassThrough();
+    const stderr = new PassThrough(); // unused — Oblien's PTY merges streams
+    const closeListeners: Array<(code: number | null, signal?: string) => void> = [];
+    let closed = false;
+    const fireClose = (code: number | null, signal?: string) => {
+      if (closed) return;
+      closed = true;
+      try {
+        wsConn.close();
+      } catch {
+        /* already closed */
+      }
+      stdout.end();
+      stderr.end();
+      for (const cb of closeListeners) {
+        try {
+          cb(code, signal);
+        } catch {
+          /* listener bug shouldn't kill cleanup */
+        }
+      }
+    };
+
+    wsConn.onTerminalOutput((id, data) => {
+      if (id === terminalId) stdout.write(Buffer.from(data));
+    });
+    wsConn.onTerminalExit((id, code) => {
+      if (id === terminalId) fireClose(code ?? null);
+    });
+    wsConn.onClose(() => fireClose(null));
+    wsConn.onError(() => fireClose(null));
+
+    wsConn.connect();
+
+    const stdin = new Writable({
+      write: (chunk, _enc, cb) => {
+        try {
+          wsConn.writeTerminalInput(
+            terminalId,
+            chunk instanceof Buffer ? new Uint8Array(chunk) : chunk,
+          );
+          cb();
+        } catch (err) {
+          cb(err as Error);
+        }
+      },
+      final(cb) {
+        // Closing stdin ends the shell on Oblien's side.
+        try {
+          wsConn.close();
+        } catch {
+          /* already closed */
+        }
+        cb();
+      },
+    });
+
+    return {
+      stdin,
+      stdout,
+      stderr,
+      setWindow: (c, r) => {
+        const sc = clampShellWindow(c, 80, 1, 1000);
+        const sr = clampShellWindow(r, 24, 1, 500);
+        try {
+          wsConn.resizeTerminal(terminalId, sc, sr);
+        } catch {
+          /* socket may already be closing */
+        }
+      },
+      close: () => {
+        // Best-effort close on Oblien's side; the WS onClose handler
+        // fires the close listeners.
+        rt.terminal
+          .close(terminalId)
+          .catch(() => undefined)
+          .finally(() => fireClose(null));
+      },
+      onClose: (cb) => {
+        closeListeners.push(cb);
+      },
+    };
+  }
+
   // ── Compose / multi-service ────────────────────────────────────────────
 
   async ensureServiceGroup(config: {
@@ -2115,4 +2243,17 @@ fi`;
       throw new Error(`Command failed with exit code ${exitCode}${detail}`);
     }
   }
+}
+
+/** Clamp a terminal window dimension to a sane min/max with default. */
+function clampShellWindow(
+  value: number | undefined,
+  fallback: number,
+  min: number,
+  max: number,
+): number {
+  const n = Number.isFinite(value) ? Number(value) : fallback;
+  if (n < min) return min;
+  if (n > max) return max;
+  return Math.floor(n);
 }

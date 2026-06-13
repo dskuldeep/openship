@@ -20,6 +20,7 @@ import {
   Plus,
   Server,
   Mail,
+  DatabaseBackup,
 } from "lucide-react";
 import { signOut } from "@/lib/auth-client";
 import { useTheme } from "@/components/theme-provider";
@@ -44,6 +45,7 @@ const MAIN_ITEMS: NavItem[] = [
   { key: "home",         href: "/",             icon: LayoutDashboard },
   { key: "projects",     href: "/projects",     icon: FolderKanban },
   { key: "deployments",  href: "/deployments",  icon: Rocket },
+  { key: "backups",      href: "/backups",      icon: DatabaseBackup },
 ];
 
 /** Build nav sections dynamically */

@@ -17,6 +17,9 @@
     "clean": "rm -rf dist .turbo node_modules"
   },
   "dependencies": {
+    "@aws-sdk/client-s3": "^3.668.0",
+    "@aws-sdk/lib-storage": "^3.668.0",
+    "@aws-sdk/s3-request-presigner": "^3.668.0",
     "@repo/core": "workspace:*",
     "dockerode": "^4.0.9",
     "ignore": "^7.0.5",

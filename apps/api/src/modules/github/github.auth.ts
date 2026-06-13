@@ -21,8 +21,12 @@ import { APIError } from "better-auth/api";
 import { env } from "../../config/env";
 import { auth } from "../../lib/auth";
 import { TtlCache } from "../../lib/cache";
-import { getLocalGhToken } from "./github.local-auth";
-import type { GitHubInstallation, MappedAccount } from "./github.types";
+import { getLocalGhStatus, getLocalGhToken } from "./github.local-auth";
+import type {
+  GitHubConnectionState,
+  GitHubInstallation,
+  MappedAccount,
+} from "./github.types";
 
 // ─── Token cache ─────────────────────────────────────────────────────────────
 
@@ -229,67 +233,27 @@ export interface TokenOptions {
   userId: string;
   owner?: string;
   installationId?: number;
-  /** Use the user's personal OAuth token instead of installation token */
+  /** Legacy flag — preserved for callers that haven't migrated yet.
+   *  In the new dispatcher (`tokenFor`) the purpose is what matters,
+   *  not the token "kind" — so this is effectively ignored. */
   useUserToken?: boolean;
 }
 
 /**
- * Resolve the best available token for a GitHub API request.
+ * Resolve a GitHub token for a generic API call.
  *
- * Dispatches by per-user resolved auth mode:
- *   - "app"       → local-signed installation token → user OAuth fallback
- *                   (cloud-mode only — this IS api.openship.io)
- *   - "cloud-app" → cloud-minted installation token → no fallback
- *                   (self-hosted + cloud-connected — App creds live in cloud)
- *   - "oauth"     → user OAuth token only
- *   - "cli"       → user OAuth → gh CLI fallback
- *   - "token"     → static GITHUB_TOKEN env var
+ * **Thin shim over `tokenFor(userId, "local", ctx)`** — the single
+ * source of truth for token resolution. See `github.token.ts` for the
+ * full priority chain. Kept as a function so existing call sites
+ * (`githubFetch`, etc.) stay stable.
  */
 export async function resolveToken(opts: TokenOptions): Promise<string | null> {
-  const mode = await resolveGitHubAuthMode(opts.userId);
-
-  switch (mode) {
-    case "token":
-      return env.GITHUB_TOKEN ?? null;
-
-    case "app": {
-      if (opts.useUserToken) return getUserToken(opts.userId);
-      if (opts.owner) {
-        const instToken = await getInstallationToken(opts.userId, opts.owner, opts.installationId);
-        if (instToken) return instToken;
-      }
-      return getUserToken(opts.userId);
-    }
-
-    case "cloud-app": {
-      // Self-hosted: no App credentials locally. Proxy through cloud
-      // for an installation token. No OAuth fallback — cloud owns the
-      // OAuth identity too; if the cloud session is dead, treat as
-      // not connected and let the caller surface the right error.
-      if (!opts.owner) return null;
-      const { cloudGithubInstallationToken } = await import("../../lib/cloud-client");
-      const minted = await cloudGithubInstallationToken(opts.userId, {
-        installationId: opts.installationId,
-        owner: opts.owner,
-      });
-      return minted?.token ?? null;
-    }
-
-    case "oauth":
-      return getUserToken(opts.userId);
-
-    case "cli": {
-      const userToken = await getUserToken(opts.userId);
-      if (userToken) return userToken;
-      // Same suppression as getUserStatus - once the user clicks Disconnect
-      // on the cli source, every downstream resolveToken caller must respect
-      // it (otherwise webhooks / clones silently bypass the disconnect).
-      const { isGithubCliDisabled } = await import("../settings/settings.service");
-      const cliDisabled = await isGithubCliDisabled(opts.userId);
-      if (cliDisabled) return null;
-      return getLocalGhToken();
-    }
-  }
+  const { tokenFor } = await import("./github.token");
+  const r = await tokenFor(opts.userId, "local", {
+    owner: opts.owner,
+    installationId: opts.installationId,
+  });
+  return r?.token ?? null;
 }
 
 // ─── GitHub API fetch helper ─────────────────────────────────────────────────
@@ -435,6 +399,109 @@ export async function getUserStatus(userId: string) {
   } catch {
     return { connected: false as const, tokenSource: null };
   }
+}
+
+// ─── Canonical connection state (single source of truth) ────────────────────
+
+/**
+ * THE canonical GitHub connection state. Every place in the codebase that
+ * asks "is GitHub connected?", "which source is active?", or "is gh CLI
+ * available?" reads this. There is no other answer.
+ *
+ * What it does NOT return:
+ *   - `mode`/"saas-app"/"self-hosted" → that's `env.CLOUD_MODE` / `platform()`.
+ *     The global platform mode is already the source of truth for that
+ *     concept; this function doesn't duplicate it.
+ *   - `tokenSource`/"app"|"oauth"|"cli"|"token"|"cloud-app" → those are
+ *     INTERNAL token-strategy details of `resolveToken`. They don't belong
+ *     on the wire.
+ *
+ * Priority for `primary`:
+ *   1. Openship App when connected — safest (short-lived install tokens)
+ *   2. gh CLI when available — local builds only
+ *   3. null — nothing usable
+ */
+export async function getGitHubConnectionState(
+  userId: string,
+): Promise<GitHubConnectionState> {
+  const onSelfHosted = !env.CLOUD_MODE;
+
+  // ── Openship App side ──────────────────────────────────────────────
+  // In CLOUD_MODE the App is local-signed; in self-hosted+cloud-connected
+  // the App is cloud-proxied. Both flow through getUserStatus which
+  // already abstracts that.
+  //
+  // Tolerant of failure: when the user has a stale cloud session token
+  // but the cloud endpoint is unreachable (dev down, DNS, HTML 200
+  // captive page, etc.), getUserStatus may throw or return false.
+  // Either way, we just say "App not connected" and let gh CLI take
+  // over. The library page must NEVER 500 because cloud is offline.
+  let appConnected = false;
+  let appLogin: string | undefined;
+  let appAvatar: string | undefined;
+  let hasInstallations: boolean | undefined;
+  try {
+    const status = await getUserStatus(userId);
+    appConnected = status.connected && status.tokenSource !== "cli";
+    if (appConnected && status.connected) {
+      appLogin = status.login;
+      appAvatar = status.avatar_url;
+      // Cheap "has installations" lookup — needed by the dashboard to
+      // decide whether to offer "install on this org" vs "you're set".
+      try {
+        const installs = await getUserInstallations(userId, status);
+        hasInstallations = installs.length > 0;
+      } catch {
+        hasInstallations = undefined;
+      }
+    }
+  } catch {
+    // Cloud unreachable / OAuth fetch failed / network blip. App side
+    // is "not connected"; gh CLI fallback below still runs.
+    appConnected = false;
+  }
+
+  // ── gh CLI side ────────────────────────────────────────────────────
+  // Only meaningful on self-hosted. On the SaaS the binary isn't there.
+  // Single rule: `gh auth token` is valid → connected. `gh auth logout`
+  // is the durable way to disconnect. We do NOT consult any per-user
+  // suppression flag here — the user already said this is the rule:
+  // "if gh cli logged in, use it as source of truth."
+  let cliAvailable = false;
+  let cliLogin: string | undefined;
+  let cliAvatar: string | undefined;
+  if (onSelfHosted) {
+    const localStatus = await getLocalGhStatus();
+    if (localStatus.available) {
+      cliAvailable = true;
+      cliLogin = localStatus.login;
+      cliAvatar = localStatus.avatar_url;
+    }
+  }
+
+  // ── Resolve primary per the user-stated priority ───────────────────
+  const primary: GitHubConnectionState["primary"] = appConnected
+    ? "openship-app"
+    : cliAvailable
+      ? "gh-cli"
+      : null;
+
+  return {
+    sources: {
+      openshipApp: {
+        connected: appConnected,
+        login: appLogin,
+        avatarUrl: appAvatar,
+        hasInstallations,
+      },
+      ghCli: {
+        available: cliAvailable,
+        login: cliLogin,
+        avatarUrl: cliAvatar,
+      },
+    },
+    primary,
+  };
 }
 
 /**

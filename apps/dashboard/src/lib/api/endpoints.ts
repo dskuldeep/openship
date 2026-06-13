@@ -262,4 +262,47 @@ export const endpoints = {
     // protocol swap; see lib/api/terminal.ts buildTerminalWsUrl.
     wsPath: (serverId: string) => `terminal/ws/${serverId}`,
   },
+
+  /* ---------------------------------------------------------------- */
+  /*  Service terminal (xterm.js ↔ WS ↔ Docker exec OR Oblien shell) */
+  /* ---------------------------------------------------------------- */
+  serviceTerminal: {
+    ticket: "services/terminal/ticket",
+    wsPath: (serviceId: string) => `services/terminal/ws/${serviceId}`,
+  },
+
+  /* ---------------------------------------------------------------- */
+  /*  Backup destinations (per-user)                                  */
+  /* ---------------------------------------------------------------- */
+  backupDestinations: {
+    list: "backup-destinations",
+    create: "backup-destinations",
+    get: (id: string) => `backup-destinations/${id}`,
+    update: (id: string) => `backup-destinations/${id}`,
+    delete: (id: string) => `backup-destinations/${id}`,
+    preflight: (id: string) => `backup-destinations/${id}/preflight`,
+  },
+
+  /* ---------------------------------------------------------------- */
+  /*  Backups (policies + runs)                                       */
+  /* ---------------------------------------------------------------- */
+  backups: {
+    listPolicies: (projectId: string | number) =>
+      `projects/${projectId}/backup-policies`,
+    createPolicy: (projectId: string | number) =>
+      `projects/${projectId}/backup-policies`,
+    updatePolicy: (policyId: string) => `backup-policies/${policyId}`,
+    deletePolicy: (policyId: string) => `backup-policies/${policyId}`,
+    runNow: (policyId: string) => `backup-policies/${policyId}/run`,
+    listRuns: (projectId: string | number) =>
+      `projects/${projectId}/backup-runs`,
+    getRun: (runId: string) => `backup-runs/${runId}`,
+    protectRun: (runId: string) => `backup-runs/${runId}/protect`,
+    prepareRestore: (runId: string) => `backup-runs/${runId}/restore/prepare`,
+    applyRestore: (restoreId: string) =>
+      `backup-restores/${restoreId}/apply`,
+    cancelRestore: (restoreId: string) =>
+      `backup-restores/${restoreId}/cancel`,
+    getRestore: (restoreId: string) => `backup-restores/${restoreId}`,
+  },
 } as const;

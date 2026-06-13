@@ -9,7 +9,28 @@ import DeploymentProcessing from "@/components/import-project/DeploymentProcessi
 import ComposeDeploymentProcessing from "@/components/import-project/ComposeDeploymentProcessing";
 import BuildSkeleton from "@/components/import-project/BuildSkeleton";
 import { useAuth } from "@/context/AuthContext";
+import { useGitHub } from "@/context/GitHubContext";
+import { useModal } from "@/context/ModalContext";
+import { DeployCredentialModal } from "@/components/deployments/DeployCredentialModal";
+import { usePlatform } from "@/context/PlatformContext";
 import { Rocket, ArrowLeft, Home } from "lucide-react";
+
+/**
+ * Error codes that mean "the deploy couldn't get a clone token for the
+ * repo's owner". Throwing these from the backend currently lands as a
+ * toast + a 'failed' build screen. This module catches those codes and
+ * opens DeployCredentialModal so the user gets actual recovery options
+ * instead of a dead-end.
+ *
+ * See apps/api/src/modules/deployments/preflight.ts and
+ * apps/api/src/modules/github/github.token.ts for the throw sites.
+ */
+const CLONE_TOKEN_ERROR_CODES = new Set([
+  "GITHUB_APP_INSTALLATION_REQUIRED",
+  "GITHUB_CLI_REMOTE_BUILD_REJECTED",
+  "GITHUB_REMOTE_TOKEN_REQUIRED",
+  "GITHUB_TOKEN_REQUIRED",
+]);
 
 const BuildPage: React.FC = () => {
   const params = useParams();
@@ -17,9 +38,15 @@ const BuildPage: React.FC = () => {
   const router = useRouter();
   const { isLoggedIn } = useAuth();
   const deploymentId = params.id as string;
-  const { state, config, connectToBuild, loadBuildSession, redeploy } = useDeployment();
+  const { state, config, connectToBuild, loadBuildSession, redeploy, updateConfig } = useDeployment();
+  const { installUrl, state: githubState } = useGitHub();
+  const { selfHosted } = usePlatform();
+  const { showModal, hideModal } = useModal();
   const initializedDeploymentRef = useRef<string | null>(null);
   const [notFound, setNotFound] = useState(false);
+  /** Ref tracking which (deploymentId × errorCode) tuple already opened
+   *  the modal — prevents reopening on every re-render. */
+  const shownModalRef = useRef<string | null>(null);
 
   const loggedInRef = useRef(false);
   useEffect(() => {
@@ -90,6 +117,70 @@ const BuildPage: React.FC = () => {
       handleRedeploy();
     }
   }, [searchParams, handleRedeploy]);
+
+  // ── Clone-credential recovery modal ─────────────────────────────────
+  // When the build fails because no GitHub clone token could be minted
+  // for the repo's owner, surface DeployCredentialModal so the user can
+  // install the App / paste a PAT / switch to local build / use their
+  // GitHub session instead of staring at a "Deployment Failed" toast
+  // with no next step.
+  useEffect(() => {
+    if (!state.deploymentFailed || !state.errorCode) return;
+    if (!CLONE_TOKEN_ERROR_CODES.has(state.errorCode)) return;
+
+    // De-dupe — same deployment + same code shouldn't reopen the modal
+    // on every state tick.
+    const key = `${deploymentId}:${state.errorCode}`;
+    if (shownModalRef.current === key) return;
+    shownModalRef.current = key;
+
+    let modalId = "";
+    modalId = showModal({
+      customContent: (
+        <DeployCredentialModal
+          trigger="build-fail"
+          owner={config.owner || "this repo"}
+          installUrl={installUrl ?? null}
+          projectId={config.projectId ?? null}
+          deployTarget={config.deployTarget}
+          buildStrategy={config.buildStrategy}
+          selfHosted={selfHosted}
+          ghCliAvailable={!!githubState?.sources.ghCli.available}
+          onChoice={(choice) => {
+            if (choice.kind === "build-local") {
+              updateConfig({ buildStrategy: "local" });
+              hideModal(modalId);
+              void handleRedeploy();
+            } else if (choice.kind === "install-app") {
+              // App popup closed; redeploy lets the backend re-check.
+              hideModal(modalId);
+              void handleRedeploy();
+            } else {
+              // add-token (navigated away) or dismiss — just close.
+              hideModal(modalId);
+            }
+          }}
+          onDismiss={() => hideModal(modalId)}
+        />
+      ),
+      maxWidth: "640px",
+    });
+  }, [
+    state.deploymentFailed,
+    state.errorCode,
+    deploymentId,
+    config.owner,
+    config.deployTarget,
+    config.buildStrategy,
+    config.projectId,
+    installUrl,
+    githubState,
+    selfHosted,
+    showModal,
+    hideModal,
+    updateConfig,
+    handleRedeploy,
+  ]);
 
   if (notFound) {
     return (

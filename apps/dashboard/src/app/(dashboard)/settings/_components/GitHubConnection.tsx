@@ -14,14 +14,15 @@ import {
 import { useGitHub } from "@/context/GitHubContext";
 import { useCloud } from "@/context/CloudContext";
 import { useModal } from "@/context/ModalContext";
+import { usePlatform } from "@/context/PlatformContext";
 import { SettingsSection } from "./SettingsSection";
 
 export function GitHubConnection() {
   const {
+    state,
     connected,
     connecting,
     loading,
-    sources,
     userLogin,
     accounts,
     connect,
@@ -35,11 +36,7 @@ export function GitHubConnection() {
   // don't require cloud.
   const { connected: cloudConnected, startConnect: startCloudConnect } = useCloud();
   const { showModal, hideModal } = useModal();
-
-  // `sources` is populated by the backend for ANY self-hosted mode (cli
-  // OR cloud-app). When present, we render a separate gh CLI mini-card
-  // below the App card so the user can see both options independently.
-  const isSelfHosted = !!sources;
+  const { selfHosted: isSelfHosted } = usePlatform();
 
   const promptDisconnect = (
     source: "oauth" | "cli" | "all",
@@ -214,20 +211,12 @@ export function GitHubConnection() {
           local-only escape hatch.                                         */}
       {isSelfHosted && (
         <GhCliCard
-          available={sources!.cli.available}
-          suppressed={sources!.cli.suppressed}
-          login={sources!.cli.login}
-          avatarUrl={sources!.cli.avatarUrl}
-          active={sources!.active === "cli"}
+          available={state.sources.ghCli.available}
+          login={state.sources.ghCli.login}
+          avatarUrl={state.sources.ghCli.avatarUrl}
+          active={state.primary === "gh-cli"}
           onConnect={() => connect("cli")}
-          connecting={connecting && !sources!.cli.available}
-          onDisconnect={() =>
-            promptDisconnect(
-              "cli",
-              "gh CLI",
-              "Openship will stop using `gh auth token` even if it's logged in. Your gh config on this machine is left untouched.",
-            )
-          }
+          connecting={connecting && !state.sources.ghCli.available}
         />
       )}
     </>
@@ -244,25 +233,21 @@ export function GitHubConnection() {
  */
 function GhCliCard(props: {
   available: boolean;
-  suppressed: boolean;
   login?: string;
   avatarUrl?: string;
   active: boolean;
   onConnect: () => void;
   connecting: boolean;
-  onDisconnect: () => void;
 }) {
-  const { available, suppressed, login, avatarUrl, active, onConnect, connecting, onDisconnect } = props;
+  const { available, login, avatarUrl, active, onConnect, connecting } = props;
   return (
     <SettingsSection
       icon={Terminal}
       title="gh CLI"
       description={
-        suppressed
-          ? "Disabled — Openship is ignoring `gh auth token` on this machine."
-          : available && login
-            ? `Logged in as @${login}`
-            : "Optional local-build fallback for repos outside your App installations"
+        available && login
+          ? `Logged in as @${login}`
+          : "Optional local-build fallback for repos outside your App installations"
       }
       iconBg="bg-foreground/5"
       iconColor="text-foreground"
@@ -302,7 +287,7 @@ function GhCliCard(props: {
         {/* Active-source warning — remote deploys get refused.
             Fires when CLI is the ONLY source (no cloud connection).  */}
         {active && (
-          <p className="text-[11px] text-amber-600 dark:text-amber-400">
+          <p className="text-sm text-amber-600 dark:text-amber-400 leading-relaxed">
             <span className="font-medium">gh CLI is the active source.</span>{" "}
             Deploys to remote servers will be refused — connect the Openship App
             or set a per-project clone token to deploy to remote targets.
@@ -314,33 +299,39 @@ function GhCliCard(props: {
             personal forks, side projects, etc). Remote builds still
             route through the App regardless. */}
         {!active && available && (
-          <p className="text-[11px] text-muted-foreground/70">
-            <ShieldCheck className="size-3 inline-block align-text-bottom mr-1" />
+          <p className="text-sm text-muted-foreground leading-relaxed">
+            <ShieldCheck className="size-3.5 inline-block align-text-bottom mr-1" />
             Openship App is the primary source. gh CLI fills in for{" "}
-            <span className="text-foreground/80">local builds</span> against
+            <span className="text-foreground font-medium">local builds</span> against
             repos outside your App installations.
           </p>
         )}
         {/* CLI not yet authed but App is connected — explain why
             setting up gh CLI is still useful. */}
-        {!active && !available && !suppressed && (
-          <p className="text-[11px] text-muted-foreground/70">
-            Optional. Run <code className="px-1 py-0.5 rounded bg-muted/50 text-foreground/80">gh auth login</code> on
-            this machine to enable local-build clones of repos outside your App
-            installations. Remote deploys always route through the App.
+        {!active && !available && (
+          <p className="text-sm text-muted-foreground leading-relaxed">
+            Optional. Run{" "}
+            <code className="px-1.5 py-0.5 rounded bg-muted/60 text-foreground font-mono text-xs">
+              gh auth login
+            </code>{" "}
+            on this machine to enable local-build clones of repos outside your
+            App installations. Remote deploys always route through the App.
           </p>
         )}
 
-        {/* Action button */}
+        {/* Action / hint row.
+            Connected → terminal instruction for the durable disconnect
+            (`gh auth logout`). Not connected → button that triggers the
+            connect flow (device flow / terminal instruction). */}
         <div className="flex items-center gap-2">
           {available ? (
-            <button
-              onClick={onDisconnect}
-              className="inline-flex items-center gap-1.5 px-3 py-1.5 text-xs font-medium text-red-600 hover:text-red-700 bg-red-500/5 hover:bg-red-500/10 rounded-lg border border-red-500/15 hover:border-red-500/25 transition-colors"
-            >
-              <Unplug className="size-3.5" />
-              Disconnect
-            </button>
+            <p className="text-sm text-muted-foreground leading-relaxed">
+              To disconnect, run{" "}
+              <code className="px-1.5 py-0.5 rounded bg-muted/60 text-foreground font-mono text-xs">
+                gh auth logout
+              </code>{" "}
+              in your terminal.
+            </p>
           ) : (
             <button
               onClick={onConnect}

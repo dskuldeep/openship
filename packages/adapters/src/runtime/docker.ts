@@ -34,7 +34,23 @@ import type {
   LogCallback,
   ContainerInfo,
   ResourceUsage,
+  ShellOptions,
+  ShellSession,
 } from "../types";
+import { PassThrough, Writable } from "node:stream";
+
+/** Clamp a terminal window dimension to a sane min/max with default. */
+function clampShellWindow(
+  value: number | undefined,
+  fallback: number,
+  min: number,
+  max: number,
+): number {
+  const n = Number.isFinite(value) ? Number(value) : fallback;
+  if (n < min) return min;
+  if (n > max) return max;
+  return Math.floor(n);
+}
 import type { Feature, SystemLog } from "../system/types";
 
 import type {
@@ -181,6 +197,7 @@ export class DockerRuntime implements RuntimeAdapter {
     "usage",
     "containerIp",
     "rollback",
+    "serviceShell",
   ]);
 
   /** Underlying dockerode instance - exposed for advanced usage */
@@ -1095,6 +1112,148 @@ export class DockerRuntime implements RuntimeAdapter {
       if (net.IPAddress) return net.IPAddress;
     }
     return null;
+  }
+
+  /**
+   * Open an interactive PTY shell inside a deployed container. Powers
+   * the in-dashboard service terminal — see apps/api/src/modules/service-terminal/.
+   *
+   * Wire-up: dockerode's `container.exec({Tty: true, AttachStdin: true,
+   * AttachStdout: true, AttachStderr: true})` returns an Exec handle.
+   * Starting it with `{hijack: true, stdin: true}` gives a single bi-
+   * directional Duplex carrying TTY bytes in both directions (when Tty
+   * is true, stderr is merged into stdout — exactly what xterm expects).
+   *
+   * The returned ShellSession matches SshExecutor.openShell so the
+   * websocket bridge in service-terminal.controller.ts is identical
+   * across Docker + Cloud + SSH callers.
+   */
+  async openServiceShell(
+    containerId: string,
+    opts?: ShellOptions,
+  ): Promise<ShellSession> {
+    const container = this.docker.getContainer(containerId);
+    const cols = clampShellWindow(opts?.cols, 80, 1, 1000);
+    const rows = clampShellWindow(opts?.rows, 24, 1, 500);
+    const term = opts?.term || "xterm-256color";
+
+    // Probe shell availability: prefer bash, fall back to sh. Both
+    // are safe to invoke as `cmd -c env-prefix exec target-shell` so
+    // the chosen shell ends up as PID 1 of the exec (clean exit
+    // semantics — closing stdin from the WS terminates the shell).
+    const inspect = await container.inspect().catch(() => null);
+    if (!inspect?.State.Running) {
+      throw new Error(
+        `Container ${containerId} is not running (status: ${inspect?.State.Status ?? "unknown"})`,
+      );
+    }
+
+    const exec = await container.exec({
+      AttachStdin: true,
+      AttachStdout: true,
+      AttachStderr: true,
+      Tty: true,
+      Cmd: ["/bin/sh", "-lc", "exec $(command -v bash || echo /bin/sh)"],
+      Env: [`TERM=${term}`],
+    });
+
+    // `hijack: true` lifts the underlying TCP connection out of HTTP
+    // and gives us a raw Duplex. With Tty:true the stream carries the
+    // PTY bytes without dockerode's multiplexing frame header.
+    const duplex = (await exec.start({
+      hijack: true,
+      stdin: true,
+      Tty: true,
+    })) as import("node:stream").Duplex;
+
+    // Set the initial window. Dockerode's resize() POSTs
+    // /exec/{id}/resize?h={rows}&w={cols}. Safe to call before any
+    // data flows.
+    try {
+      await exec.resize({ h: rows, w: cols });
+    } catch {
+      // ignore — the shell will still work at its default size
+    }
+
+    const stdout = new PassThrough();
+    const stderr = new PassThrough();
+    duplex.on("data", (chunk: Buffer) => stdout.write(chunk));
+    duplex.on("end", () => {
+      stdout.end();
+      stderr.end();
+    });
+    duplex.on("error", () => {
+      stdout.end();
+      stderr.end();
+    });
+
+    const stdin = new Writable({
+      write(chunk, _enc, cb) {
+        duplex.write(chunk, (err) => cb(err ?? undefined));
+      },
+      final(cb) {
+        try {
+          duplex.end();
+        } catch {
+          // already ended
+        }
+        cb();
+      },
+    });
+
+    const closeListeners: Array<(code: number | null, signal?: string) => void> = [];
+    let closed = false;
+    const fireClose = (code: number | null, signal?: string) => {
+      if (closed) return;
+      closed = true;
+      for (const cb of closeListeners) {
+        try {
+          cb(code, signal);
+        } catch {
+          /* listener bug shouldn't kill cleanup */
+        }
+      }
+    };
+
+    duplex.on("close", () => {
+      // Best-effort exit-code lookup. exec.inspect() returns the code
+      // for a finished exec; null/undefined means we couldn't reach
+      // dockerd in time (network blip, container gone) — surface as -1.
+      exec
+        .inspect()
+        .then((info) => fireClose(info.ExitCode ?? null))
+        .catch(() => fireClose(null));
+    });
+
+    return {
+      stdin,
+      stdout,
+      stderr,
+      setWindow: (c, r) => {
+        const sc = clampShellWindow(c, 80, 1, 1000);
+        const sr = clampShellWindow(r, 24, 1, 500);
+        // resize() returns a promise we deliberately ignore — the WS
+        // bridge calls this on every resize event, swallowing the
+        // promise prevents an unhandled rejection if the exec has
+        // already exited.
+        void exec.resize({ h: sr, w: sc }).catch(() => undefined);
+      },
+      close: (_signal?: string) => {
+        try {
+          duplex.end();
+        } catch {
+          /* already ended */
+        }
+        try {
+          duplex.destroy();
+        } catch {
+          /* already destroyed */
+        }
+      },
+      onClose: (cb) => {
+        closeListeners.push(cb);
+      },
+    };
   }
 
   // ── Compose / multi-service ────────────────────────────────────────────

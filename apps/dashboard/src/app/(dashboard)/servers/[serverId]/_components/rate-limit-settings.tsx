@@ -359,7 +359,7 @@ export function RateLimitSettings({ serverId }: { serverId: string }) {
                 onChange={(e) => handleRpsChange(e.target.value)}
                 className="mt-1.5 w-full rounded-lg border border-border/60 bg-background px-3 py-2 text-[13px] text-foreground outline-none transition-colors focus:border-primary/50"
               />
-              <p className="mt-1 text-[11px] text-muted-foreground">
+              <p className="mt-1 text-sm text-muted-foreground">
                 {useAutomaticBurst
                   ? `Burst is calculated automatically: ${effectiveBurst}`
                   : `Custom burst override is active: ${draftBurst}`}
@@ -388,7 +388,7 @@ export function RateLimitSettings({ serverId }: { serverId: string }) {
                   <div className="flex items-center justify-between gap-3">
                     <div>
                       <p className="text-[12px] font-medium text-foreground">Burst mode</p>
-                      <p className="mt-0.5 text-[11px] text-muted-foreground">
+                      <p className="mt-0.5 text-sm text-muted-foreground">
                         Auto keeps burst in sync with requests per second. Manual lets you override it.
                       </p>
                     </div>
@@ -413,7 +413,7 @@ export function RateLimitSettings({ serverId }: { serverId: string }) {
                       onChange={(e) => setDraftBurst(Math.max(0, Number.parseInt(e.target.value, 10) || 0))}
                       className="mt-1.5 w-full rounded-lg border border-border/60 bg-background px-3 py-2 text-[13px] text-foreground outline-none transition-colors focus:border-primary/50 disabled:cursor-not-allowed disabled:opacity-60"
                     />
-                    <p className="mt-1 text-[11px] text-muted-foreground">
+                    <p className="mt-1 text-sm text-muted-foreground">
                       Extra requests queued with nodelay.
                     </p>
                   </div>
@@ -425,7 +425,7 @@ export function RateLimitSettings({ serverId }: { serverId: string }) {
               <label className="text-[12px] font-medium text-muted-foreground uppercase tracking-wider">
                 Whitelisted IPs
               </label>
-              <p className="mt-0.5 text-[11px] text-muted-foreground">
+              <p className="mt-0.5 text-sm text-muted-foreground">
                 These IPs bypass rate limiting. Loopback (127.0.0.1, ::1) is always whitelisted.
               </p>
 

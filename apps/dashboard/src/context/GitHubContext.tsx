@@ -12,7 +12,6 @@ import { githubApi } from "@/lib/api";
 import { endpoints } from "@/lib/api/endpoints";
 import { getApiBaseUrl } from "@/lib/api/client";
 import { openAuthWindow } from "@/utils/authWindow";
-import { usePlatform } from "@/context/PlatformContext";
 
 /* ── Types ────────────────────────────────────────────────────────── */
 
@@ -51,26 +50,38 @@ export interface GitHubRepo {
   source?: "app" | "cli" | "both";
 }
 
-export type GitHubMode = "cloud" | "desktop" | "cli" | "token";
-
 /**
- * Per-source snapshot from the API. Only populated in cli mode. Lets the
- * settings UI render the Openship App and gh CLI panels independently with
- * their own connect/disconnect buttons.
+ * Canonical GitHub connection state from the backend. Mirrors
+ * `GitHubConnectionState` in apps/api/src/modules/github/github.types.ts —
+ * the single source of truth for "is GitHub connected? which source is
+ * primary?". No `mode` field: the global platform mode lives in
+ * PlatformContext (`selfHosted`).
  */
-export interface GitHubSources {
-  oauth: { connected: boolean; login?: string; avatarUrl?: string };
-  cli: { available: boolean; suppressed: boolean; login?: string; avatarUrl?: string };
-  active: "oauth" | "cli" | null;
+export interface GitHubConnectionState {
+  sources: {
+    openshipApp: {
+      connected: boolean;
+      login?: string;
+      avatarUrl?: string;
+      hasInstallations?: boolean;
+    };
+    ghCli: {
+      available: boolean;
+      login?: string;
+      avatarUrl?: string;
+    };
+  };
+  primary: "openship-app" | "gh-cli" | null;
 }
 
 interface GitHubContextValue {
-  /* Connection */
+  /** Canonical GitHub connection state. Read this for anything connection-related. */
+  state: GitHubConnectionState;
+  /** Derived: `state.primary !== null`. Provided as a convenience for the
+   *  many existing call sites that just need a "is anything connected" check. */
   connected: boolean;
   connecting: boolean;
   loading: boolean;
-  mode: GitHubMode;
-  sources: GitHubSources | null;
   /**
    * Initiate a GitHub connection. `source` discriminates which dual-source
    * card was clicked in cli mode — "oauth" forces the Openship App install
@@ -117,67 +128,70 @@ interface GitHubProviderProps {
   initialData?: any;
 }
 
+const EMPTY_STATE: GitHubConnectionState = {
+  sources: {
+    openshipApp: { connected: false },
+    ghCli: { available: false },
+  },
+  primary: null,
+};
+
 export function GitHubProvider({ children, initialData }: GitHubProviderProps) {
-  const { setSelfHosted } = usePlatform();
-  const [connected, setConnected] = useState(!!initialData?.status?.connected);
+  // Note: setSelfHosted is no longer driven from this context — the
+  // global platform mode is owned by PlatformContext and read from
+  // env.CLOUD_MODE during the initial dashboard layout. We deliberately
+  // don't shadow it here.
+  const [state, setState] = useState<GitHubConnectionState>(
+    initialData?.state ?? EMPTY_STATE,
+  );
   const [connecting, setConnecting] = useState(false);
   const [loading, setLoading] = useState(!initialData);
-  
-  // Resolve the initial mode correctly.
-  // - "app"       (cloud-mode SaaS holds App creds)        → "cloud"
-  // - "cloud-app" (self-hosted proxies through openship.io) → "cloud"
-  //   Same UX: managed by Openship Cloud, installations list, install URL.
-  //   The distinction matters server-side (where the JWT gets signed) but
-  //   the dashboard renders identically.
-  const initialMode = initialData?.mode === "app" || initialData?.mode === "cloud-app" ? "cloud" :
-                      initialData?.mode === "cli" ? "cli" :
-                      initialData?.mode === "token" ? "token" :
-                      initialData?.mode === "oauth" ? "desktop" :
-                      (initialData?.mode || "cloud");
 
-  const [mode, setMode] = useState<GitHubMode>(initialMode as GitHubMode);
-  const [sources, setSources] = useState<GitHubSources | null>(initialData?.sources ?? null);
   const [cliAction, setCliAction] = useState<CliAction | null>(null);
   const [accounts, setAccounts] = useState<GitHubAccount[]>(initialData?.accounts || []);
-  const [userLogin, setUserLogin] = useState(initialData?.status?.login || "");
-  const [selectedOwner, setSelectedOwnerState] = useState(initialData?.status?.login || "");
+  const [userLogin, setUserLogin] = useState(
+    initialData?.state?.sources?.openshipApp?.login ||
+      initialData?.state?.sources?.ghCli?.login ||
+      "",
+  );
+  const [selectedOwner, setSelectedOwnerState] = useState(userLogin);
   const [repos, setRepos] = useState<GitHubRepo[]>(initialData?.repos || []);
   const [loadingRepos, setLoadingRepos] = useState(false);
   const [installUrl, setInstallUrl] = useState<string | null>(initialData?.installUrl || null);
   const initRef = useRef(false);
 
+  // Convenience derived from state.primary — every existing call site
+  // that read `connected` keeps working.
+  const connected = state.primary !== null;
+
   /* ── Fetch connection info ──────────────────────────────────── */
   const refresh = useCallback(async () => {
     try {
       const res = await githubApi.getUserHome();
-      if (res?.mode) {
-        // Map backend mode to frontend mode type. "app" + "cloud-app"
-        // both render as "cloud" — distinction is server-side only.
-        const m = res.mode as string;
-        if (m === "app" || m === "cloud-app") setMode("cloud");
-        else if (m === "cli") setMode("cli");
-        else if (m === "token") setMode("token");
-        else if (m === "oauth") setMode("desktop");
-        else setMode(m as GitHubMode);
-      }
-      if (res?.selfHosted !== undefined) setSelfHosted(res.selfHosted);
+      const nextState: GitHubConnectionState = res?.state ?? EMPTY_STATE;
+      setState(nextState);
+
       if (res?.installUrl) setInstallUrl(res.installUrl);
       else setInstallUrl(null);
-      setSources(res?.sources ?? null);
-      if (res?.status?.connected) {
-        setConnected(true);
+
+      if (nextState.primary !== null) {
         setCliAction(null);
         setAccounts(res.accounts ?? []);
-        setUserLogin(res.status.login);
-        if (!selectedOwner) setSelectedOwnerState(res.status.login);
+        const primaryLogin =
+          nextState.sources.openshipApp.login ??
+          nextState.sources.ghCli.login ??
+          "";
+        setUserLogin(primaryLogin);
+        if (!selectedOwner && primaryLogin) {
+          setSelectedOwnerState(primaryLogin);
+        }
         setRepos(res.repos ?? []);
       } else {
-        setConnected(false);
         setAccounts([]);
         setRepos([]);
       }
     } catch {
-      setConnected(false);
+      setState(EMPTY_STATE);
     } finally {
       setLoading(false);
     }
@@ -259,25 +273,16 @@ export function GitHubProvider({ children, initialData }: GitHubProviderProps) {
     async (source: "oauth" | "cli" | "all" = "all") => {
       try {
         await githubApi.disconnect(source);
-        // In cli mode with both sources, refresh the per-source snapshot -
-        // the user may still have the other source connected. In all other
-        // cases this resolves to fully disconnected.
-        if (mode === "cli" && source !== "all") {
-          await refresh();
-        } else {
-          setConnected(false);
-          setAccounts([]);
-          setRepos([]);
-          setUserLogin("");
-          setSelectedOwnerState("");
-          setCliAction(null);
-          setSources(null);
-        }
+        // Always refresh — the canonical state on the backend is now the
+        // source of truth, and a per-source disconnect may still leave
+        // the other source connected (e.g. cli logged out but the
+        // Openship App still installed).
+        await refresh();
       } catch {
         /* silent */
       }
     },
-    [mode, refresh],
+    [refresh],
   );
 
   /* ── Device flow polling ────────────────────────────────────── */
@@ -337,11 +342,10 @@ export function GitHubProvider({ children, initialData }: GitHubProviderProps) {
   return (
     <GitHubContext.Provider
       value={{
+        state,
         connected,
         connecting,
         loading,
-        mode,
-        sources,
         connect,
         disconnect,
         cliAction,

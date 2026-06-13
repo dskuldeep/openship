@@ -125,6 +125,7 @@
       "new-project": "New Project",
       "projects": "Projects",
       "deployments": "Deployments",
+      "backups": "Backups",
       "domains": "Domains",
       "monitoring": "Monitoring",
       "servers": "Servers",

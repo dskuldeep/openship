@@ -152,7 +152,7 @@ const PublicEndpointsCard: React.FC<PublicEndpointsCardProps> = ({
         </div>
         <div className="min-w-0 flex-1">
           <h3 className="text-sm font-semibold text-foreground leading-tight">Domain</h3>
-          <p className="text-[11px] text-muted-foreground">
+          <p className="text-sm text-muted-foreground">
             {hasMultipleEndpoints
               ? `${endpoints.length} domains routed to this app.`
               : "Where your site will be accessible"}
@@ -177,7 +177,7 @@ const PublicEndpointsCard: React.FC<PublicEndpointsCardProps> = ({
                 <h4 className="text-sm font-semibold text-foreground leading-tight">
                   {index === 0 ? "Primary domain" : `Domain ${index + 1}`}
                 </h4>
-                <p className="text-[11px] text-muted-foreground">
+                <p className="text-sm text-muted-foreground">
                   {describeEndpointTarget(endpoint)}
                 </p>
               </div>

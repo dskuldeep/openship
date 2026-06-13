@@ -774,6 +774,7 @@ export const ProjectSettingsProvider: React.FC<ProviderProps> = ({
       { id: "source", label: "Source", icon: "git%20branch-159-1658431404.png" },
       { id: "runtime", label: "Runtime", icon: "setting-40-1662364403.png" },
       { id: "logs", label: "Logs", icon: "terminal-184-1658431404.png" },
+      { id: "backup", label: "Backup", icon: "database.png" },
       { id: "advanced", label: "Advanced", icon: "error%20triangle-81-1658234612.png" },
     ];
   }, []);

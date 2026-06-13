@@ -118,23 +118,19 @@ export const DeploymentsContent: React.FC<DeploymentsContentProps> = ({
       {/* Header */}
       {!hideHeader && (
         <div className="mb-6">
-          <div className="flex items-center gap-3 mb-1">
-            <div className="w-9 h-9 bg-primary/10 rounded-xl flex items-center justify-center">
-              <Rocket className="size-[18px] text-primary" />
-            </div>
-            <div>
-              <h1 className="text-xl font-semibold text-foreground" style={{ letterSpacing: "-0.2px" }}>
-                Deployments
-              </h1>
-              <p className="text-xs text-muted-foreground">
-                {isLoading
-                  ? "Loading..."
-                  : isProject
-                    ? `${deployments.length} deployment${deployments.length !== 1 ? "s" : ""}`
-                    : `${deployments.length} total across ${projects.length} project${projects.length !== 1 ? "s" : ""}`}
-              </p>
-            </div>
-          </div>
+          <h1
+            className="text-2xl font-medium text-foreground/80"
+            style={{ letterSpacing: "-0.2px" }}
+          >
+            Deployments
+          </h1>
+          <p className="text-sm text-muted-foreground/70 mt-1">
+            {isLoading
+              ? "Loading…"
+              : isProject
+                ? `${deployments.length} deployment${deployments.length !== 1 ? "s" : ""}`
+                : `${deployments.length} total across ${projects.length} project${projects.length !== 1 ? "s" : ""}`}
+          </p>
         </div>
       )}
 

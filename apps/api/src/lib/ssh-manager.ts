@@ -25,7 +25,7 @@
  *   - Timers use unref() so they don't prevent graceful shutdown.
  */
 
-import { isAbsolute } from "node:path";
+import { homedir } from "node:os";
 import { readFileSync } from "node:fs";
 import { repos } from "@repo/db";
 import {
@@ -36,6 +36,7 @@ import {
 } from "@repo/adapters";
 import { formatDuration, systemDebug } from "@/lib/system-debug";
 import { decryptSecretField } from "@/lib/credential-encryption";
+import { resolveSafeSshKeyPath } from "@/lib/ssh-key-path";
 
 // ─── Shared SSH config builder ───────────────────────────────────────────────
 
@@ -73,9 +74,17 @@ export async function buildSshConfig(
     // legacy rows so existing installs keep working through one restart.
     config.password = decryptSecretField(settings.sshPassword);
   } else if (settings.sshAuthMethod === "key" && settings.sshKeyPath) {
-    const keyPath = settings.sshKeyPath.trim();
-    // Reject path traversal - must be absolute with no ".." segments
-    if (!isAbsolute(keyPath) || keyPath.includes("..")) return null;
+    // Centralised allowlist + traversal check — see lib/ssh-key-path.ts.
+    // homedir() is the operator's home, used as the default convenient
+    // root so `~/.ssh/openship` works without explicit env config.
+    let keyPath: string;
+    try {
+      keyPath = resolveSafeSshKeyPath(settings.sshKeyPath, {
+        extraRoots: [homedir()],
+      });
+    } catch {
+      return null;
+    }
 
     try {
       config.privateKey = readFileSync(keyPath, "utf-8");

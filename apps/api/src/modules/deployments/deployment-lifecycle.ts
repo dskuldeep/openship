@@ -195,6 +195,12 @@ export async function onSuccess(
       ? { ...((dep.meta as Record<string, unknown> | null) ?? {}), ...result.metaPatch }
       : dep.meta,
   });
+
+  // Pre-deploy backups used to fire here — moved upstream to
+  // build.service.ts:runDeploy() so the snapshot captures the
+  // OLD container before runtime.destroy(). See firePreDeployBackups
+  // call site in build.service.ts for the new location.
+
   await repos.project.setActiveDeployment(project.id, dep.id);
   await repos.deployment.finishBuildSession(buildSessionId, "ready", result.durationMs, persistLogs());
   sessionManager.updateStatus(dep.id, "ready", {

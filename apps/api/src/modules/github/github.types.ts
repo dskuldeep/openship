@@ -187,3 +187,55 @@ export interface RepositoryDetail {
   html_url: string;
   branches?: GitHubBranch[];
 }
+
+// ─── Canonical GitHub connection state ───────────────────────────────────────
+//
+// SINGLE SOURCE OF TRUTH. Everything that asks "is GitHub connected?" or
+// "which source should we use?" reads this shape, computed once by
+// getGitHubConnectionState(userId) in github.auth.ts.
+//
+// What's NOT here on purpose:
+//   - `mode` / "saas-app" / "self-hosted" — that's `env.CLOUD_MODE` /
+//     `platform()` on the backend and `selfHosted` from PlatformContext on
+//     the frontend. The global platform mode owns that concept; this
+//     interface doesn't duplicate it.
+//   - `tokenSource` / "app"|"oauth"|"cli"|"token"|"cloud-app" — those
+//     were internal token-strategy details that leaked to the wire.
+//     The new wire shape only carries USER-VISIBLE concepts (which source
+//     is connected, which one's primary).
+//
+// `primary` is the resolved priority pick that listings + cloning use.
+// `null` means no source can hand out a token at all.
+
+export interface GitHubConnectionState {
+  sources: {
+    /** Openship GitHub App. In SaaS mode this is the local installation;
+     *  in self-hosted+cloud-connected this is the cloud-proxied install. */
+    openshipApp: {
+      connected: boolean;
+      login?: string;
+      avatarUrl?: string;
+      /** Set when at least one App installation exists. Used to render
+       *  the install-on-this-org affordance in the dashboard. */
+      hasInstallations?: boolean;
+    };
+    /** gh CLI on the API host. Always { available: false } on the SaaS
+     *  server (there's no `gh` there). On self-hosted it reflects the
+     *  result of `gh auth token` + a /user verify, gated by the per-user
+     *  cli_excluded_from_listing flag. */
+    ghCli: {
+      available: boolean;
+      login?: string;
+      avatarUrl?: string;
+    };
+  };
+  /**
+   * Which source listings + cloning prefer. The priority is:
+   *   1. openship-app (when connected) — safest, short-lived install tokens
+   *   2. gh-cli (when available) — local builds only
+   *   3. null — nothing connected
+   *
+   * `null` is the "show the connect prompt" signal.
+   */
+  primary: "openship-app" | "gh-cli" | null;
+}

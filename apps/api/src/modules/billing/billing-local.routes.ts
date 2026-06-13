@@ -14,7 +14,13 @@ import * as billingLocal from "./billing-local.controller";
 
 export const billingLocalRoutes = new Hono();
 
-billingLocalRoutes.use("*", authMiddleware);
+// ⚠ Same prefix collision as billingSaasRoutes — billingPlansRoutes
+// shares /api/billing with a public GET /plans. Scope auth to the
+// specific sub-paths so /plans is never accidentally gated.
+billingLocalRoutes.use("/subscription", authMiddleware);
+billingLocalRoutes.use("/usage", authMiddleware);
+billingLocalRoutes.use("/payment-methods", authMiddleware);
+billingLocalRoutes.use("/invoices", authMiddleware);
 
 /* ---------- Subscriptions ---------- */
 billingLocalRoutes.get("/subscription", billingLocal.getSubscription);

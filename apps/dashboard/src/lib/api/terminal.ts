@@ -59,7 +59,12 @@ export type TerminalErrorCode =
   | "idle_timeout"
   | "session_cap"
   | "resume_failed"
-  | "server_error";
+  | "server_error"
+  // Service-terminal-specific codes — emitted by the service variant
+  // of the controller. The union lives here because the WS wire
+  // protocol is shared with the server terminal endpoint.
+  | "not_deployed"
+  | "not_supported";
 
 export interface ErrorMsg {
   type: "error";

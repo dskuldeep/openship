@@ -2,7 +2,7 @@ import { Hono } from "hono";
 import { cors } from "hono/cors";
 import { logger } from "hono/logger";
 import { env, trustedOrigins } from "./config/env";
-import { errorHandler } from "./middleware/error-handler";
+import { errorHandler, handleApiError } from "./middleware/error-handler";
 import { rateLimiter } from "./middleware/rate-limiter";
 import { bootstrapPlatform } from "./lib/controller-helpers";
 
@@ -19,6 +19,14 @@ import { githubRoutes } from "./modules/github";
 import * as githubAuth from "./modules/github/github.auth";
 import { settingsRoutes } from "./modules/settings/settings.routes";
 import { imageRoutes } from "./modules/images/images.routes";
+import { backupRoutes } from "./modules/backups/backup.routes";
+import { backupWebhookRoutes } from "./modules/backups/webhook.routes";
+import { backupDestinationRoutes } from "./modules/backup-destinations/destination.routes";
+import { reconcileAllSchedules } from "./modules/backups/triggers/cron";
+import { scheduleRetentionPrune } from "./modules/backups/retention-prune";
+import { backupOrchestrator } from "./modules/backups/backup.orchestrator";
+import { getJobRunner } from "./lib/job-runner";
+import { repos } from "@repo/db";
 
 /* ---------- Initialize platform (runtime + infra + system) ---------- */
 await bootstrapPlatform();
@@ -36,6 +44,13 @@ app.use(
 app.use("*", errorHandler);
 app.use("*", logger());
 
+// Primary error path: Hono's compose() catches thrown errors at each
+// dispatch level and routes them to `this.errorHandler`, NOT up through
+// middleware. So try/catch-around-next middleware never sees downstream
+// throws — only an explicit `app.onError(...)` does. Register one here so
+// AppError / ZodError get serialized with their statusCode and code.
+app.onError(handleApiError);
+
 app.use("/api/auth/*", rateLimiter);
 
 /* ---------- Shared routes (self-hosted + cloud + desktop) ---------- */
@@ -51,6 +66,9 @@ app.route("/api/analytics", analyticsRoutes);
 app.route("/api/settings", settingsRoutes);
 app.route("/api/billing", billingPlansRoutes);
 app.route("/api/images", imageRoutes);
+app.route("/api", backupRoutes);
+app.route("/api/backup-destinations", backupDestinationRoutes);
+app.route("/api/webhooks/backup", backupWebhookRoutes);
 
 /* ---------- OAuth callback landing pages ---------- */
 const authCallbackHtml = `<!DOCTYPE html><html><head><title>Success</title></head><body><script>window.close();</script><p>Authentication successful. You can close this window.</p></body></html>`;
@@ -62,6 +80,31 @@ app.get("/auth/callback/install", (c) => {
   return c.html(authCallbackHtml);
 });
 app.get("/auth/callback/close", (c) => c.html(authCallbackHtml));
+
+/* ---------- WebSocket subsystem ---------- */
+//
+// Needed for both interactive terminal endpoints:
+//   - server terminal (self-hosted only — mounted inside the `else`)
+//   - service terminal (mounted unconditionally below; runtime adapter
+//     decides Docker vs Cloud per-service)
+//
+// setupWebSocket(app) MUST run before any route module that calls
+// upgradeWebSocket() at module load.
+const { setupWebSocket } = await import("./lib/ws");
+setupWebSocket(app);
+
+/* ---------- Service terminal (both modes) ---------- */
+//
+// Cloud mode routes terminal traffic to the user's Oblien workspace
+// via the Cloud runtime adapter; self-hosted mode routes to Docker
+// exec via the Docker runtime adapter. The controller picks via
+// resolveDeploymentRuntime() from the service's active deployment.
+{
+  const { serviceTerminalRoutes } = await import(
+    "./modules/service-terminal/service-terminal.routes"
+  );
+  app.route("/api/services/terminal", serviceTerminalRoutes);
+}
 
 /* ---------- Cloud-only routes (gated by CLOUD_MODE) ---------- */
 if (env.CLOUD_MODE) {
@@ -87,16 +130,11 @@ if (env.CLOUD_MODE) {
   app.route("/api/mail", mailRoutes);
 
   /**
-   * Interactive terminal (xterm.js ↔ WebSocket ↔ ssh2 PTY).
-   *
-   * The whole WebSocket subsystem (@hono/node-ws + the lib/ws wrapper)
-   * is dynamic-imported inside this branch so cloud-mode never loads
-   * any of it — the terminal feature is self-hosted-only and so is its
-   * transport plumbing. setupWebSocket(app) MUST run before
-   * terminal.routes (which calls upgradeWebSocket() at module load).
+   * Interactive SERVER terminal (xterm.js ↔ WebSocket ↔ ssh2 PTY).
+   * Self-hosted only — exposes the host's SSH-managed servers.
+   * setupWebSocket(app) already ran unconditionally above; this
+   * branch only mounts the SSH-flavored routes.
    */
-  const { setupWebSocket } = await import("./lib/ws");
-  setupWebSocket(app);
   const { terminalRoutes } = await import("./modules/terminal/terminal.routes");
   app.route("/api/terminal", terminalRoutes);
 
@@ -111,4 +149,45 @@ if (env.CLOUD_MODE) {
   /** Start the periodic analytics scraper for managed servers */
   const { startAnalyticsScraper } = await import("./modules/system/analytics-scraper");
   startAnalyticsScraper();
+}
+
+// ─── Backup job runner + boot reconcile ─────────────────────────────
+//
+// One JobRunner powers all backup work — BullMQ when Redis is
+// reachable, in-process otherwise. Same code path for SaaS and
+// desktop installs. The runner is module-singleton; first access
+// here triggers Redis detection.
+{
+  const sweepStale = repos.backupRun.sweepStaleRuns(
+    "API restart while backup in flight",
+  );
+  const sweepStaleRestores = repos.backupRestore.sweepStaleRestores(
+    "API restart while restore in flight",
+  );
+
+  const runner = await getJobRunner();
+  await runner.start({
+    processRun: (runId) => backupOrchestrator.execute(runId),
+  });
+  console.log(`[boot] backup runner: ${runner.describe()}`);
+
+  // Daily retention sweep — idempotent registration.
+  void scheduleRetentionPrune().catch((err) =>
+    console.warn("[boot] scheduleRetentionPrune failed:", err),
+  );
+
+  // Re-register every enabled cron policy with the runner.
+  void reconcileAllSchedules().then((stats) =>
+    console.log(
+      `[boot] backup schedules: ${stats.registered} registered, ${stats.skipped} skipped`,
+    ),
+  );
+
+  void Promise.all([sweepStale, sweepStaleRestores]).then(([runs, restores]) => {
+    if (runs > 0 || restores > 0) {
+      console.log(
+        `[boot] swept ${runs} stale backup runs + ${restores} stale restores`,
+      );
+    }
+  });
 }

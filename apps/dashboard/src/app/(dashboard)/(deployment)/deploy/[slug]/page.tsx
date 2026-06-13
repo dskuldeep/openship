@@ -1,6 +1,6 @@
 "use client";
 
-import React, { useState, useEffect, useRef } from "react";
+import React, { useState, useEffect, useLayoutEffect, useRef } from "react";
 import { useParams, useSearchParams } from "next/navigation";
 import ProjectSettings from "@/components/import-project/ProjectSettings";
 import BuildSettings from "@/components/import-project/BuildSettings";
@@ -9,7 +9,7 @@ import ComposeServices from "@/components/import-project/ComposeServices";
 import EnvironmentVariables from "@/components/import-project/EnvironmentVariables";
 import MonorepoApps from "@/components/import-project/MonorepoApps";
 import Sidebar from "./components/Sidebar";
-import DeployTargetStep, { DeployTargetSummary, useDesktopTargets } from "./components/DeployTargetStep";
+import DeployTargetStep, { DeployTargetSummary, lastPickStore, useDesktopTargets } from "./components/DeployTargetStep";
 // Clone-strategy gate moved from inline render to a preflight modal
 // triggered from <Sidebar>'s handleDeploy. The inline placement was
 // wrong (showed before the user clicked Deploy). See
@@ -54,7 +54,7 @@ const ProjectName: React.FC = () => {
 const DeployRepository: React.FC = () => {
     const params = useParams();
     const slug = params.slug as string;
-    const { config, initializeFromRepo, initializeFromLocal } = useDeployment();
+    const { config, initializeFromRepo, initializeFromLocal, updateConfig } = useDeployment();
     const { deployMode } = usePlatform();
     const searchParams = useSearchParams();
     const force = searchParams.get("force") || undefined;
@@ -86,7 +86,40 @@ const DeployRepository: React.FC = () => {
 
     // Step: "target" = pick build/deploy target, "config" = project settings
     // Only desktop gets step 1. Non-desktop skips straight to config.
-    const [step, setStep] = useState<"target" | "config">(isDesktop ? "target" : "config");
+    //
+    // Returning users land directly on "config": we read their soft
+    // last-pick from localStorage SYNCHRONOUSLY in the useState initializer
+    // and skip the target picker entirely. Avoids the brief flash of
+    // "Where do you want to deploy?" + spinner that DeployTargetStep
+    // would otherwise show while waiting for settingsApi.get() to resolve.
+    // The settings-API default is still authoritative and gets applied
+    // if the user clicks "edit" to reopen the picker.
+    const [step, setStep] = useState<"target" | "config">(() => {
+        if (!isDesktop) return "config";
+        if (typeof window === "undefined") return "target";
+        return lastPickStore.read() ? "config" : "target";
+    });
+
+    // Apply the soft last-pick to config BEFORE first paint so step="config"
+    // renders with the correct target/serverId. Without this, config falls
+    // back to DEFAULT_CONFIG.deployTarget="cloud" and the user briefly sees
+    // the wrong summary bar. useLayoutEffect runs synchronously after DOM
+    // mutation but before the browser paints, so the user never sees the
+    // intermediate state.
+    const appliedLastPickRef = useRef(false);
+    useLayoutEffect(() => {
+        if (!isDesktop || appliedLastPickRef.current) return;
+        const last = typeof window !== "undefined" ? lastPickStore.read() : null;
+        if (!last) return;
+        appliedLastPickRef.current = true;
+        if (last.target === "server" && last.serverId) {
+            updateConfig({ deployTarget: "server", serverId: last.serverId });
+        } else if (last.target === "cloud") {
+            updateConfig({ deployTarget: "cloud", serverId: undefined, buildStrategy: "server" });
+        } else if (last.target === "local") {
+            updateConfig({ deployTarget: "local", serverId: undefined });
+        }
+    }, [isDesktop, updateConfig]);
 
     // Track whether the user explicitly came back to step 1 via the edit
     // affordance. If they did, we must NOT auto-skip past it again - they

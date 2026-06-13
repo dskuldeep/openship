@@ -344,7 +344,7 @@ export const OverviewTab = () => {
             </div>
           )}
           {serviceCount === 0 && (
-            <span className="text-[11px] text-muted-foreground/50">No services connected</span>
+            <span className="text-xs text-muted-foreground">No services connected</span>
           )}
         </div>
         <div className="flex items-center gap-1.5 text-muted-foreground">

@@ -9,3 +9,11 @@ export { servers } from "./servers";
 export { mailServers } from "./mail";
 export { serverAnalytics, serverAnalyticsGeo } from "./analytics";
 export { terminalSessions } from "./terminal-sessions";
+export { serviceTerminalSessions } from "./service-terminal-sessions";
+export { cloudHandoffCode } from "./cloud-handoff-code";
+export {
+  backupDestination,
+  backupPolicy,
+  backupRun,
+  backupRestore,
+} from "./backup";

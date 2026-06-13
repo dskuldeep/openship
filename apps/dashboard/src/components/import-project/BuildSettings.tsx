@@ -455,7 +455,7 @@ const BuildSettings: React.FC<BuildSettingsProps> = ({
                     <Hammer className="w-3.5 h-3.5 text-muted-foreground" />
                     <div>
                       <p className="text-sm font-medium text-foreground">Build</p>
-                      <p className="text-[11px] text-muted-foreground leading-tight">
+                      <p className="text-sm text-muted-foreground leading-tight">
                         {hasBuild
                           ? (config?.buildImage ? `Install & build in ${config.buildImage}` : 'Install & build commands')
                           : 'Deploy source directly'}
@@ -500,7 +500,7 @@ const BuildSettings: React.FC<BuildSettingsProps> = ({
                     <Play className="w-3.5 h-3.5 text-muted-foreground" />
                     <div>
                       <p className="text-sm font-medium text-foreground">Start</p>
-                      <p className="text-[11px] text-muted-foreground leading-tight">
+                      <p className="text-sm text-muted-foreground leading-tight">
                         {hasServer
                           ? (buildData?.productionPort ? `Server on port ${buildData.productionPort}` : 'Server port not set')
                           : 'Static from edge'}

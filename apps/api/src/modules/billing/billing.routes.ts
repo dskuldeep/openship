@@ -12,13 +12,22 @@ billingPlansRoutes.get("/plans", billingController.listPlans);
 /**
  * Stripe-powered billing - SaaS only (CLOUD_MODE=true).
  * Registered at `/api/billing` only when CLOUD_MODE.
+ *
+ * ⚠ This sub-app shares the `/api/billing` mount prefix with
+ * `billingPlansRoutes` (which serves a PUBLIC GET /plans). Using
+ * `.use("*", authMiddleware)` here would extend across siblings in
+ * Hono v4 — same landmine the backup-routes had. Scope to explicit
+ * sub-paths so /plans stays reachable regardless of mount order.
  */
 export const billingSaasRoutes = new Hono();
 
-billingSaasRoutes.use("*", async (c, next) => {
-  if (c.req.path.endsWith("/webhook/stripe")) return next();
-  return authMiddleware(c, next);
-});
+billingSaasRoutes.use("/subscription", authMiddleware);
+billingSaasRoutes.use("/usage", authMiddleware);
+billingSaasRoutes.use("/payment-methods", authMiddleware);
+billingSaasRoutes.use("/invoices", authMiddleware);
+// /webhook/stripe is intentionally unauthed — Stripe signs the
+// request; verification happens inside the handler. No middleware
+// here would have caught it under the old wildcard either.
 
 billingSaasRoutes.get("/subscription", billingController.getSubscription);
 billingSaasRoutes.post("/subscription", billingController.createSubscription);

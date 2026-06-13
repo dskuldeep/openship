@@ -311,6 +311,9 @@ export async function runDeploymentPreflight(
      *  GitHub App is installed for this owner before the build pipeline
      *  spends resources cloning a repo it can't access. */
     gitOwner?: string | null;
+    /** Project id — passed to the remote-clone-token preflight check so
+     *  project-scoped clone tokens are considered. */
+    projectId?: string;
   },
 ): Promise<void> {
   const preflight = await runPreflightChecks(snapshot, {
@@ -324,6 +327,7 @@ export async function runDeploymentPreflight(
     ...(opts.composeServices ? { composeServices: opts.composeServices } : {}),
     ...(opts.multiService !== undefined ? { multiService: opts.multiService } : {}),
     ...(opts.gitOwner !== undefined ? { gitOwner: opts.gitOwner } : {}),
+    ...(opts.projectId !== undefined ? { projectId: opts.projectId } : {}),
     buildStrategy: snapshot.buildStrategy as "local" | "server" | undefined,
   });
   if (!preflight.ok) {
@@ -717,6 +721,7 @@ export async function requestBuildAccess(userId: string, input: BuildAccessInput
     composeServices: servicePreflightServices,
     multiService: useServicePipeline,
     gitOwner: project.gitOwner,
+    projectId: project.id,
   });
   const env = environment || "production";
 
@@ -1143,6 +1148,7 @@ export async function triggerDeployment(
   await runDeploymentPreflight(snapshot, routeState, {
     userId,
     gitOwner: project.gitOwner,
+    projectId: project.id,
   });
 
   // Copy env vars from project (already encrypted in env_var table)
@@ -1620,6 +1626,34 @@ async function executeServerDeploy(phase: DeployPhaseInputs): Promise<void> {
   const deploySsl = plannedDomains.some((domain) => domain.provisionSsl)
     ? createTrackedSslProvider(ssl, domainByHostname)
     : ssl;
+
+  // Pre-deploy backups — fire BEFORE runDeployPipeline so the snapshot
+  // captures the OLD container's state before runtime.destroy() in
+  // compose/deploy.service.ts wipes it. Best-effort: we await only the
+  // enqueue (so we know the run is durably queued before destruction),
+  // not the run itself — a failing or slow backup must not block the
+  // deploy. firePreDeployBackups returns { enqueued, failed } and
+  // logs internally; we surface the count to the build log.
+  try {
+    const { firePreDeployBackups } = await import(
+      "../backups/triggers/pre-deploy"
+    );
+    const preBackup = await firePreDeployBackups({
+      projectId: project.id,
+      userId: dep.userId,
+    });
+    if (preBackup.enqueued > 0 || preBackup.failed > 0) {
+      logger.log(
+        `[pre-deploy-backup] enqueued=${preBackup.enqueued} failed=${preBackup.failed}`,
+      );
+    }
+  } catch (err) {
+    logger.log(
+      `[pre-deploy-backup] trigger crashed (ignoring, best-effort): ${
+        err instanceof Error ? err.message : String(err)
+      }`,
+    );
+  }
 
   const deployResult = await runDeployPipeline(
     deployEnv,

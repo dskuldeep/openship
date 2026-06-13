@@ -171,7 +171,7 @@ export function CloneCredentials() {
                   </button>
                 )}
               </div>
-              <p className="text-[11px] text-muted-foreground/60">
+              <p className="text-sm text-muted-foreground">
                 For private repos, give the token the <span className="font-mono">repo</span> scope
                 (classic) or fine-grained read access to the repos you want to deploy.
               </p>

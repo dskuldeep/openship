@@ -25,19 +25,55 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import {
   buildTerminalWsUrl,
+  buildServiceTerminalWsUrl,
   requestTerminalTicket,
+  requestServiceTerminalTicket,
   TERMINAL_RESUME_SUBPROTOCOL_PREFIX,
   TERMINAL_SUBPROTOCOL_PREFIX,
   type ServerControlMsg,
   type TerminalErrorCode,
 } from "@/lib/api";
 
+/**
+ * What we're opening a shell against. The wire protocol is identical
+ * for both kinds — server flavor uses the host's SSH PTY, service
+ * flavor uses Docker exec or Oblien shell depending on the runtime.
+ * The hook dispatches to the right ticket endpoint and WS URL based
+ * on this kind.
+ */
+export type PtyTarget =
+  | { kind: "server"; id: string }
+  | { kind: "service"; id: string };
+
+function pickTransport(target: PtyTarget) {
+  if (target.kind === "service") {
+    return {
+      requestTicket: () => requestServiceTerminalTicket(target.id),
+      buildWsUrl: () => buildServiceTerminalWsUrl(target.id),
+    };
+  }
+  return {
+    requestTicket: () => requestTerminalTicket(target.id),
+    buildWsUrl: () => buildTerminalWsUrl(target.id),
+  };
+}
+
 const HEARTBEAT_INTERVAL_MS = 25_000;
 const MAX_RECONNECT_ATTEMPTS = 3;
 
 interface UsePtyConnectionArgs {
-  /** Server to open the shell on. Required - the hook is a no-op when falsy/disabled. */
-  serverId: string | null | undefined;
+  /**
+   * Server to open the shell on. Required when target is omitted —
+   * preserved for backward compatibility with the original
+   * server-only callers. Either this OR `target` must be provided.
+   */
+  serverId?: string | null | undefined;
+  /**
+   * Target to open a shell against — discriminated `{kind, id}`.
+   * Required for service terminals; either this OR `serverId` for
+   * server terminals.
+   */
+  target?: PtyTarget | null;
   /** Receives every binary PTY chunk from the server. */
   onBytes: (chunk: Uint8Array) => void;
   /**
@@ -91,6 +127,7 @@ const TERMINAL_CLOSE_CODES = new Set([4400, 4401, 4403, 4404, 4429]);
 
 export function usePtyConnection({
   serverId,
+  target: targetProp,
   onBytes,
   onReady,
   onExit,
@@ -98,6 +135,14 @@ export function usePtyConnection({
   enabled,
   resumeToken,
 }: UsePtyConnectionArgs): PtyConnection {
+  // Normalize to a single `target` shape. If both are passed, `target`
+  // wins (explicit beats compat shim). When the caller passes only
+  // a serverId, we synthesize a server-kind target.
+  const target: PtyTarget | null = targetProp
+    ? targetProp
+    : serverId
+      ? { kind: "server", id: serverId }
+      : null;
   const [isConnecting, setIsConnecting] = useState(false);
   const [isConnected, setIsConnected] = useState(false);
   const [reconnectAttempts, setReconnectAttempts] = useState(0);
@@ -172,16 +217,18 @@ export function usePtyConnection({
   }, []);
 
   const connect = useCallback(async () => {
-    if (!serverId) return;
+    if (!target) return;
     if (manualStopRef.current) return;
     if (wsRef.current) return; // already connected / connecting
 
     setIsConnecting(true);
     setLastError(null);
 
+    const transport = pickTransport(target);
+
     let token: string;
     try {
-      const t = await requestTerminalTicket(serverId);
+      const t = await transport.requestTicket();
       token = t.token;
     } catch (err: any) {
       setIsConnecting(false);
@@ -195,7 +242,7 @@ export function usePtyConnection({
 
     if (manualStopRef.current) return;
 
-    const url = buildTerminalWsUrl(serverId);
+    const url = transport.buildWsUrl();
     const protocols = [TERMINAL_SUBPROTOCOL_PREFIX + token];
     const rt = resumeTokenRef.current;
     if (rt) protocols.push(TERMINAL_RESUME_SUBPROTOCOL_PREFIX + rt);
@@ -300,11 +347,15 @@ export function usePtyConnection({
       setLastError("transport");
     };
   // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [serverId]);
+  }, [target?.kind, target?.id]);
 
-  // ── Effect: lifecycle bound to (serverId, enabled) ──────────────────────
+  // ── Effect: lifecycle bound to (target, enabled) ────────────────────────
+  // Key the effect on a stringified target so changing kind/id triggers
+  // a fresh connect (and disconnects the old). Using the object reference
+  // would re-fire on every render because callers build inline objects.
+  const targetKey = target ? `${target.kind}:${target.id}` : null;
   useEffect(() => {
-    if (!enabled || !serverId) return;
+    if (!enabled || !target) return;
     manualStopRef.current = false;
     terminalRef.current = false;
     attemptsRef.current = 0;
@@ -315,7 +366,8 @@ export function usePtyConnection({
       manualStopRef.current = true;
       teardownSocket();
     };
-  }, [enabled, serverId, connect, teardownSocket]);
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [enabled, targetKey, connect, teardownSocket]);
 
   const sendInput = useCallback((data: string | Uint8Array) => {
     const ws = wsRef.current;

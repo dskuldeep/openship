@@ -191,7 +191,7 @@ export const ResourceSettings: React.FC<ResourceSettingsProps> = ({
                 <p className={`text-sm font-semibold mb-0.5 ${isSelected ? 'text-foreground' : 'text-foreground'}`}>
                   {tier.name}
                 </p>
-                <p className={`text-[11px] ${isSelected ? 'text-primary' : 'text-muted-foreground'}`}>
+                <p className={`text-xs ${isSelected ? 'text-primary' : 'text-muted-foreground'}`}>
                   {tier.description}
                 </p>
                 <div className="flex items-center gap-3 mt-1.5">
@@ -246,7 +246,7 @@ export const ResourceSettings: React.FC<ResourceSettingsProps> = ({
             <p className={`text-sm font-semibold mb-0.5 ${selectedTier === 'custom' ? 'text-foreground' : 'text-foreground'}`}>
               Custom
             </p>
-            <p className={`text-[11px] ${selectedTier === 'custom' ? 'text-primary' : 'text-muted-foreground'}`}>
+            <p className={`text-xs ${selectedTier === 'custom' ? 'text-primary' : 'text-muted-foreground'}`}>
               Define your own resources
             </p>
             {selectedTier === 'custom' ? (
@@ -260,7 +260,7 @@ export const ResourceSettings: React.FC<ResourceSettingsProps> = ({
                 </div>
               </div>
             ) : (
-              <div className={`text-[11px] mt-1.5 ${selectedTier === 'custom' ? 'text-foreground/70' : 'text-muted-foreground'}`}>
+              <div className={`text-xs mt-1.5 ${selectedTier === 'custom' ? 'text-foreground/70' : 'text-muted-foreground'}`}>
                 Click to configure
               </div>
             )}

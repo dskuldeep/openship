@@ -5,10 +5,13 @@ import type { Terminal } from "@xterm/xterm";
 import { useToast } from "@/context/ToastContext";
 import { useCloud } from "@/context/CloudContext";
 import { canUseCloudConnection, usePlatform } from "@/context/PlatformContext";
+import { useModal } from "@/context/ModalContext";
+import { useGitHub } from "@/context/GitHubContext";
 import type { BuildLog } from "@/utils/deploymentPhaseDetector";
 import { useBuildStream } from "@/hooks/useSSEConnection";
 import { deployApi, projectsApi } from "@/lib/api";
 import { ApiError } from "@/lib/api/client";
+import { DeployCredentialModal } from "@/components/deployments/DeployCredentialModal";
 import type { DeploymentConfig, DeploymentState, DeploymentStatus } from "./types";
 import { syncActiveModeSnapshot } from "./mode-config";
 import {
@@ -110,6 +113,8 @@ export function useDeploymentBuild(
   const { showToast } = useToast();
   const { requireCloud } = useCloud();
   const { baseDomain, selfHosted, deployMode } = usePlatform();
+  const { showModal, hideModal } = useModal();
+  const { installUrl, state: githubState } = useGitHub();
   const [state, setState] = useState<DeploymentState>(INITIAL_STATE);
 
   // ── Refs ──────────────────────────────────────────────────────────────────
@@ -385,6 +390,12 @@ export function useDeploymentBuild(
         prev.deploymentFailed || prev.deploymentCanceled ? resolveBuildElapsedMs(prev) : 0,
     }));
 
+    // Hoisted so the catch block can show the credential modal with the
+    // freshly-ensured project id — for first deploys, config.projectId is
+    // still null at this point, which would disable the "Add a project
+    // clone token" option.
+    let ensuredProjectId: string | null = config.projectId ?? null;
+
     try {
       const isServiceDeployment = usesServiceDeployment(config);
       const isMonorepoDeployment = config.projectType === "monorepo";
@@ -447,6 +458,10 @@ export function useDeploymentBuild(
         setState((prev) => ({ ...prev, isDeploying: false }));
         return null;
       }
+
+      // Capture for the catch block — buildAccess may throw preflight
+      // errors but the project row already exists at this point.
+      ensuredProjectId = projectData.project_id;
 
       // Step 2: Create deployment with config snapshot + env vars
       const envVarsMap: Record<string, string> = {};
@@ -530,6 +545,14 @@ export function useDeploymentBuild(
         usesServiceDeployment(config) &&
         errorCode === "CLOUD_REQUIRED_MANAGED_COMPOSE_DOMAINS";
       const needsCloudTargetHelp = errorCode === "CLOUD_REQUIRED_TARGET";
+      // Clone-token preflight failures — server's runPreflightChecks
+      // ran tokenFor("remote") and came up empty. Open the missing-
+      // credential modal in place of the toast so the user has three
+      // concrete recovery paths instead of a dead-end error.
+      const needsCloneCredentialHelp =
+        errorCode === "GITHUB_REMOTE_TOKEN_REQUIRED" ||
+        errorCode === "GITHUB_APP_INSTALLATION_REQUIRED" ||
+        errorCode === "GITHUB_CLI_REMOTE_BUILD_REJECTED";
 
       if (needsManagedProjectDomainHelp) {
         const openedModal = !requireCloud({
@@ -554,13 +577,37 @@ export function useDeploymentBuild(
         if (!openedModal) {
           showToast(message, "error", "Error");
         }
+      } else if (needsCloneCredentialHelp && config.owner) {
+        let modalId = "";
+        modalId = showModal({
+          customContent: (
+            <DeployCredentialModal
+              trigger="preflight-fail"
+              owner={config.owner}
+              installUrl={installUrl ?? null}
+              projectId={ensuredProjectId}
+              deployTarget={config.deployTarget}
+              buildStrategy={config.buildStrategy}
+              selfHosted={selfHosted}
+              ghCliAvailable={!!githubState?.sources.ghCli.available}
+              onChoice={(choice) => {
+                if (choice.kind === "build-local") {
+                  setConfig((prev) => ({ ...prev, buildStrategy: "local" }));
+                }
+                hideModal(modalId);
+              }}
+              onDismiss={() => hideModal(modalId)}
+            />
+          ),
+          maxWidth: "640px",
+        });
       } else {
         showToast(message, "error", "Error");
       }
       setState((prev) => ({ ...prev, isDeploying: false }));
       return null;
     }
-  }, [baseDomain, config, deployMode, requireCloud, selfHosted, showToast]);
+  }, [baseDomain, config, deployMode, hideModal, installUrl, requireCloud, selfHosted, setConfig, showModal, showToast]);
 
   // `startBuild` controls which SSE endpoint to hit:
   //   - true  → POST /:id/build, which ALSO kicks off the build (used by

@@ -29,8 +29,15 @@ import {
   Settings,
   Pencil,
   Trash2,
+  DatabaseBackup,
+  PlayCircle,
+  Plus,
 } from "lucide-react";
 import { ServiceEditorModal } from "./ServiceEditorModal";
+import { backupsApi, getApiErrorMessage, type BackupPolicy } from "@/lib/api";
+import { PolicyEditor } from "@/components/backup/PolicyEditor";
+import { BackupRunCard } from "@/components/backup/BackupRunCard";
+import { ServiceTerminal } from "@/components/terminal/ServiceTerminal";
 
 /* ── Props ──────────────────────────────────────────────────────────── */
 
@@ -65,6 +72,72 @@ export function ServiceDetailPanel({
   const [deleting, setDeleting] = useState(false);
   const [deploying, setDeploying] = useState(false);
   const status = container?.status ?? (service.enabled ? "stopped" : "disabled");
+
+  // ── Terminal section state ──────────────────────────────────────────
+  // Lazy-mount: the WS only opens once the user clicks "Open terminal",
+  // so service pages don't burn a session slot per page view. A
+  // resume token persists per-service in localStorage so refresh /
+  // tab-switch reattaches the parked session rather than spawning a
+  // fresh shell.
+  const [terminalOpen, setTerminalOpen] = useState(false);
+  const [terminalResumeToken, setTerminalResumeToken] = useState<string | null>(
+    null,
+  );
+  useEffect(() => {
+    if (typeof window === "undefined") return;
+    const key = `openship.serviceterm.resume.${service.id}`;
+    setTerminalResumeToken(window.localStorage.getItem(key));
+  }, [service.id]);
+  const persistResumeToken = (token: string | null) => {
+    setTerminalResumeToken(token);
+    if (typeof window === "undefined") return;
+    const key = `openship.serviceterm.resume.${service.id}`;
+    if (token) window.localStorage.setItem(key, token);
+    else window.localStorage.removeItem(key);
+  };
+
+  // ── Backup section state ────────────────────────────────────────────
+  const [backupPolicy, setBackupPolicy] = useState<BackupPolicy | null>(null);
+  const [backupEditorOpen, setBackupEditorOpen] = useState(false);
+  const [activeBackupRunId, setActiveBackupRunId] = useState<string | null>(null);
+
+  useEffect(() => {
+    let alive = true;
+    void backupsApi
+      .listPolicies(projectId)
+      .then((res) => {
+        if (!alive) return;
+        const policy = res.data.find((p) => p.serviceId === service.id) ?? null;
+        setBackupPolicy(policy);
+      })
+      .catch(() => {
+        // best-effort — section just shows "no policy" when API errors
+        if (alive) setBackupPolicy(null);
+      });
+    return () => {
+      alive = false;
+    };
+  }, [projectId, service.id]);
+
+  const reloadBackupPolicy = async (): Promise<void> => {
+    try {
+      const res = await backupsApi.listPolicies(projectId);
+      const policy = res.data.find((p) => p.serviceId === service.id) ?? null;
+      setBackupPolicy(policy);
+    } catch {
+      // tolerated
+    }
+  };
+
+  const handleBackupNow = async (): Promise<void> => {
+    if (!backupPolicy) return;
+    try {
+      const res = await backupsApi.runNow(backupPolicy.id);
+      setActiveBackupRunId(res.data.runId);
+    } catch (err) {
+      window.alert(getApiErrorMessage(err, "Backup run failed"));
+    }
+  };
 
   const resolvedUrl = service.exposed
     ? service.domainType === "custom" && service.customDomain
@@ -392,6 +465,115 @@ export function ServiceDetailPanel({
             </div>
           </div>
         </div>
+      )}
+
+      {/* ── Terminal ─────────────────────────────────────────── */}
+      <div className="bg-card rounded-2xl border border-border/50 overflow-hidden">
+        <SectionHeader
+          title="Terminal"
+          subtitle={
+            terminalOpen
+              ? "Live shell — type to interact with the running service"
+              : status === "running"
+                ? "Open an interactive shell inside this service's container"
+                : "Service must be running to open a terminal"
+          }
+          icon={Terminal}
+        />
+        <div className="px-6 pb-6 space-y-3">
+          {terminalOpen ? (
+            <>
+              <div className="h-[420px]">
+                <ServiceTerminal
+                  serviceId={service.id}
+                  enabled={true}
+                  resumeToken={terminalResumeToken}
+                  onResumeTokenChange={persistResumeToken}
+                />
+              </div>
+              <div className="flex justify-end">
+                <button
+                  type="button"
+                  onClick={() => setTerminalOpen(false)}
+                  className="inline-flex items-center gap-1.5 rounded-xl bg-foreground/[0.06] px-3 py-2 text-sm font-medium text-foreground transition-colors hover:bg-foreground/[0.1]"
+                >
+                  Close terminal
+                </button>
+              </div>
+            </>
+          ) : (
+            <button
+              type="button"
+              onClick={() => setTerminalOpen(true)}
+              disabled={status !== "running"}
+              className="inline-flex items-center gap-1.5 rounded-xl bg-foreground/[0.06] px-3 py-2 text-sm font-medium text-foreground transition-colors hover:bg-foreground/[0.1] disabled:opacity-50 disabled:cursor-not-allowed"
+            >
+              <Terminal className="size-3.5" />
+              Open terminal
+            </button>
+          )}
+        </div>
+      </div>
+
+      {/* ── Backup ───────────────────────────────────────────── */}
+      <div className="bg-card rounded-2xl border border-border/50 overflow-hidden">
+        <SectionHeader
+          title="Backup"
+          subtitle={
+            backupPolicy
+              ? `${backupPolicy.payloadKind} · ${backupPolicy.cronExpression ? `cron ${backupPolicy.cronExpression}` : "manual only"}${backupPolicy.triggerOnPreDeploy ? " · pre-deploy" : ""}${backupPolicy.webhookToken ? " · webhook" : ""}`
+              : "No backup policy for this service"
+          }
+          icon={DatabaseBackup}
+        />
+        <div className="px-6 pb-6 space-y-3">
+          {activeBackupRunId && (
+            <BackupRunCard runId={activeBackupRunId} />
+          )}
+
+          <div className="flex items-center gap-2">
+            {backupPolicy ? (
+              <>
+                <button
+                  onClick={() => void handleBackupNow()}
+                  className="inline-flex items-center gap-1.5 rounded-lg bg-primary px-3 py-1.5 text-xs font-medium text-primary-foreground hover:bg-primary/90"
+                >
+                  <PlayCircle className="size-3.5" />
+                  Backup now
+                </button>
+                <button
+                  onClick={() => setBackupEditorOpen(true)}
+                  className="inline-flex items-center gap-1.5 rounded-lg bg-muted/50 px-3 py-1.5 text-xs font-medium hover:bg-muted"
+                >
+                  <Settings className="size-3.5" />
+                  Edit policy
+                </button>
+              </>
+            ) : (
+              <button
+                onClick={() => setBackupEditorOpen(true)}
+                className="inline-flex items-center gap-1.5 rounded-lg bg-muted/50 px-3 py-1.5 text-xs font-medium hover:bg-muted"
+              >
+                <Plus className="size-3.5" />
+                Create policy
+              </button>
+            )}
+          </div>
+        </div>
+      </div>
+
+      {backupEditorOpen && (
+        <PolicyEditor
+          projectId={projectId}
+          serviceId={service.id}
+          serviceName={service.name}
+          existing={backupPolicy}
+          onClose={() => setBackupEditorOpen(false)}
+          onSaved={async () => {
+            setBackupEditorOpen(false);
+            await reloadBackupPolicy();
+          }}
+        />
       )}
 
       {/* ── Volumes ────────────────────────────────────────────── */}

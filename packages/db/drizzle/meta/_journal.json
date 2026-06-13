@@ -162,6 +162,34 @@
       "when": 1780287600000,
       "tag": "0022_cloud_archive_offload",
       "breakpoints": true
+    },
+    {
+      "idx": 23,
+      "version": "7",
+      "when": 1780374000000,
+      "tag": "0023_backup_foundation",
+      "breakpoints": true
+    },
+    {
+      "idx": 24,
+      "version": "7",
+      "when": 1780460400000,
+      "tag": "0024_backup_server_destination",
+      "breakpoints": true
+    },
+    {
+      "idx": 25,
+      "version": "7",
+      "when": 1780546800000,
+      "tag": "0025_service_terminal_sessions",
+      "breakpoints": true
+    },
+    {
+      "idx": 26,
+      "version": "7",
+      "when": 1780633200000,
+      "tag": "0026_cloud_handoff_code",
+      "breakpoints": true
     }
   ]
 }

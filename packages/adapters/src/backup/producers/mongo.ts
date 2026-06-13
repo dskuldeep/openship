@@ -1,0 +1,93 @@
+/**
+ * MongoDumpProducer — MongoDB backups via mongodump --archive.
+ *
+ * produce: `mongodump --archive --gzip` streams BSON archive to stdout.
+ *          --archive merges every collection into one stream — clean
+ *          single artifact, no per-collection files.
+ *
+ * restore: `mongorestore --archive --gzip --drop` via pipeIntoCommand.
+ *          --drop wipes existing collections before importing.
+ *
+ * Detection: image matches ^(mongo|percona/percona-server-mongodb):.*
+ */
+
+import { registerProducer } from "../registry";
+import type {
+  Artifact,
+  ArtifactRef,
+  BackupExecutor,
+  BackupProducer,
+  ProducerOpts,
+  RestoreOpts,
+  ServiceHandle,
+} from "../types";
+
+const MONGO_IMAGE_RE = /^(mongo|percona\/percona-server-mongodb):/i;
+
+function shellEscape(s: string): string {
+  return `'${s.replace(/'/g, "'\\''")}'`;
+}
+
+class MongoDumpProducerImpl implements BackupProducer {
+  readonly kind = "mongo_dump" as const;
+
+  detects(service: ServiceHandle): boolean {
+    return !!service.image && MONGO_IMAGE_RE.test(service.image);
+  }
+
+  private authArgs(service: ServiceHandle): string {
+    const user =
+      service.env.MONGO_INITDB_ROOT_USERNAME ?? service.env.MONGODB_ROOT_USERNAME ?? "";
+    const pass =
+      service.env.MONGO_INITDB_ROOT_PASSWORD ?? service.env.MONGODB_ROOT_PASSWORD ?? "";
+    if (!user || !pass) return "";
+    return `-u ${shellEscape(user)} -p ${shellEscape(pass)} --authenticationDatabase admin`;
+  }
+
+  async *produce(
+    service: ServiceHandle,
+    executor: BackupExecutor,
+    _opts: ProducerOpts,
+  ): AsyncIterable<Artifact> {
+    const auth = this.authArgs(service);
+    const cmd = ["sh", "-c", `mongodump ${auth} --archive --gzip`];
+    const { stdout, awaitExit } = await executor.execStream(service, cmd);
+
+    yield {
+      name: "mongo-dump.archive.gz",
+      stream: stdout,
+      payloadKind: "mongo_dump",
+      metadata: { format: "archive", compression: "gzip" },
+    };
+
+    const exit = await awaitExit;
+    if (exit.code !== 0) {
+      throw new Error(`mongodump exited ${exit.code}: ${exit.stderr.slice(0, 500)}`);
+    }
+  }
+
+  async restore(
+    service: ServiceHandle,
+    executor: BackupExecutor,
+    artifact: ArtifactRef,
+    _opts: RestoreOpts,
+  ): Promise<void> {
+    const auth = this.authArgs(service);
+    const cmd = [
+      "sh",
+      "-c",
+      `mongorestore ${auth} --archive --gzip --drop`,
+    ];
+
+    const body = await artifact.open();
+    const exit = await executor.pipeIntoCommand(service, cmd, body, {
+      timeoutMs: 60 * 60 * 1000,
+    });
+    if (exit.code !== 0) {
+      throw new Error(`mongorestore exited ${exit.code}: ${exit.stderr.slice(0, 500)}`);
+    }
+  }
+}
+
+export const MongoDumpProducer = new MongoDumpProducerImpl();
+registerProducer(MongoDumpProducer);

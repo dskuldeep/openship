@@ -58,21 +58,55 @@ export async function connectCallback(c: Context) {
   const userId = getUserId(c);
   const code = c.req.query("code");
   if (!code) {
-    return c.html(connectResultPage("Missing Code", "The authentication code was not provided. Please try again."));
+    console.error("[cloud-connect-callback] missing code query param");
+    return c.html(
+      connectResultPage(
+        "Missing Code",
+        "The authentication code was not provided. Please try again.",
+      ),
+    );
   }
 
   try {
-    const { exchangeCodeWithCloud, storeCloudSession } = await import("../../lib/cloud-auth-proxy");
+    const { exchangeCodeWithCloud, storeCloudSession } = await import(
+      "../../lib/cloud-auth-proxy"
+    );
 
     const data = await exchangeCodeWithCloud(code);
     if (!data) {
-      return c.html(connectResultPage("Connection Failed", "Could not verify with Openship Cloud. Please try again."));
+      // exchangeCodeWithCloud already logged the specific failure
+      // reason (network / non-2xx / non-JSON / parse error). Operator
+      // sees the line in the API log.
+      return c.html(
+        connectResultPage(
+          "Connection Failed",
+          "Could not verify with Openship Cloud — check the API log for the exact reason (network, cloud unreachable, or invalid response).",
+        ),
+      );
     }
 
     await storeCloudSession(userId, data.sessionToken);
 
-    return c.html(connectResultPage("Connected to Openship Cloud", "Your instance is now linked. You can close this window.", true));
-  } catch {
-    return c.html(connectResultPage("Connection Failed", "Something went wrong. Please try again."));
+    return c.html(
+      connectResultPage(
+        "Connected to Openship Cloud",
+        "Your instance is now linked. You can close this window.",
+        true,
+      ),
+    );
+  } catch (err) {
+    console.error(
+      `[cloud-connect-callback] unexpected error: ${
+        err instanceof Error ? err.message : String(err)
+      }`,
+    );
+    return c.html(
+      connectResultPage(
+        "Connection Failed",
+        `Something went wrong: ${
+          err instanceof Error ? err.message : String(err)
+        }`,
+      ),
+    );
   }
 }

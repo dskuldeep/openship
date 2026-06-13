@@ -7,13 +7,13 @@
 
 import {
   githubFetch,
+  getGitHubConnectionState,
   getUserStatus,
   getUserInstallations,
   mapAccounts,
   getGitHubAuthMode,
-  resolveGitHubAuthMode,
 } from "./github.auth";
-import { getLocalGhStatus, listLocalGhRepos } from "./github.local-auth";
+import { listLocalGhRepos } from "./github.local-auth";
 import { isIgnoredRepoPath } from "../../lib/project-root-detector";
 import type {
   GitHubRepository,
@@ -21,6 +21,7 @@ import type {
   GitHubFileContent,
   GitHubTreeResponse,
   GitHubWebhook,
+  GitHubConnectionState,
   MappedRepository,
   MappedAccount,
   RepositoryDetail,
@@ -672,190 +673,175 @@ export async function listUserOrgsWithRepos(
 }
 
 /**
- * Get the user's "home" view - status, accounts, and personal repos.
+ * Get the user's "home" view — the canonical connection state, plus the
+ * accounts and repos visible from the active source(s).
+ *
+ * Shape (the ONLY wire shape callers see):
+ *   {
+ *     state: GitHubConnectionState,   // sources + primary
+ *     accounts: MappedAccount[],
+ *     repos: MappedRepository[],
+ *   }
+ *
+ * `state` is the single source of truth — see getGitHubConnectionState.
+ * Listings + repos come from `state.primary`:
+ *   - "openship-app" → /installations + per-install repos (merged with
+ *     gh CLI repos if available, so personal forks the App isn't on
+ *     still show up — clone-auth refuses them for remote builds).
+ *   - "gh-cli"       → /user/repos + /user/orgs via the CLI token.
+ *   - null           → empty arrays.
  */
-export async function getUserHome(userId: string) {
-  const status = await getUserStatus(userId);
-  // Per-user mode — picks "cloud-app" when self-hosted + cloud-connected.
-  // The dashboard renders different UI for cloud-app (single "managed by
-  // openship cloud" card) vs cli (dual-source App + CLI panel).
-  const mode = await resolveGitHubAuthMode(userId);
+export async function getUserHome(userId: string): Promise<{
+  state: GitHubConnectionState;
+  accounts: MappedAccount[];
+  repos: MappedRepository[];
+}> {
+  const state = await getGitHubConnectionState(userId);
 
-  // Self-hosted instances (cli + cloud-app modes) BOTH have gh CLI as
-  // a legitimate alternative auth source. Read the local gh status for
-  // either; it's a quick local subprocess call.
-  const isSelfHosted = mode === "cli" || mode === "cloud-app";
-  const localStatus = isSelfHosted ? await getLocalGhStatus() : undefined;
-
-  // ── One-time self-heal for stale CLI suppression ────────────────
-  // Legacy `disconnectUser(userId, "all")` calls (the OLD "Disconnect
-  // GitHub" button before this refactor) set githubCliDisabled=true
-  // alongside removing the OAuth account row. In the NEW architecture
-  // CLI is a per-repo fallback in cloud-app mode, not an alternative
-  // auth source — so the old suppression semantic doesn't apply. If
-  // gh is actively logged in on this machine but the flag is still
-  // set, that's leftover state from the pre-refactor world. Clear it
-  // once so the dashboard reflects reality.
-  //
-  // Triggers ONLY when:
-  //   - cloud-app mode (the architecture-change boundary)
-  //   - gh is locally authenticated (the user clearly wants it)
-  //   - flag is currently true
-  //
-  // This is idempotent — flag stays false after the first heal. Future
-  // explicit Disconnect clicks on the CLI card still set it back to
-  // true (with the new narrower semantic: "exclude CLI repos from the
-  // library listing").
-  if (mode === "cloud-app" && localStatus?.available) {
-    const { isGithubCliDisabled, setGithubCliDisabled } = await import(
-      "../settings/settings.service"
-    );
-    if (await isGithubCliDisabled(userId)) {
-      await setGithubCliDisabled(userId, false);
-    }
+  // Nothing connected → return the empty shell. The dashboard renders
+  // the connect prompt when state.primary === null.
+  if (state.primary === null) {
+    return { state, accounts: [], repos: [] };
   }
 
-  // Per-source snapshot for the dual-source settings panel. Populated
-  // for ANY self-hosted mode so users can see BOTH options + switch
-  // between them (App requires cloud; gh CLI is always available
-  // locally, with the "local builds only" caveat surfaced in the UI).
-  //
-  // - `oauth` reflects the Openship App side:
-  //     cli mode → connected iff a Better-Auth GitHub OAuth row exists
-  //     cloud-app → connected iff status from cloud is connected
-  // - `cli` reflects the local gh binary state, minus any suppression.
-  // - `active` is what the backend will ACTUALLY use for token resolution.
-  let sources: undefined | {
-    oauth: { connected: boolean; login?: string; avatarUrl?: string };
-    cli: { available: boolean; suppressed: boolean; login?: string; avatarUrl?: string };
-    active: "oauth" | "cli" | null;
-  };
-  if (isSelfHosted) {
-    const { isGithubCliDisabled } = await import("../settings/settings.service");
-    const cliSuppressed = await isGithubCliDisabled(userId);
-    // In cloud-app mode, the OAuth identity comes from cloud — `status`
-    // is populated via cloud-client. Treat status.connected as the
-    // OAuth signal regardless of tokenSource (which is "cloud-app").
-    const oauthConnected =
-      mode === "cloud-app"
-        ? status.connected
-        : status.connected && status.tokenSource === "oauth";
-    const oauthLogin = oauthConnected && status.connected ? status.login : undefined;
-    const oauthAvatar = oauthConnected && status.connected ? status.avatar_url : undefined;
-    // Active source: in cloud-app, App is always the primary (cloud
-    // mints scoped install tokens). In cli, follow the legacy resolver
-    // — OAuth first, gh CLI fallback.
-    const active: "oauth" | "cli" | null =
-      mode === "cloud-app"
-        ? oauthConnected ? "oauth" : null
-        : status.connected ? (status.tokenSource === "oauth" ? "oauth" : "cli") : null;
-    sources = {
-      oauth: { connected: oauthConnected, login: oauthLogin, avatarUrl: oauthAvatar },
-      cli: {
-        available: !!localStatus?.available && !cliSuppressed,
-        suppressed: cliSuppressed,
-        login: localStatus?.available ? localStatus.login : undefined,
-        avatarUrl: localStatus?.available ? localStatus.avatar_url : undefined,
-      },
-      active,
-    };
-  }
-
-  if (!status.connected) {
-    return { status, repos: [] as MappedRepository[], accounts: [] as MappedAccount[], mode, localStatus, sources };
-  }
-
-  // App-scoped modes (local-signed or cloud-proxied) both use the
-  // installations list. cloud-app's OAuth identity lives on the cloud
-  // side; the local instance has no /user OAuth token to call
-  // /user/repos with, so we MUST go through the installation path.
-  if (mode !== "app" && mode !== "cloud-app") {
-    // OAuth / CLI / static-token modes: fetch repos via personal token.
+  // ── Openship App path ──────────────────────────────────────────────
+  // Used whenever the App is connected. Installation-scoped tokens are
+  // the safest source and produce the canonical account list.
+  if (state.primary === "openship-app") {
+    let accounts: MappedAccount[] = [];
     let repos: MappedRepository[] = [];
-    try {
-      const data = await githubFetch<GitHubRepository[]>({
-        userId,
-        url: "https://api.github.com/user/repos",
-        useUserToken: true,
-        params: { per_page: 100, sort: "updated", affiliation: "owner,collaborator,organization_member" },
-      });
-      repos = mapRepositories(Array.isArray(data) ? data : []);
-    } catch { /* empty */ }
+    /**
+     * Set of owner logins (lowercased) that have ANY App installation.
+     * Used when merging gh CLI repos so a CLI repo whose owner has an
+     * App installation does NOT get a misleading "Local only" badge,
+     * even though we haven't fetched that secondary install's repo list
+     * yet (we don't fan out — that would overload the API on first
+     * load with N parallel calls).
+     *
+     * Trade-off: this is owner-level granularity, not repo-level.
+     * A repo-scoped installation (App granted access to only specific
+     * repos under an org) will still trigger a misleading "covered"
+     * tag here for repos under that org that the install can't actually
+     * touch. Clone-auth will refuse those at deploy time with a clear
+     * error — much better than every CLI repo flashing "Local only"
+     * on every page load.
+     */
+    const appInstalledOwners = new Set<string>();
 
-    // Build account list from /user + /user/orgs
-    const accounts: MappedAccount[] = [
-      { login: status.login, id: status.id, avatar_url: status.avatar_url, type: "User" },
-    ];
     try {
-      const orgs = await githubFetch<Array<{ login: string; id: number; avatar_url: string }>>({
-        userId,
-        url: "https://api.github.com/user/orgs",
-        useUserToken: true,
-      });
-      for (const org of orgs) {
-        accounts.push({ login: org.login, id: org.id, avatar_url: org.avatar_url, type: "Organization" });
+      const status = await getUserStatus(userId);
+      const installations = await getUserInstallations(userId, status);
+      accounts = mapAccounts(installations);
+      for (const i of installations) {
+        appInstalledOwners.add(i.account.login.toLowerCase());
       }
-    } catch { /* empty */ }
 
-    return { status, repos, accounts, mode, localStatus, sources };
-  }
+      if (installations.length > 0) {
+        const primaryInstall =
+          installations.find((i) => i.account.login === status.login) ??
+          installations[0];
 
-  // App-scoped path: use GitHub App installations for accounts + repos.
-  // In "app" mode (cloud SaaS / explicit env) JWT signing happens locally.
-  // In "cloud-app" mode all calls proxy through openship.io.
-  let accounts: MappedAccount[] = [];
-  let repos: MappedRepository[] = [];
-
-  try {
-    const installations = await getUserInstallations(userId, status);
-    accounts = mapAccounts(installations);
-
-    if (installations.length > 0) {
-      const primary = installations.find((installation) => installation.account.login === status.login)
-        ?? installations[0];
-      repos = await listInstallationRepos(userId, primary.account.login, primary.id);
-    }
-  } catch (err) {
-    // Private key not configured or installation token failed - return empty
-    console.warn("[GitHub] Failed to fetch installations/repos:", (err as Error).message);
-  }
-
-  // Tag App-derived repos so the dashboard chip knows what's deployable
-  // where. The merge below adds CLI-only repos with source="cli" and
-  // upgrades App+CLI overlaps to source="both".
-  for (const repo of repos) repo.source = "app";
-
-  // CLI repo merge — cloud-app mode only. On SaaS (mode="app", running
-  // on api.openship.io) there's no local gh CLI to query. On self-hosted
-  // cloud-app, the local gh binary often knows about repos the App
-  // isn't installed on (personal forks, side-project orgs). Pull those
-  // in so the dashboard's repo picker sees them — clone-auth still
-  // refuses them for remote builds via its existing source guards.
-  if (mode === "cloud-app" && localStatus?.available) {
-    try {
-      const ghRepos = await listLocalGhRepos(userId);
-      const byFullName = new Map(repos.map((r) => [r.full_name.toLowerCase(), r]));
-      const mappedGh = mapRepositories(Array.isArray(ghRepos) ? (ghRepos as GitHubRepository[]) : []);
-      for (const r of mappedGh) {
-        const key = r.full_name.toLowerCase();
-        const existing = byFullName.get(key);
-        if (existing) {
-          // App + CLI overlap — keep the App-fetched entry (it carries
-          // the install token semantics) and just upgrade the source
-          // tag so the UI knows both sources see it.
-          existing.source = "both";
-        } else {
-          // CLI-only repo — add with source tag so the chip renders.
-          byFullName.set(key, { ...r, source: "cli" });
-        }
+        // Only the PRIMARY install's repos are fetched up-front for the
+        // initial visible list. Other accounts load their repos when
+        // the user clicks them in the picker via fetchReposForOwner.
+        repos = await listInstallationRepos(
+          userId,
+          primaryInstall.account.login,
+          primaryInstall.id,
+        );
+        for (const repo of repos) repo.source = "app";
       }
-      repos = Array.from(byFullName.values());
     } catch (err) {
-      console.warn("[GitHub] CLI repo merge failed:", (err as Error).message);
+      console.warn("[GitHub] App path failed:", (err as Error).message);
     }
+
+    // Merge gh CLI repos when available (self-hosted + cloud-connected
+    // case). Tagging rule for each CLI repo (cheap, zero extra API calls):
+    //
+    //   1. Already in primary install's repo list   → "both"
+    //   2. Owner has an App installation            → "both" (presumed
+    //      App-covered — we haven't fetched that install's list, but
+    //      the App is connected to the org)
+    //   3. Neither                                  → "cli" (truly local-only)
+    if (state.sources.ghCli.available) {
+      try {
+        const ghRepos = await listLocalGhRepos(userId);
+        const byFullName = new Map(repos.map((r) => [r.full_name.toLowerCase(), r]));
+        const mappedGh = mapRepositories(
+          Array.isArray(ghRepos) ? (ghRepos as GitHubRepository[]) : [],
+        );
+        for (const r of mappedGh) {
+          const key = r.full_name.toLowerCase();
+          const existing = byFullName.get(key);
+          if (existing) {
+            existing.source = "both";
+          } else if (appInstalledOwners.has(r.owner.toLowerCase())) {
+            // Owner has an App installation — presume App-covered.
+            // Per-repo accuracy comes when the user opens that org in
+            // the picker and fetchReposForOwner loads the real list.
+            byFullName.set(key, { ...r, source: "both" });
+          } else {
+            byFullName.set(key, { ...r, source: "cli" });
+          }
+        }
+        repos = Array.from(byFullName.values());
+      } catch (err) {
+        console.warn("[GitHub] CLI repo merge failed:", (err as Error).message);
+      }
+    }
+
+    return { state, accounts, repos };
   }
 
-  return { status, repos, accounts, mode, localStatus, sources };
+  // ── gh CLI path ────────────────────────────────────────────────────
+  // state.primary === "gh-cli". The App isn't connected; listings flow
+  // through the user OAuth token (which resolveToken resolves to the
+  // gh CLI fallback in this case).
+  let repos: MappedRepository[] = [];
+  try {
+    const data = await githubFetch<GitHubRepository[]>({
+      userId,
+      url: "https://api.github.com/user/repos",
+      useUserToken: true,
+      params: {
+        per_page: 100,
+        sort: "updated",
+        affiliation: "owner,collaborator,organization_member",
+      },
+    });
+    repos = mapRepositories(Array.isArray(data) ? data : []);
+    for (const r of repos) r.source = "cli";
+  } catch {
+    /* empty */
+  }
+
+  // Build account list from /user + /user/orgs using the same token.
+  const cliLogin = state.sources.ghCli.login;
+  const cliAvatar = state.sources.ghCli.avatarUrl;
+  const accounts: MappedAccount[] = cliLogin
+    ? [{ login: cliLogin, id: 0, avatar_url: cliAvatar ?? "", type: "User" }]
+    : [];
+  try {
+    const orgs = await githubFetch<
+      Array<{ login: string; id: number; avatar_url: string }>
+    >({
+      userId,
+      url: "https://api.github.com/user/orgs",
+      useUserToken: true,
+    });
+    for (const org of orgs) {
+      accounts.push({
+        login: org.login,
+        id: org.id,
+        avatar_url: org.avatar_url,
+        type: "Organization",
+      });
+    }
+  } catch {
+    /* empty */
+  }
+
+  return { state, accounts, repos };
 }
 
 // ─── Webhook strategy ────────────────────────────────────────────────────────

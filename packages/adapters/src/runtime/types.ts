@@ -20,6 +20,8 @@ import type {
   ContainerInfo,
   ResourceUsage,
   ResourceConfig,
+  ShellOptions,
+  ShellSession,
 } from "../types";
 import type { BuildLogger } from "./build-pipeline";
 
@@ -50,7 +52,14 @@ export type RuntimeCapability =
    * `purge`). When unsupported, rollback is unavailable for projects
    * deploying to this runtime. All in-tree runtimes support this.
    */
-  | "rollback";
+  | "rollback"
+  /**
+   * Runtime can open an interactive PTY shell INSIDE a deployed
+   * service's container/workspace. Docker exec with TTY, Oblien
+   * workspace terminal, etc. Powers the in-dashboard service
+   * terminal — see modules/service-terminal/.
+   */
+  | "serviceShell";
 
 // ─── Interface ───────────────────────────────────────────────────────────────
 
@@ -183,6 +192,30 @@ export interface RuntimeAdapter {
    *   Cloud  — delete archived disk
    */
   purge(deployment: DeploymentRef): Promise<void>;
+
+  // ── Interactive service shell ────────────────────────────────────────
+  //
+  // Opens a PTY-attached shell INSIDE the deployed service. Powers the
+  // in-dashboard service terminal. Capability flag: "serviceShell".
+  //
+  //   Docker — `docker exec -ti <containerId> /bin/sh -c '...'`
+  //   Bare   — currently unsupported (would need node-pty + chroot)
+  //   Cloud  — `rt.terminal.create({shell})` + multiplexed WS bridge
+  //
+  // The `containerId` parameter is whatever the deployment row stored
+  // as its container/workspace identifier. The caller resolves
+  // service → container before calling. The returned ShellSession
+  // exposes the same stdin/stdout/setWindow/onClose shape as
+  // SshExecutor.openShell, so the WS bridge code is identical.
+
+  /**
+   * Open an interactive shell inside a deployed service. Optional —
+   * runtimes without `serviceShell` capability throw if called.
+   */
+  openServiceShell?(
+    containerId: string,
+    opts?: ShellOptions,
+  ): Promise<ShellSession>;
 }
 
 // ─── Rollback primitive types ───────────────────────────────────────────────

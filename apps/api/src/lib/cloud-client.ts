@@ -73,6 +73,28 @@ async function cloudFetch(
   return res;
 }
 
+/**
+ * Defensive JSON parser for cloud responses. Cloud endpoints SHOULD
+ * return application/json — but a dev server may serve a 200 HTML
+ * error page, or a proxy may return a captive-portal page, etc.
+ * `.json()` on that body throws "Unexpected token '<'" and crashes
+ * the calling handler.
+ *
+ * Use this for every cloud-client read: returns the parsed JSON when
+ * the body is real JSON, otherwise null (caller treats as unreachable).
+ */
+async function readCloudJson<T>(res: Response): Promise<T | null> {
+  const contentType = res.headers.get("content-type") ?? "";
+  if (!contentType.includes("application/json")) {
+    return null;
+  }
+  try {
+    return (await res.json()) as T;
+  } catch {
+    return null;
+  }
+}
+
 // ─── Cloud session management ────────────────────────────────────────────────
 
 /**
@@ -113,7 +135,8 @@ export async function getCloudConnectionStatus(
     return { connected: true };
   }
 
-  const json = (await res.json()) as { user?: CloudAccount };
+  const json = await readCloudJson<{ user?: CloudAccount }>(res);
+  if (!json) return { connected: true };
   return json.user
     ? { connected: true, user: json.user }
     : { connected: true };
@@ -141,9 +164,10 @@ export async function getCloudToken(
   const res = await cloudFetch(userId, "/api/cloud/token", { method: "POST" });
   if (!res || !res.ok) return null;
 
-  const json = (await res.json()) as {
+  const json = await readCloudJson<{
     data: { token: string; namespace: string; expiresAt: string };
-  };
+  }>(res);
+  if (!json?.data) return null;
 
   const { token, namespace, expiresAt } = json.data;
 
@@ -167,8 +191,8 @@ export async function getCloudPreflight(
 
   if (!res || !res.ok) return null;
 
-  const json = (await res.json()) as { data: CloudPreflightData };
-  return json.data;
+  const json = await readCloudJson<{ data: CloudPreflightData }>(res);
+  return json?.data ?? null;
 }
 
 // ─── Edge proxy sync ─────────────────────────────────────────────────────────
@@ -217,7 +241,7 @@ export async function cloudAnalyticsProxy<T>(
     body: JSON.stringify({ operation, domain, params }),
   });
   if (!res?.ok) return null;
-  return res.json() as Promise<T>;
+  return readCloudJson<T>(res);
 }
 
 // ─── Pages proxy ─────────────────────────────────────────────────────────────
@@ -252,16 +276,16 @@ export async function cloudPagesProxy(
 
   if (!res.ok) {
     let detail = `Status ${res.status}`;
-    try {
-      const body = (await res.json()) as { error?: string };
-      if (body?.error) detail = body.error;
-    } catch {
-      // ignore JSON parse errors — keep the status code as the message
-    }
+    const body = await readCloudJson<{ error?: string }>(res);
+    if (body?.error) detail = body.error;
     throw new Error(detail);
   }
 
-  return res.json() as Promise<{ page: { slug: string; url?: string | null } }>;
+  const body = await readCloudJson<{ page: { slug: string; url?: string | null } }>(res);
+  if (!body) {
+    throw new Error("Cloud returned a non-JSON response when creating the page.");
+  }
+  return body;
 }
 
 // ─── GitHub App proxy (cloud holds the App private key) ─────────────────────
@@ -313,8 +337,8 @@ export async function cloudGithubInstallUrl(
     method: "POST",
   });
   if (!res || !res.ok) return null;
-  const json = (await res.json()) as { data: { url: string; state: string } };
-  return json.data;
+  const json = await readCloudJson<{ data: { url: string; state: string } }>(res);
+  return json?.data ?? null;
 }
 
 /** Exchange a post-install `code` (delivered to the local callback) for the
@@ -330,10 +354,10 @@ export async function cloudGithubExchangeCode(
     body: JSON.stringify({ code, state }),
   });
   if (!res || !res.ok) return null;
-  const json = (await res.json()) as {
+  const json = await readCloudJson<{
     data: { installations: CloudGithubInstallation[] };
-  };
-  return json.data;
+  }>(res);
+  return json?.data ?? null;
 }
 
 /** List the cloud user's GitHub App installations. Local caches results
@@ -345,8 +369,8 @@ export async function cloudGithubInstallations(
     method: "GET",
   });
   if (!res || !res.ok) return null;
-  const json = (await res.json()) as { data: CloudGithubInstallation[] };
-  return json.data;
+  const json = await readCloudJson<{ data: CloudGithubInstallation[] }>(res);
+  return json?.data ?? null;
 }
 
 /** Mint a short-lived installation access token for cloning the given owner.
@@ -361,8 +385,8 @@ export async function cloudGithubInstallationToken(
     body: JSON.stringify(input),
   });
   if (!res || !res.ok) return null;
-  const json = (await res.json()) as { data: CloudGithubInstallationToken };
-  return json.data;
+  const json = await readCloudJson<{ data: CloudGithubInstallationToken }>(res);
+  return json?.data ?? null;
 }
 
 /** Cloud-issued OAuth identity for this user (login + avatar). Used by the
@@ -374,8 +398,8 @@ export async function cloudGithubUserStatus(
     method: "GET",
   });
   if (!res || !res.ok) return null;
-  const json = (await res.json()) as { data: CloudGithubUserStatus };
-  return json.data;
+  const json = await readCloudJson<{ data: CloudGithubUserStatus }>(res);
+  return json?.data ?? null;
 }
 
 // ─── Billing ─────────────────────────────────────────────────────────────────

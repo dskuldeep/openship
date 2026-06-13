@@ -15,6 +15,7 @@ import {
   AlertTriangle,
   Layers,
   ExternalLink,
+  DatabaseBackup,
 } from "lucide-react";
 
 const TAB_ICONS: Record<
@@ -30,6 +31,7 @@ const TAB_ICONS: Record<
   runtime: Wrench,
   settings: Wrench,
   logs: ScrollText,
+  backup: DatabaseBackup,
   advanced: AlertTriangle,
 };
 

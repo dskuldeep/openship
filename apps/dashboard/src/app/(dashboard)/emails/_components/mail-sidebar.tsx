@@ -425,10 +425,10 @@ function AllStepsCard({
                 </div>
                 {(isCurrent || isFailed) && s.message && (
                   <p
-                    className={`text-[11px] mt-0.5 truncate ${
+                    className={`text-sm mt-0.5 truncate ${
                       isFailed
                         ? "text-red-500/80"
-                        : "text-muted-foreground/70"
+                        : "text-muted-foreground"
                     }`}
                   >
                     {s.message}

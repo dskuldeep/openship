@@ -73,10 +73,10 @@ export const SleepModeSettings: React.FC<SleepModeSettingsProps> = ({
                 RECOMMENDED
               </span>
             </div>
-            <p className={`text-[11px] ${selectedMode === 'auto_sleep' ? 'text-primary' : 'text-muted-foreground'}`}>
+            <p className={`text-xs ${selectedMode === 'auto_sleep' ? 'text-primary' : 'text-muted-foreground'}`}>
               Stops when idle, wakes instantly
             </p>
-            <p className={`text-[11px] ${selectedMode === 'auto_sleep' ? 'text-primary/70' : 'text-muted-foreground/70'}`}>
+            <p className={`text-xs ${selectedMode === 'auto_sleep' ? 'text-primary/70' : 'text-muted-foreground/70'}`}>
               Cost-efficient • No cold start
             </p>
           </div>
@@ -106,10 +106,10 @@ export const SleepModeSettings: React.FC<SleepModeSettingsProps> = ({
             <p className={`text-sm font-semibold mb-0.5 ${selectedMode === 'always_on' ? 'text-foreground' : 'text-foreground'}`}>
               Always On
             </p>
-            <p className={`text-[11px] ${selectedMode === 'always_on' ? 'text-primary' : 'text-muted-foreground'}`}>
+            <p className={`text-xs ${selectedMode === 'always_on' ? 'text-primary' : 'text-muted-foreground'}`}>
               Container never stops
             </p>
-            <p className={`text-[11px] ${selectedMode === 'always_on' ? 'text-primary/70' : 'text-muted-foreground/70'}`}>
+            <p className={`text-xs ${selectedMode === 'always_on' ? 'text-primary/70' : 'text-muted-foreground/70'}`}>
               Maximum availability • Higher cost
             </p>
           </div>
@@ -122,7 +122,7 @@ export const SleepModeSettings: React.FC<SleepModeSettingsProps> = ({
           {generateIcon('info%20circle-16-1662452248.png', 16, 'hsl(var(--primary))')}
           <div>
             <p className="text-xs font-semibold text-amber-700 dark:text-amber-300 mb-0.5">How Auto Sleep works</p>
-            <p className="text-[11px] text-amber-700/80 dark:text-amber-300/80 leading-relaxed">
+            <p className="text-sm text-amber-700/80 dark:text-amber-300/80 leading-relaxed">
               When there are requests, your container stays running. After inactivity, it sleeps to save costs. 
               On the next request, it wakes up <span className="font-semibold">instantly</span> - no cold start delays.
             </p>

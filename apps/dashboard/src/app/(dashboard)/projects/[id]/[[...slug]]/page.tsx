@@ -20,6 +20,7 @@ import { DomainSettings } from "../components/DomainSettings";
 import { GitSettings } from "../components/GitSettings";
 import { BuildSettings } from "../components/BuildSettings";
 import { LogsSettings } from "../components/LogsSettings";
+import { BackupSettings } from "../components/BackupSettings";
 import { Deployments } from "../components/Deployments";
 import { AdvancedSettings } from "../components/AdvancedSettings";
 import { OverviewTab } from "../components/OverviewTab";
@@ -536,6 +537,8 @@ const ProjectSettingsContent = () => {
         return <BuildSettings />;
       case "logs":
         return <LogsSettings />;
+      case "backup":
+        return <BackupSettings />;
       case "advanced":
         return <AdvancedSettings onDeleteProject={handleDeleteProject} />;
       default:

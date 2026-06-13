@@ -26,6 +26,7 @@ import {
   getInstallUrl,
   resolveGitHubAuthMode,
 } from "../github/github.auth";
+import { canResolveTokenFor } from "../github/github.token";
 
 export interface PreflightCheck {
   id: string;
@@ -45,6 +46,11 @@ export const PREFLIGHT_ERROR_CODES = {
    *  GITHUB_CLI_REMOTE_BUILD_REJECTED at deploy time — surface it earlier
    *  so the user can fix it before provisioning starts. */
   GITHUB_CLI_REMOTE_BUILD_REJECTED: "GITHUB_CLI_REMOTE_BUILD_REJECTED",
+  /** No remote-safe clone token resolvable for the project's owner.
+   *  Atomic — same `tokenFor(purpose:"remote")` resolver that clone-auth
+   *  uses at deploy time. Failing here surfaces the missing-credential
+   *  modal up-front instead of letting the build pipeline fail later. */
+  GITHUB_REMOTE_TOKEN_REQUIRED: "GITHUB_REMOTE_TOKEN_REQUIRED",
 } as const;
 
 export interface PreflightResult {
@@ -71,6 +77,10 @@ export interface PreflightOptions {
    *  AFTER provisioning resources. Catching it here surfaces a clear
    *  "install the App on <owner>" message and skips the wasted work. */
   gitOwner?: string | null;
+  /** Project id — passed to `tokenFor` so per-project clone tokens are
+   *  considered as a valid remote-clone source. Optional because the
+   *  project row may not exist yet during a first-deploy preflight. */
+  projectId?: string;
   /** Whether the build runs on the API host (`local`) or on the deploy
    *  target (`server`). For non-App auth modes, only `local` keeps the
    *  user's broad-scope token from leaving the API process. */
@@ -183,6 +193,56 @@ async function checkRemoteBuildTokenLeak(
       `Building on the remote target will ship your GitHub credential there. ` +
       `Switch to "Build on this machine" (buildStrategy=local) to keep the token ` +
       `on the API host, or install the GitHub App to mint short-lived per-repo tokens.`,
+  };
+}
+
+/**
+ * Atomic remote-clone-token check. The single source of truth for
+ * "can this deploy actually clone the repo on the build worker?" — runs
+ * the same `tokenFor(userId, "remote", ...)` resolver clone-auth uses at
+ * deploy time, but non-throwing.
+ *
+ * Skipped when:
+ *   - no userId / no owner (nothing to resolve)
+ *   - buildStrategy === "local" (clone happens on the API host, not remote)
+ *   - effectiveTarget === "local" (no remote at all)
+ *
+ * On fail, emits GITHUB_REMOTE_TOKEN_REQUIRED — the dashboard maps that
+ * code to DeployCredentialModal (install App / add PAT /
+ * build locally). This subsumes the per-mode App-installation check
+ * for the remote-clone case but we keep `checkGitHubAppInstallation`
+ * for clearer error copy when the App is configured but uninstalled.
+ */
+async function checkRemoteCloneToken(
+  userId: string | undefined,
+  owner: string | null | undefined,
+  projectId: string | undefined,
+  effectiveTarget: string,
+  buildStrategy: "local" | "server" | undefined,
+): Promise<PreflightCheck> {
+  const baseCheck = {
+    id: "remote-clone-token",
+    label: "Remote clone credential",
+  };
+  if (!userId || !owner) return { ...baseCheck, status: "pass" };
+  if (buildStrategy === "local") return { ...baseCheck, status: "pass" };
+  if (effectiveTarget === "local") return { ...baseCheck, status: "pass" };
+
+  // Existence check only — no mint. The real mint happens later in the
+  // build pipeline when we actually need to clone.
+  const source = await canResolveTokenFor(userId, "remote", { projectId, owner }).catch(
+    () => null,
+  );
+  if (source) return { ...baseCheck, status: "pass" };
+
+  return {
+    ...baseCheck,
+    status: "fail",
+    code: PREFLIGHT_ERROR_CODES.GITHUB_REMOTE_TOKEN_REQUIRED,
+    message:
+      `No GitHub credential available to clone "${owner}" onto the build worker. ` +
+      `Install the Openship App on this owner, add a per-project clone token, ` +
+      `or switch to "Build on this machine" so the credential stays on the API host.`,
   };
 }
 
@@ -860,6 +920,20 @@ export async function runPreflightChecks(
   checks.push(
     await checkRemoteBuildTokenLeak(
       opts?.userId,
+      effectiveTarget,
+      opts?.buildStrategy ?? (snapshot.buildStrategy as "local" | "server" | undefined),
+    ),
+  );
+
+  // Atomic remote-clone-token check — the single source of truth for
+  // "can this deploy actually mint a token to clone the repo on the
+  // build worker?". Mirrors clone-auth.ts at deploy time so any failure
+  // here means the deploy would have failed downstream.
+  checks.push(
+    await checkRemoteCloneToken(
+      opts?.userId,
+      opts?.gitOwner,
+      opts?.projectId,
       effectiveTarget,
       opts?.buildStrategy ?? (snapshot.buildStrategy as "local" | "server" | undefined),
     ),

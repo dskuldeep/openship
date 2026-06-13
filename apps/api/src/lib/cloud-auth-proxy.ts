@@ -108,42 +108,48 @@ async function createLocalSession(
 }
 
 // ─── One-time handoff codes (cloud-side generates, desktop-side consumes) ────
+//
+// DB-BACKED. Codes survive process restarts (dev --watch, prod rolling
+// deploys, k8s pod recycles) and work across multi-instance SaaS pods.
+//
+// Schema: cloud_handoff_code (code PK, user_data jsonb, session_token,
+// code_challenge nullable, expires_at, created_at). See packages/db/src/
+// schema/cloud-handoff-code.ts.
+//
+// One-time use is enforced by an atomic DELETE ... RETURNING in the
+// consume path — no race between SELECT and DELETE, so a code can only
+// be exchanged exactly once even under concurrent requests.
 
-/**
- * In-memory store for one-time handoff codes.
- * Code → { user, sessionToken, expiresAt }
- *
- * Used by CLOUD_MODE instances to hold auth data between the
- * auth completion and the desktop/local instance's code exchange.
- */
-const handoffCodes = new Map<string, { user: CloudUser; sessionToken: string; codeChallenge: string | null; expiresAt: number }>();
-
-let lastPurge = 0;
-function purgeExpiredCodes() {
-  const now = Date.now();
-  if (now - lastPurge < 60_000) return;
-  lastPurge = now;
-  for (const [code, data] of handoffCodes) {
-    if (data.expiresAt < now) handoffCodes.delete(code);
-  }
-}
+const HANDOFF_TTL_MS = 60_000;
 
 /**
  * Generate a one-time code that holds the auth result.
  * Called on the CLOUD instance after authentication completes.
- * The code is valid for 60 seconds and can only be used once.
  *
  * @param codeChallenge - PKCE S256 challenge (base64url). When provided,
  *   the corresponding code_verifier must be presented at exchange time.
  */
-async function generateHandoffCode(user: CloudUser, sessionToken: string, codeChallenge?: string): Promise<string> {
-  purgeExpiredCodes();
+async function generateHandoffCode(
+  user: CloudUser,
+  sessionToken: string,
+  codeChallenge?: string,
+): Promise<string> {
+  // Lazy purge — cheap, runs at most once per minute via inserts.
+  await repos.cloudHandoffCode.purgeExpired().catch(() => undefined);
+
   const code = randomBytes(32).toString("hex");
-  handoffCodes.set(code, {
-    user,
+  await repos.cloudHandoffCode.create({
+    code,
+    userData: {
+      id: user.id,
+      name: user.name ?? null,
+      email: user.email ?? null,
+      emailVerified: user.emailVerified ?? null,
+      image: user.image ?? null,
+    },
     sessionToken,
     codeChallenge: codeChallenge ?? null,
-    expiresAt: Date.now() + 60_000,
+    expiresAt: new Date(Date.now() + HANDOFF_TTL_MS),
   });
   return code;
 }
@@ -152,30 +158,49 @@ async function generateHandoffCode(user: CloudUser, sessionToken: string, codeCh
  * Exchange a one-time code for the auth result.
  * Called on the CLOUD instance by the desktop/local callback.
  *
+ * Atomic DELETE ... RETURNING — the lookup AND the one-time-use guard
+ * are a single SQL statement; concurrent exchanges of the same code
+ * see exactly one success.
+ *
  * If a code_challenge was stored, the caller must provide the matching
  * code_verifier (PKCE S256). Returns null on mismatch.
  */
-function exchangeHandoffCode(code: string, codeVerifier?: string): { user: CloudUser; sessionToken: string } | null {
-  purgeExpiredCodes();
-  const data = handoffCodes.get(code);
-  if (!data || data.expiresAt < Date.now()) {
-    handoffCodes.delete(code);
+async function exchangeHandoffCode(
+  code: string,
+  codeVerifier?: string,
+): Promise<{ user: CloudUser; sessionToken: string } | null> {
+  const row = await repos.cloudHandoffCode.consume(code);
+  if (!row) {
+    console.error(
+      `[handoff-exchange-miss] code=${code.slice(0, 12)}… ` +
+        `not found in DB or already expired/consumed.`,
+    );
     return null;
   }
 
-  // PKCE verification - if a challenge was stored, verifier is mandatory
-  if (data.codeChallenge) {
+  // PKCE verification — if a challenge was stored, verifier is mandatory
+  if (row.codeChallenge) {
     if (!codeVerifier) {
-      return null; // verifier required but not provided
+      console.warn(`[handoff] PKCE: code_verifier required but not provided`);
+      return null;
     }
-    const computed = createHash("sha256").update(codeVerifier).digest("base64url");
-    if (computed !== data.codeChallenge) {
-      return null; // PKCE mismatch
+    const computed = createHash("sha256")
+      .update(codeVerifier)
+      .digest("base64url");
+    if (computed !== row.codeChallenge) {
+      console.warn(`[handoff] PKCE mismatch`);
+      return null;
     }
   }
 
-  handoffCodes.delete(code); // one-time use
-  return { user: data.user, sessionToken: data.sessionToken };
+  const user: CloudUser = {
+    id: row.userData.id,
+    name: row.userData.name ?? "",
+    email: row.userData.email ?? "",
+    emailVerified: row.userData.emailVerified ?? false,
+    image: row.userData.image ?? null,
+  };
+  return { user, sessionToken: row.sessionToken };
 }
 
 /**
@@ -185,17 +210,58 @@ function exchangeHandoffCode(code: string, codeVerifier?: string): { user: Cloud
  * @param codeVerifier - PKCE code_verifier (plain). Required when the
  *   authorization was initiated with a code_challenge.
  */
-async function exchangeCodeWithCloud(code: string, codeVerifier?: string): Promise<{ user: CloudUser; sessionToken: string } | null> {
-  const res = await fetch(`${cloudRuntimeTarget.api}/api/cloud/exchange-code`, {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ code, code_verifier: codeVerifier }),
-  });
-  if (!res.ok) return null;
-  const { data } = (await res.json()) as {
-    data: { user: CloudUser; sessionToken: string };
-  };
-  return data;
+async function exchangeCodeWithCloud(
+  code: string,
+  codeVerifier?: string,
+): Promise<{ user: CloudUser; sessionToken: string } | null> {
+  const url = `${cloudRuntimeTarget.api}/api/cloud/exchange-code`;
+  let res: Response;
+  try {
+    res = await fetch(url, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ code, code_verifier: codeVerifier }),
+    });
+  } catch (err) {
+    // Network error (DNS, ECONNREFUSED, timeout). The cloud SaaS is
+    // unreachable from this host. Log so the operator can see WHY the
+    // connect popup says "Connection Failed".
+    console.error(
+      `[cloud-auth] exchange-code fetch failed: ${url} — ${
+        err instanceof Error ? err.message : String(err)
+      }`,
+    );
+    return null;
+  }
+  if (!res.ok) {
+    console.error(
+      `[cloud-auth] exchange-code returned ${res.status} from ${url}`,
+    );
+    return null;
+  }
+  // Defensive parse: cloud returning HTML (404 page / captive portal /
+  // dev server with no route) is the dominant failure mode. Don't let
+  // it throw the whole connect-callback handler.
+  const contentType = res.headers.get("content-type") ?? "";
+  if (!contentType.includes("application/json")) {
+    console.error(
+      `[cloud-auth] exchange-code returned non-JSON (content-type=${contentType}) from ${url}`,
+    );
+    return null;
+  }
+  try {
+    const { data } = (await res.json()) as {
+      data: { user: CloudUser; sessionToken: string };
+    };
+    return data ?? null;
+  } catch (err) {
+    console.error(
+      `[cloud-auth] exchange-code JSON parse failed: ${
+        err instanceof Error ? err.message : String(err)
+      }`,
+    );
+    return null;
+  }
 }
 
 // ─── Desktop auth nonce relay (single-user, in-memory) ──────────────────────

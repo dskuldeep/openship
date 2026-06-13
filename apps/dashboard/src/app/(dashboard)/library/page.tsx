@@ -4,6 +4,7 @@ import React, { useEffect, useState } from "react";
 import { FolderOpen, Github, Link2, Sparkles } from "lucide-react";
 import { useGitHub } from "@/context/GitHubContext";
 import { usePlatform } from "@/context/PlatformContext";
+import { useCloud } from "@/context/CloudContext";
 import { ConnectPrompt } from "./components/ConnectPrompt";
 import { LoadingSkeleton } from "./components/LoadingSkeleton";
 import { RepositoryList } from "./components/RepositoryList";
@@ -23,6 +24,7 @@ interface TabItem {
 
 export default function LibraryPage() {
   const {
+    state,
     connected,
     connecting,
     loading,
@@ -37,6 +39,7 @@ export default function LibraryPage() {
     installUrl,
   } = useGitHub();
   const { selfHosted } = usePlatform();
+  const { connected: cloudConnected } = useCloud();
 
   const [activeTab, setActiveTab] = useState<Tab>(selfHosted ? "local" : "repositories");
 
@@ -116,7 +119,14 @@ export default function LibraryPage() {
           </div>
 
           {/* ── RIGHT COLUMN ───────────────────────────────────────── */}
-          <LibrarySidebar connected={connected} selectedOwner={selectedOwner} repos={repos} onSwitchTab={setActiveTab} />
+          <LibrarySidebar
+            selectedOwner={selectedOwner}
+            repos={repos}
+            onSwitchTab={setActiveTab}
+            selfHosted={selfHosted}
+            state={state}
+            cloudConnected={cloudConnected}
+          />
         </div>
     </PageContainer>
   );

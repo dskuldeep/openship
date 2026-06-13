@@ -4,10 +4,8 @@ import { CustomSelect } from "@/components/ui/CustomSelect";
 import DomainSettings from "./DomainSettings";
 import BuildSummary from "./BuildSummary";
 import RuntimeModeModalContent from "./RuntimeModeModalContent";
-import {
-  CloneStrategyModalContent,
-  useCloneStrategyGate,
-} from "./CloneStrategyNudge";
+import { useCloneStrategyGate } from "./CloneStrategyNudge";
+import { DeployCredentialModal } from "@/components/deployments/DeployCredentialModal";
 import { useDeployment } from "@/context/DeploymentContext";
 import {
   publicEndpointsNeedCloud,
@@ -16,6 +14,7 @@ import {
 } from "@/context/deployment/types";
 import { useCloud } from "@/context/CloudContext";
 import { canUseCloudConnection, usePlatform } from "@/context/PlatformContext";
+import { useGitHub } from "@/context/GitHubContext";
 import { useModal } from "@/context/ModalContext";
 import { useRouter } from "next/navigation";
 
@@ -141,6 +140,7 @@ const Sidebar: React.FC = () => {
   const { config, state, updateConfig, startDeployment } = useDeployment();
   const { requireCloud } = useCloud();
   const { baseDomain, selfHosted, deployMode } = usePlatform();
+  const { installUrl, state: githubState } = useGitHub();
   const { showModal, hideModal } = useModal();
   const router = useRouter();
   const isServices = usesServiceDeployment(config);
@@ -214,15 +214,31 @@ const Sidebar: React.FC = () => {
     //   - user already picked a preference (`preference !== "prompt"`)
     // The modal is awaited - deploy doesn't proceed until the user
     // either picks or hits "Skip for now".
-    if (cloneGate.needsPrompt) {
+    if (cloneGate.needsPrompt && config.owner) {
       await new Promise<void>((resolve) => {
         let modalId = "";
         modalId = showModal({
           customContent: (
-            <CloneStrategyModalContent
+            <DeployCredentialModal
+              trigger="preflight-gate"
+              owner={config.owner!}
+              installUrl={installUrl ?? null}
+              projectId={config.projectId ?? null}
+              deployTarget={config.deployTarget}
+              buildStrategy={config.buildStrategy}
+              selfHosted={selfHosted}
+              ghCliAvailable={!!githubState?.sources.ghCli.available}
               hasGlobalToken={cloneGate.hasGlobalToken}
-              onChooseLocal={() => updateConfig({ buildStrategy: "local" })}
-              onDone={() => {
+              onChoice={(choice) => {
+                if (choice.kind === "build-local") {
+                  updateConfig({ buildStrategy: "local" });
+                }
+                // install-app / add-token already navigated or popped up;
+                // dismiss falls through to resolve below.
+                hideModal(modalId);
+                resolve();
+              }}
+              onDismiss={() => {
                 hideModal(modalId);
                 resolve();
               }}
@@ -304,7 +320,7 @@ const Sidebar: React.FC = () => {
     }
 
     await continueDeploy();
-  }, [baseDomain, canConnectCloud, cloneGate.hasGlobalToken, cloneGate.needsPrompt, config.deployTarget, config.publicEndpoints, config.services, continueDeploy, hideModal, isServices, requireCloud, showModal]);
+  }, [baseDomain, canConnectCloud, cloneGate.hasGlobalToken, cloneGate.needsPrompt, config.buildStrategy, config.deployTarget, config.owner, config.projectId, config.publicEndpoints, config.services, continueDeploy, githubState, hideModal, installUrl, isServices, requireCloud, selfHosted, showModal, updateConfig]);
 
   return (
     <div className="lg:sticky lg:top-6 h-fit space-y-4">

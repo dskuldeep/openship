@@ -50,27 +50,31 @@ function getSetCookieHeaders(headers: Headers): string[] {
 
 // ─── Status / Connection ─────────────────────────────────────────────────────
 
-/** GET /github/status - Check if user is connected to GitHub */
+/**
+ * GET /github/status — canonical connection state for the current user.
+ * The wire shape is `{ state: GitHubConnectionState }` — see github.types.ts.
+ * No `mode` field: the global platform mode is `env.CLOUD_MODE` (backend) /
+ * `selfHosted` (frontend's PlatformContext). This endpoint only carries
+ * GitHub-specific state.
+ */
 export async function getStatus(c: Context) {
   const userId = getUserId(c);
-  const status = await githubAuth.getUserStatus(userId);
-  return c.json({ ...status, mode: githubAuth.getGitHubAuthMode() });
+  const state = await githubAuth.getGitHubConnectionState(userId);
+  return c.json({ state });
 }
 
-/** GET /github/home - User's GitHub home: status + accounts + repos */
+/**
+ * GET /github/home — canonical state plus accounts and repos visible from
+ * the active source(s). The install URL is offered whenever the App is
+ * an option for this user (any non-CLOUD_MODE-only install ships the App
+ * install URL so the dashboard can prompt "install on this org").
+ */
 export async function getHome(c: Context) {
   const userId = getUserId(c);
   const data = await githubService.getUserHome(userId);
-  // Per-user mode — picks "cloud-app" when self-hosted + cloud-connected.
-  // The install URL is the same github.com/apps/openship-io URL in both
-  // app-scoped modes; the state-bound URL is only used for the initial
-  // connect popup, not for the "Add account" link in the settings panel.
-  const mode = await githubAuth.resolveGitHubAuthMode(userId);
-  const isAppScoped = mode === "app" || mode === "cloud-app";
   return c.json({
     ...data,
-    selfHosted: !env.CLOUD_MODE,
-    installUrl: isAppScoped ? githubAuth.getInstallUrl() : undefined,
+    installUrl: githubAuth.getInstallUrl(),
   });
 }
 

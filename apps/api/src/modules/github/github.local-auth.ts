@@ -24,6 +24,7 @@ import { join } from "path";
 import { createOAuthDeviceAuth } from "@octokit/auth-oauth-device";
 import { env } from "../../config/env";
 import { TtlCache } from "../../lib/cache";
+import { systemDebug } from "../../lib/system-debug";
 import { getGitHubAuthMode } from "./github.auth";
 
 // ─── Cache ───────────────────────────────────────────────────────────────────
@@ -87,10 +88,20 @@ export async function getLocalGhStatus(): Promise<
         "X-GitHub-Api-Version": "2022-11-28",
       },
     });
-    if (!res.ok) return { available: false };
+    if (!res.ok) {
+      systemDebug(
+        "gh-cli",
+        `/user verify failed: status=${res.status} — token from gh CLI was rejected. Run \`gh auth refresh\` or \`gh auth login\`.`,
+      );
+      return { available: false };
+    }
     const user = (await res.json()) as { login: string; id: number; avatar_url: string };
     return { available: true, ...user };
-  } catch {
+  } catch (err) {
+    systemDebug(
+      "gh-cli",
+      `/user verify threw: ${err instanceof Error ? err.message : String(err)}`,
+    );
     return { available: false };
   }
 }
@@ -106,17 +117,10 @@ export async function getLocalGhStatus(): Promise<
  * can deploy them as local builds. clone-auth.ts gates the remote-build
  * refusal; this just hands the dashboard a more complete list.
  *
- * Honors the per-user `isGithubCliDisabled` suppression flag — same
- * gate as token resolution, so a user who clicked Disconnect on the
- * gh CLI source doesn't see CLI repos sneak back in via listings.
- *
- * Returns [] silently on any failure (no gh, no token, suppressed,
- * network error). The caller treats this as an optional enhancement.
+ * Returns [] silently on any failure (no gh, no token, network error).
+ * The caller treats this as an optional enhancement.
  */
-export async function listLocalGhRepos(userId: string): Promise<unknown[]> {
-  const { isGithubCliDisabled } = await import("../settings/settings.service");
-  if (await isGithubCliDisabled(userId)) return [];
-
+export async function listLocalGhRepos(_userId: string): Promise<unknown[]> {
   const token = await getLocalGhToken();
   if (!token) return [];
 
@@ -140,39 +144,131 @@ export async function listLocalGhRepos(userId: string): Promise<unknown[]> {
 
 // ─── Internal helpers ────────────────────────────────────────────────────────
 
-/** Try `gh auth token` subprocess. */
-function ghAuthTokenViaCli(): Promise<string | null> {
+/**
+ * Candidate absolute paths to try when `gh` isn't found via PATH lookup.
+ * The dominant failure: API process is spawned by a tool (bun, electron,
+ * launchd) that inherits a stripped PATH missing the user's Homebrew /
+ * MacPorts / asdf dirs, so `execFile("gh", …)` returns ENOENT even though
+ * `gh` works fine from the user's interactive shell.
+ */
+const GH_FALLBACK_PATHS = [
+  "/opt/homebrew/bin/gh", // Apple Silicon Homebrew
+  "/usr/local/bin/gh", // Intel Homebrew + MacPorts
+  "/usr/bin/gh", // distro packages on Linux
+  "/snap/bin/gh", // Snap-installed gh on Linux
+];
+
+/** One-shot exec attempt — resolves to the trimmed stdout on success,
+ *  or an error object the caller can log. Used to walk fallback paths
+ *  without burying the actual ENOENT/EPERM under a silent null. */
+function tryGhExec(bin: string): Promise<{ token: string } | { error: NodeJS.ErrnoException; stderr?: string }> {
   return new Promise((resolve) => {
-    execFile("gh", ["auth", "token"], { timeout: 5_000 }, (err, stdout) => {
-      if (err || !stdout) return resolve(null);
+    execFile(bin, ["auth", "token"], { timeout: 10_000 }, (err, stdout, stderr) => {
+      if (err) return resolve({ error: err as NodeJS.ErrnoException, stderr: stderr?.toString() });
       const t = stdout.trim();
-      resolve(t || null);
+      if (!t) {
+        return resolve({
+          error: Object.assign(new Error("gh auth token returned empty"), { code: "EMPTY" }),
+          stderr: stderr?.toString(),
+        });
+      }
+      resolve({ token: t });
     });
   });
 }
 
-/** Read token from the gh CLI config file (`~/.config/gh/hosts.yml`). */
-async function ghAuthTokenViaConfig(): Promise<string | null> {
-  try {
-    const configDir = process.env.GH_CONFIG_DIR || join(homedir(), ".config", "gh");
-    const raw = await readFile(join(configDir, "hosts.yml"), "utf-8");
-    // Simple line-by-line YAML parse - look for `oauth_token:` under `github.com:`
-    const ghSection = raw.split(/\n/).reduce<{ inGithub: boolean; token: string | null }>(
-      (acc, line) => {
-        if (/^github\.com:/i.test(line.trim())) acc.inGithub = true;
-        else if (/^\S/.test(line)) acc.inGithub = false;
-        if (acc.inGithub) {
-          const m = line.match(/^\s+oauth_token:\s*(.+)/);
-          if (m && !acc.token) acc.token = m[1].trim();
-        }
-        return acc;
-      },
-      { inGithub: false, token: null },
+/**
+ * Try `gh auth token`. First attempt uses PATH lookup (`execFile("gh", …)`);
+ * on ENOENT we walk a small list of known-install locations so the API
+ * process succeeds even when launched with a stripped PATH (bun-dev from a
+ * non-login shell, Electron, systemd unit without User=). Every failure
+ * is logged so operators can see WHY detection missed — silent null was
+ * the worst offender of the previous design.
+ */
+async function ghAuthTokenViaCli(): Promise<string | null> {
+  // Allow operators to bypass PATH guessing entirely.
+  const explicit = process.env.GH_BIN;
+  const order = explicit ? [explicit] : ["gh", ...GH_FALLBACK_PATHS];
+
+  for (const bin of order) {
+    const r = await tryGhExec(bin);
+    if ("token" in r) {
+      if (bin !== "gh") {
+        systemDebug("gh-cli", `resolved via absolute path: ${bin} (PATH lookup failed)`);
+      }
+      return r.token;
+    }
+    // ENOENT on the PATH attempt is expected when PATH is stripped — try
+    // the next candidate without screaming. For other errors (EPERM,
+    // ETIMEDOUT, EMPTY, non-zero exit) log immediately so the operator
+    // sees the actual problem.
+    const code = r.error.code;
+    if (code === "ENOENT") {
+      systemDebug("gh-cli", `${bin}: not found`);
+      continue;
+    }
+    // gh exists but the call failed — log and stop. Walking more fallbacks
+    // won't help if the same gh binary fails again.
+    systemDebug(
+      "gh-cli",
+      `${bin}: ${code ?? "error"} ${r.error.message}` +
+        (r.stderr ? ` stderr=${r.stderr.trim().slice(0, 200)}` : ""),
     );
-    return ghSection.token || null;
-  } catch {
     return null;
   }
+  systemDebug(
+    "gh-cli",
+    `gh not found via PATH or fallback locations (${GH_FALLBACK_PATHS.join(", ")}). ` +
+      `Set GH_BIN=/path/to/gh to override.`,
+  );
+  return null;
+}
+
+/**
+ * Read token from the gh CLI config file. Tries (in order):
+ *   - $GH_CONFIG_DIR/hosts.yml (explicit override)
+ *   - $XDG_CONFIG_HOME/gh/hosts.yml (XDG spec)
+ *   - ~/.config/gh/hosts.yml (default)
+ *
+ * Logs the path it actually attempted on failure so operators can see
+ * the resolved location.
+ */
+async function ghAuthTokenViaConfig(): Promise<string | null> {
+  const candidates: string[] = [];
+  if (process.env.GH_CONFIG_DIR) candidates.push(join(process.env.GH_CONFIG_DIR, "hosts.yml"));
+  if (process.env.XDG_CONFIG_HOME)
+    candidates.push(join(process.env.XDG_CONFIG_HOME, "gh", "hosts.yml"));
+  candidates.push(join(homedir(), ".config", "gh", "hosts.yml"));
+
+  for (const path of candidates) {
+    try {
+      const raw = await readFile(path, "utf-8");
+      // Simple line-by-line YAML parse — look for `oauth_token:` under `github.com:`
+      const ghSection = raw.split(/\n/).reduce<{ inGithub: boolean; token: string | null }>(
+        (acc, line) => {
+          if (/^github\.com:/i.test(line.trim())) acc.inGithub = true;
+          else if (/^\S/.test(line)) acc.inGithub = false;
+          if (acc.inGithub) {
+            const m = line.match(/^\s+oauth_token:\s*(.+)/);
+            if (m && !acc.token) acc.token = m[1].trim();
+          }
+          return acc;
+        },
+        { inGithub: false, token: null },
+      );
+      if (ghSection.token) {
+        systemDebug("gh-cli", `resolved token from ${path}`);
+        return ghSection.token;
+      }
+      systemDebug("gh-cli", `${path}: parsed but no oauth_token for github.com`);
+    } catch (err) {
+      const code = (err as NodeJS.ErrnoException).code;
+      if (code !== "ENOENT") {
+        systemDebug("gh-cli", `${path}: ${code ?? "read error"}`);
+      }
+    }
+  }
+  return null;
 }
 
 // ─── OAuth Device Flow ───────────────────────────────────────────────────────

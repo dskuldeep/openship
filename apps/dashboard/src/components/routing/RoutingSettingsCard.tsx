@@ -275,19 +275,19 @@ export function RoutingSettingsCard({
                   <div className="flex items-center gap-2 px-3 py-2">
                     <Server className="size-3 text-muted-foreground shrink-0" />
                     {loadingRecords ? (
-                      <p className="text-[11px] text-muted-foreground flex-1">Fetching DNS records...</p>
+                      <p className="text-sm text-muted-foreground flex-1">Fetching DNS records...</p>
                     ) : hasRecords ? (
-                      <p className="text-[11px] text-muted-foreground flex-1">
+                      <p className="text-sm text-muted-foreground flex-1">
                         Add a <span className="font-medium text-foreground">{dnsRecords.find((record) => record.type !== "TXT")?.type}</span> and <span className="font-medium text-foreground">TXT</span> record
                       </p>
                     ) : (
-                      <p className="text-[11px] text-muted-foreground flex-1">Enter a valid domain to preview required DNS records</p>
+                      <p className="text-sm text-muted-foreground flex-1">Enter a valid domain to preview required DNS records</p>
                     )}
                     {hasRecords && (
                       <button
                         type="button"
                         onClick={() => setShowDnsModal(true)}
-                        className="text-[11px] text-primary hover:text-primary/80 font-medium shrink-0 transition-colors"
+                        className="text-xs text-primary hover:text-primary/80 font-medium shrink-0 transition-colors"
                       >
                         View records
                       </button>
@@ -401,7 +401,7 @@ export function RoutingSettingsCard({
                   )}
                 </div>
               </div>
-              <p className="text-[11px] text-muted-foreground">
+              <p className="text-sm text-muted-foreground">
                 Serve files from this subdirectory inside the build output. Use <span className="font-medium text-foreground">/</span> for the root output.
               </p>
             </div>

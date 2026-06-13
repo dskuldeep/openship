@@ -226,7 +226,7 @@ export async function exchangeCode(c: Context) {
     return c.json({ error: "Code required" }, 400);
   }
 
-  const result = exchangeHandoffCode(body.code, body.code_verifier);
+  const result = await exchangeHandoffCode(body.code, body.code_verifier);
   if (!result) {
     return c.json({ error: "Invalid or expired code" }, 401);
   }

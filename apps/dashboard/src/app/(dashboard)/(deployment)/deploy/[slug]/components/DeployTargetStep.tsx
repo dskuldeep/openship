@@ -331,12 +331,12 @@ export function useDesktopTargets(): ResolvedTargets {
 //
 // Priority on seed: settings-API default > localStorage > auto-select fallback.
 
-type LastPick = {
+export type LastPick = {
   target: DeployTarget;
   serverId?: string | null;
 };
 
-const lastPickStore = createPersistedValue<LastPick>(
+export const lastPickStore = createPersistedValue<LastPick>(
   "openship.deploy-last-pick",
   (raw): raw is LastPick => {
     if (!raw || typeof raw !== "object") return false;

@@ -23,6 +23,16 @@ const envSchema = z.object({
     .default("false")
     .transform((v) => v === "true" || v === "1"),
   /**
+   * Override the cloud target's API URL. The local API normally talks
+   * to `https://api.openship.io` for cloud features (App install, OAuth
+   * exchange, etc.) — set this to point at a local SaaS dev instance
+   * (`http://localhost:4100`) so a single machine can run both sides
+   * of the connect flow.
+   */
+  CLOUD_API_URL: z.string().optional(),
+  /** Override the cloud dashboard URL — defaults to `https://app.openship.io`. */
+  CLOUD_DASHBOARD_URL: z.string().optional(),
+  /**
    * Deployment mode - determines the runtime + infrastructure combination:
     *   - "docker"  (default) → Docker runtime + OpenResty routing/SSL (self-hosted)
     *   - "bare"              → Process runtime + OpenResty routing/SSL (self-hosted)
@@ -93,6 +103,32 @@ const envSchema = z.object({
   /* ---------- Oblien Cloud ---------- */
   OBLIEN_CLIENT_ID: z.string().optional(),
   OBLIEN_CLIENT_SECRET: z.string().optional(),
+
+  /* ---------- Backup destinations ---------- */
+  /**
+   * Allow `kind: 'local'` backup destinations. Defaults OFF in CLOUD_MODE
+   * (the SaaS would otherwise expose its multi-tenant filesystem to any
+   * authenticated user), defaults ON for self-hosted single-operator
+   * installs where the API process owns the host.
+   */
+  BACKUP_ALLOW_LOCAL_DESTINATION: z
+    .enum(["true", "false", "1", "0", ""])
+    .default("")
+    .transform((v) => v === "true" || v === "1"),
+  /**
+   * Absolute path that bounds every `kind: 'local'` destination.
+   * Endpoints must resolve to a subpath of this root. Default
+   * /var/lib/openship/backups. Symlinks are resolved before the check.
+   */
+  BACKUP_LOCAL_ROOT: z.string().default("/var/lib/openship/backups"),
+
+  /**
+   * Colon-separated extra roots accepted for `server.sshKeyPath`. The
+   * default allowlist already includes /var/lib/openship/ssh-keys and
+   * /etc/openship/ssh-keys — set this for installs that keep their
+   * SSH keys somewhere else.
+   */
+  SSH_KEY_PATH_ROOTS: z.string().default(""),
 
   /* ---------- Screenshots (optional) ---------- */
   SCREENSHOT_SERVICE_URL: z.string().optional(),
@@ -225,7 +261,18 @@ const parsedEnv = envSchema.parse(process.env);
 export const runtimeTarget = resolveDashboardRuntimeTarget({
   cloudMode: parsedEnv.CLOUD_MODE,
 });
-export const cloudRuntimeTarget = getDashboardRuntimeTarget(runtimeTarget.cloudTargetId);
+
+// The "cloud" target the local API talks to for OAuth exchange, App
+// install URL minting, etc. Defaults to whatever the runtime config
+// pins (`api.openship.io` in production) but allows an env override
+// so dual-local dev (`bun dev:local` + `bun dev:saas`) can wire the
+// two halves together without editing core.
+const _resolvedCloudTarget = getDashboardRuntimeTarget(runtimeTarget.cloudTargetId);
+export const cloudRuntimeTarget = {
+  ..._resolvedCloudTarget,
+  api: parsedEnv.CLOUD_API_URL || _resolvedCloudTarget.api,
+  dashboard: parsedEnv.CLOUD_DASHBOARD_URL || _resolvedCloudTarget.dashboard,
+};
 
 export const env: Env = {
   ...parsedEnv,

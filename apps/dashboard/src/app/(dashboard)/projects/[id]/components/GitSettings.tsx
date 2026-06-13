@@ -566,7 +566,7 @@ export const GitSettings = () => {
             <div className="rounded-xl border border-border/50 bg-muted/15 p-3.5 flex items-center justify-between gap-3">
               <div className="min-w-0">
                 <p className="text-sm font-medium text-foreground">Token saved for this project</p>
-                <p className="text-[11px] text-muted-foreground/70 mt-0.5">
+                <p className="text-sm text-muted-foreground mt-0.5">
                   Last updated {cloneToken.setAt ? new Date(cloneToken.setAt).toLocaleString() : "just now"}
                 </p>
               </div>

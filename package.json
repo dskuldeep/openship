@@ -13,7 +13,7 @@
   ],
   "scripts": {
     "build": "turbo run build",
-    "dev": "turbo run dev",
+    "dev": "turbo run dev --concurrency=20",
     "dev:api": "turbo run dev --filter=@repo/api...",
     "dev:local": "turbo run dev --filter=@repo/api --filter=@repo/dashboard --concurrency=10",
     "dev:saas": "turbo run dev:saas --filter=@repo/api --filter=@repo/dashboard --concurrency=10",

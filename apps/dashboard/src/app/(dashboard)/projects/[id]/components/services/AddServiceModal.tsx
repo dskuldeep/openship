@@ -1024,7 +1024,7 @@ function ConfigureStep({
             <Plus className="size-3.5" />
             Add volume
           </button>
-          <p className="mt-1.5 text-[11px] text-muted-foreground/60">
+          <p className="mt-1.5 text-sm text-muted-foreground">
             Volumes keep data across restarts. Name on the left, container path on the right.
           </p>
         </div>
@@ -1101,7 +1101,7 @@ function Field({
     <label className="block space-y-1.5">
       <span className="text-xs font-medium text-muted-foreground">{label}</span>
       {children}
-      {hint && <span className="block text-[11px] text-muted-foreground/60">{hint}</span>}
+      {hint && <span className="block text-xs text-muted-foreground">{hint}</span>}
     </label>
   );
 }

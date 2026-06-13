@@ -107,5 +107,22 @@ export type {
   TerminalTicketResponse,
 } from "./terminal";
 
+/* --- Service terminal --------------------------------------------- */
+export {
+  requestServiceTerminalTicket,
+  buildServiceTerminalWsUrl,
+} from "./service-terminal";
+
+/* --- Backups ------------------------------------------------------- */
+export { backupDestinationsApi, backupsApi } from "./backups";
+export type {
+  BackupDestinationSummary,
+  CreateDestinationInput,
+  UpdateDestinationInput,
+  BackupPolicy,
+  BackupRun,
+  BackupRestore,
+} from "./backups";
+
 /* --- Auth helpers -------------------------------------------------- */
 export { getAuthToken } from "./auth";

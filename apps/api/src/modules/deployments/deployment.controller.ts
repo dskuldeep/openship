@@ -270,6 +270,11 @@ export async function buildAccess(c: Context) {
     const result = await buildService.requestBuildAccess(userId, body);
     return c.json(result);
   } catch (err) {
+    // Preserve AppError code so the dashboard can branch on preflight
+    // failures (CLOUD_REQUIRED_*, GITHUB_REMOTE_TOKEN_REQUIRED, …).
+    // The global error-handler middleware serializes AppError as
+    // `{ error, code }` with the right statusCode.
+    if (err instanceof AppError) throw err;
     const message = err instanceof Error ? err.message : "Failed to start deployment";
     return c.json({ success: false, message }, 400);
   }
