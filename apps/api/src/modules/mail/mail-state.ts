@@ -21,12 +21,22 @@ const MAX_PERSISTED_LOGS = 800;
 
 import type { CommandExecutor } from "@repo/adapters";
 import { safeErrorMessage } from "@repo/core";
+import {
+  OPENSHIP_DIR,
+  readOpenshipFile,
+  writeOpenshipFile,
+  removeOpenshipFile,
+} from "../../lib/openship-server-store";
 
 /**
- * Where the state file lives on the target server. `/root/` matches
- * iRedMail's own convention (it writes `/root/.iredmail/kv/`).
+ * Mail state lives inside the one `.openship/` dir on the target server
+ * (alongside the project manifest), so a single root-only folder is the
+ * server's self-describing source of truth. All folder/atomic-write mechanics
+ * live in `openship-server-store`; this module only owns the mail schema.
  */
-export const STATE_FILE_PATH = "/root/.openship-mail-state.json";
+const MAIL_STATE_FILE = "mail-state.json";
+/** Full path — for log messages only; I/O goes through the store helpers. */
+export const STATE_FILE_PATH = `${OPENSHIP_DIR}/${MAIL_STATE_FILE}`;
 
 const STATE_VERSION = 1;
 
@@ -212,7 +222,7 @@ export interface AdditionalDomainDns {
    * mirror that behavior so every domain has a working SMTP-Auth account
    * out of the box - the welcome test-email and any future
    * orchestrator-driven sending both rely on it. State file lives at
-   * `/root/.openship-mail-state.json` with root-only permissions, same
+   * `/root/.openship/mail-state.json` with root-only permissions, same
    * blast radius as `/etc/dovecot/dovecot-sql.conf`.
    */
   postmasterPassword?: string;
@@ -317,15 +327,7 @@ export interface MailServerState {
 export async function readState(
   exec: CommandExecutor,
 ): Promise<MailServerState | null> {
-  let raw: string;
-  try {
-    raw = await exec.exec(
-      `[ -f ${STATE_FILE_PATH} ] && cat ${STATE_FILE_PATH} || echo ""`,
-    );
-  } catch {
-    return null;
-  }
-  const trimmed = raw.trim();
+  const trimmed = await readOpenshipFile(exec, MAIL_STATE_FILE);
   if (!trimmed) return null;
 
   try {
@@ -358,16 +360,12 @@ export async function writeState(
     version: STATE_VERSION,
     updatedAt: new Date().toISOString(),
   };
-  const tmp = `${STATE_FILE_PATH}.tmp`;
-  await exec.writeFile(tmp, JSON.stringify(next, null, 2));
-  await exec.exec(
-    `mv -f ${tmp} ${STATE_FILE_PATH} && chmod 0600 ${STATE_FILE_PATH}`,
-  );
+  await writeOpenshipFile(exec, MAIL_STATE_FILE, JSON.stringify(next, null, 2));
 }
 
 /** Wipe the state file. The next install will run as if fresh. */
 export async function clearState(exec: CommandExecutor): Promise<void> {
-  await exec.exec(`rm -f ${STATE_FILE_PATH} ${STATE_FILE_PATH}.tmp`);
+  await removeOpenshipFile(exec, MAIL_STATE_FILE);
 }
 
 // ─── Construction / mutation helpers ─────────────────────────────────────────

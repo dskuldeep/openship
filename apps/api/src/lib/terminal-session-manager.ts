@@ -27,6 +27,7 @@ import { env } from "../config/env";
 import type { ShellSession } from "@repo/adapters";
 import type { TerminalExitReason } from "@repo/db";
 import type { RequestContext } from "./request-context";
+import { sshManager } from "./ssh-manager";
 
 // ─── Tickets ────────────────────────────────────────────────────────────────
 
@@ -358,6 +359,13 @@ export function unregisterSession(sessionId: string): boolean {
   if (!session) return false;
   if (session.closed) return false;
   session.closed = true;
+
+  // Release the SSH connection hold acquired when this terminal opened. This is
+  // the single, atomic release point — park/resume never unregister — so the
+  // shared connection stays pinned for the EXACT session lifetime (surviving
+  // background command churn via dropServer's retain guard) and is freed
+  // exactly once: no leak on the park→timeout path, no early drop on resume.
+  sshManager.release(session.serverId);
 
   clearTimeout(session.idleTimer);
   clearTimeout(session.hardCapTimer);

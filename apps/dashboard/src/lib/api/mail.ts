@@ -309,6 +309,31 @@ export const mailApi = {
     }>(endpoints.mail.servers),
 
   /**
+   * Scan a server for an EXISTING mail install whose orchestrator state was
+   * lost (e.g. a rebuilt desktop). Read-only.
+   */
+  scan: (serverId: string) =>
+    api.post<{
+      serverId: string;
+      iredmailInstalled: boolean;
+      hasState: boolean;
+      domain: string | null;
+      installComplete: boolean;
+      webmailPresent: boolean;
+      adoptable: boolean;
+    }>(endpoints.mail.scan, { serverId }),
+
+  /**
+   * Re-adopt a mail server detected by `scan` — repopulates the dashboard's
+   * record from the on-server state. Idempotent; nothing changes on the server.
+   */
+  adopt: (serverId: string) =>
+    api.post<{ success: boolean; serverId: string; domain: string; completed: boolean }>(
+      endpoints.mail.adopt,
+      { serverId },
+    ),
+
+  /**
    * Start or resume the mail setup wizard.
    * Returns an EventSource for SSE streaming.
    */

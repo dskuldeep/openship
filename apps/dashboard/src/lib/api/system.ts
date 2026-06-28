@@ -128,6 +128,21 @@ export interface SetupCompleteEvent {
   durationMs: number;
 }
 
+/** A saved port-forward tunnel + its live status (desktop-only). */
+export interface TunnelInfo {
+  id: string;
+  serverId: string;
+  remoteHost: string;
+  remotePort: number;
+  /** Configured/last-assigned preferred local port (null = let the OS pick). */
+  localPort: number | null;
+  autoStart: boolean;
+  running: boolean;
+  activeConnections: number;
+  /** Ready-to-open URL, present only while the tunnel is up. */
+  url: string | null;
+}
+
 export const systemApi = {
   /** List child directories at a given path (backend browse) */
   browse: (path?: string) =>
@@ -173,7 +188,7 @@ export const systemApi = {
     api.post<ServerCheckResult>(endpoints.system.check, {
       serverId,
       ...(components?.length ? { components } : {}),
-    }),
+    }, { timeout: 30_000 }), // headroom for a cold SSH connect + parallel probes
 
   /** Install a component on a specific server */
   installComponent: (serverId: string, component: string, config?: Record<string, unknown>) =>
@@ -233,4 +248,28 @@ export const systemApi = {
       endpoints.system.serverRateLimit(serverId),
       data,
     ),
+
+  // ── Port-forward tunnels (desktop-only) ────────────────────────────────────
+
+  /** List a server's saved forwards + their live status */
+  listTunnels: (serverId: string) =>
+    api.get<TunnelInfo[]>(endpoints.system.tunnels(serverId)),
+
+  /** Create/update a forward config */
+  saveTunnel: (
+    serverId: string,
+    data: { remotePort: number; remoteHost?: string; localPort?: number | null; autoStart?: boolean },
+  ) => api.post<TunnelInfo>(endpoints.system.tunnels(serverId), data),
+
+  /** Open a saved forward */
+  startTunnel: (serverId: string, tunnelId: string) =>
+    api.post<TunnelInfo>(endpoints.system.tunnelStart(serverId, tunnelId), {}),
+
+  /** Close a live forward */
+  stopTunnel: (serverId: string, tunnelId: string) =>
+    api.post<TunnelInfo>(endpoints.system.tunnelStop(serverId, tunnelId), {}),
+
+  /** Delete a forward config (stops it first if live) */
+  deleteTunnel: (serverId: string, tunnelId: string) =>
+    api.delete<{ ok: boolean }>(endpoints.system.tunnel(serverId, tunnelId)),
 };

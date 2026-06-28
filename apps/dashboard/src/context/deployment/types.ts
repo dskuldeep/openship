@@ -165,6 +165,8 @@ export interface DeploymentConfig {
   deployTarget: DeployTarget;
   /** Which server to deploy to when deployTarget === "server" */
   serverId?: string;
+  /** Display name of the target server (resolved by the API for the detail UI). */
+  serverName?: string;
   /** Runtime mode: "bare" (direct process) or "docker" (container-based) */
   runtimeMode: RuntimeMode;
   projectType: ProjectType;
@@ -209,6 +211,13 @@ export interface DeploymentConfig {
   cloudResourceTier?: CloudResourceTier;
   /** Custom CPU/RAM/disk values, used only when cloudResourceTier === "custom". */
   cloudResourceCustom?: CloudResourceCustom;
+  /**
+   * Per-deploy opt-in (desktop-only; default off) to forward the operator's
+   * LOCAL `gh` identity to a remote server so it can clone on-server using the
+   * relay — instead of building locally + uploading. Only meaningful for a
+   * server-target build; nothing is persisted on the remote.
+   */
+  forwardGitCredentials?: boolean;
   /** Local-only flag so env imports don't overwrite a user-edited runtime port. */
   productionPortTouched: boolean;
   /** Last runtime port auto-applied from env detection in this deploy flow. */
@@ -492,7 +501,22 @@ export interface DeploymentState {
   } | null;
   /** Per-service deployment statuses for compose projects. */
   serviceStatuses: ServiceDeployStatus[];
+  /**
+   * Per-phase build durations in ms, keyed by phase id (prepare/clone/install/
+   * build/deploy). Seeded from the API on load; filled live as phases complete.
+   * "prepare" is the one-time server provisioning, excluded from build time.
+   */
+  phaseDurations: Record<string, number>;
 }
+
+/** Ordered build phases for the Build-phases panel. `prepare` is one-time. */
+export const BUILD_PHASES: ReadonlyArray<{ id: string; label: string; oneTime?: boolean }> = [
+  { id: "prepare", label: "Prepare server", oneTime: true },
+  { id: "clone", label: "Clone" },
+  { id: "install", label: "Install" },
+  { id: "build", label: "Build" },
+  { id: "deploy", label: "Deploy" },
+];
 
 export const INITIAL_STATE: DeploymentState = {
   deploymentId: null,
@@ -515,6 +539,7 @@ export const INITIAL_STATE: DeploymentState = {
   buildRetryCarryMs: 0,
   pendingPrompt: null,
   serviceStatuses: [],
+  phaseDurations: {},
 };
 
 export function resolveBuildElapsedMs(

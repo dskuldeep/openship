@@ -12,6 +12,7 @@ export { service, serviceDeployment } from "./service";
 export { deploymentCheckRun } from "./deployment-check-run";
 export { userSettings, instanceSettings } from "./settings";
 export { servers } from "./servers";
+export { serverTunnels } from "./server-tunnel";
 export { mailServers } from "./mail";
 export { serverAnalytics, serverAnalyticsGeo } from "./analytics";
 export { terminalSessions } from "./terminal-sessions";

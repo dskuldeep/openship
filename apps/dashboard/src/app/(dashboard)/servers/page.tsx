@@ -11,9 +11,11 @@ import {
   ExternalLink,
   Wifi,
   Shield,
+  Network,
 } from "lucide-react";
 import { systemApi } from "@/lib/api";
 import { PageContainer } from "@/components/ui/PageContainer";
+import { usePlatform } from "@/context/PlatformContext";
 
 interface ServerEntry {
   id: string;
@@ -26,8 +28,12 @@ interface ServerEntry {
 
 export default function ServersPage() {
   const router = useRouter();
+  const { deployMode } = usePlatform();
+  const isDesktop = deployMode === "desktop";
   const [servers, setServers] = useState<ServerEntry[]>([]);
   const [loading, setLoading] = useState(true);
+  /** Active (running) port-forward count per server — desktop-only. */
+  const [forwardCounts, setForwardCounts] = useState<Record<string, number>>({});
 
   const fetchServers = useCallback(async () => {
     try {
@@ -53,6 +59,28 @@ export default function ServersPage() {
   useEffect(() => {
     fetchServers();
   }, [fetchServers]);
+
+  // Active forward counts (desktop-only). Best-effort and per-server; a
+  // failed lookup just leaves that server's badge absent.
+  useEffect(() => {
+    if (!isDesktop || servers.length === 0) return;
+    let cancelled = false;
+    void Promise.all(
+      servers.map(async (s) => {
+        try {
+          const rows = await systemApi.listTunnels(s.id);
+          return [s.id, rows.filter((t) => t.running).length] as const;
+        } catch {
+          return [s.id, 0] as const;
+        }
+      }),
+    ).then((entries) => {
+      if (!cancelled) setForwardCounts(Object.fromEntries(entries));
+    });
+    return () => {
+      cancelled = true;
+    };
+  }, [isDesktop, servers]);
 
   return (
     <PageContainer>
@@ -209,6 +237,12 @@ export default function ServersPage() {
                             <div className="inline-flex items-center gap-1 px-2 py-0.5 bg-red-500/10 text-red-600 dark:text-red-400 text-xs font-medium rounded-full">
                               <XCircle className="size-3" />
                               Error
+                            </div>
+                          )}
+                          {isDesktop && (forwardCounts[server.id] ?? 0) > 0 && (
+                            <div className="inline-flex items-center gap-1 px-2 py-0.5 bg-blue-500/10 text-blue-600 dark:text-blue-400 text-xs font-medium rounded-full">
+                              <Network className="size-3" />
+                              {forwardCounts[server.id]} forwarding
                             </div>
                           )}
                         </div>

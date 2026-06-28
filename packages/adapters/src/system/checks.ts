@@ -223,7 +223,39 @@ export const COMPONENT_CHECKS: Record<string, CheckFn> = {
   rsync: checkRsync,
 };
 
-/** Run every registered check sequentially to avoid SSH channel contention. */
+/**
+ * Map items through `fn` with a bounded concurrency pool, preserving order.
+ *
+ * Component checks are independent, so we run several at once instead of
+ * serially — a big win on the system-ssh path where every `exec` is a separate
+ * `ssh` round-trip (serial checks otherwise stack past the client timeout). The
+ * cap keeps us well under sshd's per-connection MaxSessions (default 10), which
+ * both ssh2 channels and ControlMaster sessions draw from, leaving headroom for
+ * the live-metrics stream sharing the same connection.
+ */
+async function mapWithConcurrency<T, R>(
+  items: readonly T[],
+  limit: number,
+  fn: (item: T) => Promise<R>,
+): Promise<R[]> {
+  const results = new Array<R>(items.length);
+  let cursor = 0;
+  const worker = async (): Promise<void> => {
+    while (cursor < items.length) {
+      const index = cursor++;
+      results[index] = await fn(items[index]!);
+    }
+  };
+  await Promise.all(
+    Array.from({ length: Math.min(limit, items.length) }, worker),
+  );
+  return results;
+}
+
+/** Max component checks to run concurrently (see mapWithConcurrency). */
+const CHECK_CONCURRENCY = 4;
+
+/** Run every registered check with bounded concurrency. */
 export async function checkAll(
   executor: CommandExecutor,
 ): Promise<ComponentStatus[]> {
@@ -235,15 +267,14 @@ export async function checkAll(
     "checks",
     `checkAll:start [${entries.map(([name]) => name).join(", ")}]`,
   );
-  const results: ComponentStatus[] = [];
-  for (const [, fn] of entries) {
-    results.push(await fn(executor));
-  }
+  const results = await mapWithConcurrency(entries, CHECK_CONCURRENCY, ([, fn]) =>
+    fn(executor),
+  );
   systemDebug("checks", `checkAll:done (${formatDuration(startedAt)})`);
   return results;
 }
 
-/** Run checks for a specific set of components. */
+/** Run checks for a specific set of components with bounded concurrency. */
 export async function checkComponents(
   executor: CommandExecutor,
   names: string[],
@@ -251,12 +282,11 @@ export async function checkComponents(
   const startedAt = Date.now();
   const fns = names
     .map((name) => COMPONENT_CHECKS[name])
-    .filter(Boolean);
+    .filter((fn): fn is CheckFn => Boolean(fn));
   systemDebug("checks", `checkComponents:start [${names.join(", ")}]`);
-  const results: ComponentStatus[] = [];
-  for (const fn of fns) {
-    results.push(await fn(executor));
-  }
+  const results = await mapWithConcurrency(fns, CHECK_CONCURRENCY, (fn) =>
+    fn(executor),
+  );
   systemDebug(
     "checks",
     `checkComponents:done [${names.join(", ")}] (${formatDuration(startedAt)})`,

@@ -81,7 +81,7 @@ export async function updatePostmasterPassword(
   // (and any future SMTP-from-orchestrator use) can authenticate over
   // submission as postmaster@<domain> without scraping it from disk.
   //
-  // The state file lives at `/root/.openship-mail-state.json` with root-
+  // The state file lives at `/root/.openship/mail-state.json` with root-
   // only permissions; an attacker with read access there already has
   // /etc/dovecot/dovecot-sql.conf and the bind credentials. Keeping the
   // postmaster plaintext alongside the other generated secrets doesn't

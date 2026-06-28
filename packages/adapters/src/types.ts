@@ -109,6 +109,14 @@ export interface BuildConfig {
   resources: ResourceConfig;
   /** Ephemeral token for cloning private repos - never persisted */
   gitToken?: string;
+  /**
+   * Desktop-only: absolute path to a git credential-helper script on the
+   * REMOTE build host (written by the deploy git-credential relay). When set,
+   * the clone uses this helper (via `GIT_CONFIG_*` env) over a plain URL
+   * instead of injecting a token — so no token ever lands in the remote
+   * `.git/config`. Mutually exclusive in practice with `gitToken`.
+   */
+  gitCredentialHelperPath?: string;
 }
 
 export interface DeployPublicEndpoint {
@@ -179,10 +187,16 @@ export interface DeploymentResult {
   status: ContainerStatus;
 }
 
-/** Pipeline step identifiers for stepper UI */
-export type BuildStep = "clone" | "install" | "build" | "deploy";
+/**
+ * Pipeline step identifiers for stepper UI.
+ *
+ * "prepare" is one-time server provisioning (toolchain install, source
+ * transfer) that runs BEFORE the build timer starts — so it's shown as its own
+ * phase and excluded from the reported build duration.
+ */
+export type BuildStep = "prepare" | "clone" | "install" | "build" | "deploy";
 
-export const BUILD_STEPS: readonly BuildStep[] = ["clone", "install", "build", "deploy"] as const;
+export const BUILD_STEPS: readonly BuildStep[] = ["prepare", "clone", "install", "build", "deploy"] as const;
 
 export interface LogEntry {
   timestamp: string;
@@ -284,6 +298,17 @@ export interface SshConfig {
   privateKeyPassphrase?: string;
   /** SSH agent socket (alternative to privateKey) */
   sshAgent?: string;
+  /**
+   * Route this connection through the OS `ssh` binary (SystemSshExecutor)
+   * instead of the in-process `ssh2` client. Set for "agent" auth, where only
+   * the real OpenSSH client reliably resolves the agent / `~/.ssh/config` /
+   * default keys / keychain. Password and key auth leave this unset.
+   */
+  useSystemSsh?: boolean;
+  /** Optional jump/bastion host (`ssh -J`). Honored by the system-ssh path. */
+  sshJumpHost?: string;
+  /** Extra raw `ssh` CLI arguments. Honored by the system-ssh path. */
+  sshArgs?: string;
 }
 
 // ─── Command execution abstraction ──────────────────────────────────────────
@@ -399,6 +424,20 @@ export interface CommandExecutor {
    * node-pty for parity).
    */
   openShell?(opts?: ShellOptions): Promise<ShellSession>;
+
+  /**
+   * Open a REVERSE tunnel: ask the remote to listen on an ephemeral
+   * `127.0.0.1` port and forward every connection back to `onConnection`
+   * (SSH `tcpip-forward` / ssh2 `forwardIn`). Used by the desktop git
+   * credential relay — a helper on the remote connects to the returned port
+   * to fetch a credential on demand. The caller owns the duplex stream.
+   *
+   * Only available on SshExecutor (ssh2 path); LocalExecutor and the
+   * system-ssh path do not implement it.
+   */
+  reverseForward?(
+    onConnection: (stream: Duplex) => void,
+  ): Promise<{ port: number; close: () => Promise<void> }>;
 }
 
 // ─── Interactive PTY shell ──────────────────────────────────────────────────

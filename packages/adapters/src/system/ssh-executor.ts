@@ -36,6 +36,10 @@ export class SshExecutor implements CommandExecutor {
   private client: SshClient | null = null;
   private connecting: Promise<SshClient> | null = null;
   private readonly config: SshConfig;
+  /** Reverse-forward handlers keyed by the remote bound port (see reverseForward). */
+  private readonly reverseHandlers = new Map<number, (stream: Duplex) => void>();
+  /** The client the single 'tcp connection' dispatcher is attached to (re-attached on reconnect). */
+  private reverseListenerClient: SshClient | null = null;
 
   constructor(config: SshConfig) {
     if (!config.privateKey && !config.sshAgent && !config.password) {
@@ -352,8 +356,61 @@ export class SshExecutor implements CommandExecutor {
     });
   }
 
+  /**
+   * Open a reverse tunnel: the remote listens on an ephemeral 127.0.0.1 port
+   * and every connection to it is handed to `onConnection` as a duplex stream
+   * over this SSH connection. ssh2's 'tcp connection' event is client-wide, so
+   * a single dispatcher routes by the bound `destPort` to the right handler.
+   */
+  async reverseForward(
+    onConnection: (stream: Duplex) => void,
+  ): Promise<{ port: number; close: () => Promise<void> }> {
+    const client = await this.connect();
+    this.attachReverseListener(client);
+
+    const port = await new Promise<number>((resolve, reject) => {
+      client.forwardIn("127.0.0.1", 0, (err, boundPort) => {
+        if (err) return reject(err);
+        resolve(boundPort);
+      });
+    });
+    this.reverseHandlers.set(port, onConnection);
+
+    return {
+      port,
+      close: async () => {
+        this.reverseHandlers.delete(port);
+        await new Promise<void>((resolve) => {
+          try {
+            client.unforwardIn("127.0.0.1", port, () => resolve());
+          } catch {
+            resolve();
+          }
+        });
+      },
+    };
+  }
+
+  /** Attach the single client-wide 'tcp connection' dispatcher (idempotent per client). */
+  private attachReverseListener(client: SshClient): void {
+    if (this.reverseListenerClient === client) return;
+    this.reverseListenerClient = client;
+    client.on("tcp connection", (details, accept, reject) => {
+      const handler = this.reverseHandlers.get(details.destPort);
+      if (!handler) {
+        // No relay registered on this port — refuse rather than leak a channel.
+        try { reject(); } catch { /* already gone */ }
+        return;
+      }
+      const channel = accept();
+      handler(channel as unknown as Duplex);
+    });
+  }
+
   async dispose(): Promise<void> {
     this.connecting = null;
+    this.reverseHandlers.clear();
+    this.reverseListenerClient = null;
     if (this.client) {
       this.client.end();
       this.client = null;

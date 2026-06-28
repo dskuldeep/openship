@@ -176,6 +176,8 @@ async function buildEphemeralExecutor(c: Context) {
       sshPassword: body.sshPassword as string ?? null,
       sshKeyPath: body.sshKeyPath as string ?? null,
       sshKeyPassphrase: body.sshKeyPassphrase as string ?? null,
+      sshJumpHost: body.sshJumpHost as string ?? null,
+      sshArgs: body.sshArgs as string ?? null,
     });
   } catch (err) {
     return c.json({ ok: false, message: safeErrorMessage(err) }, 400);
@@ -680,6 +682,10 @@ export async function monitorStream(c: Context) {
   await permission.assert(getRequestContext(c), { resourceType: "server", resourceId: serverId, action: "read" });
 
   const POLL_INTERVAL = 3_000;
+  // Generous per-sample timeout: on the system-ssh (agent) path each exec is a
+  // fresh ssh process + ControlMaster channel + remote shell, so the heavy
+  // /proc one-liner can take a few seconds on a busy box. 5s was too tight.
+  const STATS_TIMEOUT_MS = 12_000;
 
   return streamSSE(c, async (sseStream) => {
     sshManager.retain(serverId);
@@ -689,11 +695,12 @@ export async function monitorStream(c: Context) {
     try {
       while (!ac.signal.aborted) {
         try {
-          const raw = await sshManager.withExecutor<string>(
-            serverId,
-            (executor: CommandExecutor) =>
-              executor.exec(STATS_COMMAND, { timeout: 5_000 }),
-          );
+          // Use acquire()+exec() rather than withExecutor(): this is a
+          // best-effort background poller, and its timeouts must NOT count
+          // toward the circuit breaker (which would penalize the whole server
+          // for a slow metrics sample). A failed sample just retries next tick.
+          const executor = await sshManager.acquire(serverId);
+          const raw = await executor.exec(STATS_COMMAND, { timeout: STATS_TIMEOUT_MS });
           if (ac.signal.aborted) break;
           JSON.parse(raw); // validate
           await sseStream.writeSSE({ event: "stats", data: raw });

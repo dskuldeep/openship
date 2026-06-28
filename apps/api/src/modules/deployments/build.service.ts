@@ -182,6 +182,13 @@ export interface DeploymentConfigSnapshot {
    * with `status='skipped'` so the fan-out has a complete record.
    */
   targetServiceIds?: string[];
+  /**
+   * Per-deploy opt-in to forward the operator's LOCAL `gh` identity to the
+   * remote host for the on-server clone (desktop-only; default off). Drives the
+   * HTTPS credential relay in the build pipeline — see `allowRelayFallback`.
+   * Nothing is persisted on the remote; the relay closes when the build ends.
+   */
+  forwardGitCredentials?: boolean;
 }
 
 export interface BuildAccessInput {
@@ -206,6 +213,12 @@ export interface BuildAccessInput {
   cloudResourceTier?: CloudResourceTier;
   /** Custom CPU/RAM/disk, used only when cloudResourceTier === "custom". */
   cloudResourceCustom?: CloudResourceCustom;
+  /**
+   * Per-deploy opt-in to forward the operator's local `gh` identity to the
+   * remote host for the on-server clone (desktop-only; default off). Carried
+   * into the snapshot; the pipeline enforces desktop + server-build gating.
+   */
+  forwardGitCredentials?: boolean;
 }
 
 // ─── Helpers ─────────────────────────────────────────────────────────────────
@@ -485,6 +498,7 @@ export async function requestBuildAccess(ctx: RequestContext, input: BuildAccess
     services,
     cloudResourceTier,
     cloudResourceCustom,
+    forwardGitCredentials,
   } = input;
 
   const project = await repos.project.findById(projectId);
@@ -555,6 +569,12 @@ export async function requestBuildAccess(ctx: RequestContext, input: BuildAccess
   }
   if (runtimeMode) {
     snapshot.runtimeMode = runtimeMode;
+  }
+  // Per-deploy git credential forwarding choice (desktop-only; default off).
+  // We carry the raw choice; the build pipeline enforces desktop + server-build
+  // gating before opening the relay, so a forged flag elsewhere is inert.
+  if (forwardGitCredentials === true) {
+    snapshot.forwardGitCredentials = true;
   }
 
   // Openship Cloud resource tier — only a SERVER-BACKED cloud (Oblien)
@@ -687,6 +707,12 @@ export async function getBuildSessionStatus(deploymentId: string) {
   const snapshot = dep.meta as DeploymentConfigSnapshot | null;
   const routeState = await resolveProjectRouteState(project);
 
+  // Resolve the target server's display name (when this deployed to a server),
+  // so the detail UI can show "Server · <name>" rather than a raw id.
+  const targetServer = snapshot?.serverId
+    ? await repos.server.get(snapshot.serverId).catch(() => null)
+    : null;
+
   // Derive step progress from persisted log entries when no active session
   let currentStep = 0;
   let progress = 0;
@@ -695,12 +721,13 @@ export async function getBuildSessionStatus(deploymentId: string) {
     currentStep = undefined as unknown as number;
     progress = undefined as unknown as number;
   } else if (effectiveStatus === "ready") {
-    currentStep = 4; // past deploy
+    currentStep = 5; // past deploy → Ready terminal (steps: prepare,clone,install,build,deploy,ready)
     progress = 100;
   } else {
-    // Scan persisted logs for step events to find where it got to
-    const STEP_INDEX: Record<string, number> = { clone: 0, install: 1, build: 2, deploy: 3 };
-    const STEP_PROGRESS: Record<string, number> = { clone: 5, install: 25, build: 50, deploy: 75 };
+    // Scan persisted logs for step events to find where it got to. Indices must
+    // match the session-manager + the frontend STEPS array (prepare prepended).
+    const STEP_INDEX: Record<string, number> = { prepare: 0, clone: 1, install: 2, build: 3, deploy: 4 };
+    const STEP_PROGRESS: Record<string, number> = { prepare: 3, clone: 10, install: 30, build: 55, deploy: 80 };
     for (const entry of logEntries) {
       if (entry.step && entry.step in STEP_INDEX) {
         const idx = STEP_INDEX[entry.step];
@@ -715,6 +742,24 @@ export async function getBuildSessionStatus(deploymentId: string) {
       }
     }
     // For failed/cancelled, keep progress where it stopped
+  }
+
+  // Per-phase durations for the build-phases panel. The raw log entries (before
+  // the terminal filter) carry each step's running→completed events with
+  // timestamps; pair them per step. Keyed by step name (prepare/clone/…).
+  const phaseDurations: Record<string, number> = {};
+  {
+    const phaseStart: Record<string, number> = {};
+    for (const entry of logEntries) {
+      if (!entry.step || !entry.stepStatus) continue;
+      const t = new Date(entry.timestamp).getTime();
+      if (!Number.isFinite(t)) continue;
+      if (entry.stepStatus === "running") {
+        phaseStart[entry.step] = t;
+      } else if (entry.stepStatus === "completed" && phaseStart[entry.step] != null) {
+        phaseDurations[entry.step] = Math.max(0, t - phaseStart[entry.step]);
+      }
+    }
   }
 
   const [deploymentServices, projectServices] = await Promise.all([
@@ -776,6 +821,12 @@ export async function getBuildSessionStatus(deploymentId: string) {
       projectName: project.name,
       framework: snapshot?.framework || project.framework,
       branch: dep.branch ?? project.gitBranch,
+      // Build/deploy target — shown in Deployment Details. Sourced from the
+      // immutable deployment snapshot so a loaded historical deploy is accurate.
+      buildStrategy: snapshot?.buildStrategy,
+      deployTarget: snapshot?.deployTarget,
+      serverId: snapshot?.serverId,
+      serverName: targetServer?.name ?? null,
       publicEndpoints: routeState.publicEndpoints.map((endpoint) => ({
         id: endpoint.id,
         ...(endpoint.port !== undefined ? { port: String(endpoint.port) } : {}),
@@ -794,6 +845,7 @@ export async function getBuildSessionStatus(deploymentId: string) {
     },
     progress,
     currentStep,
+    phaseDurations,
     screenshots: [],
     buildDurationMs: buildSessionRow?.durationMs ?? null,
     buildStartedAt: buildSessionRow?.startedAt?.toISOString() ?? null,

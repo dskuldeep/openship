@@ -602,6 +602,12 @@ export default function EmailsPage() {
             onPasswordChange={setAdminPassword}
             onServerSelect={setSelectedServer}
             onStart={() => handleStart()}
+            onAdopted={async (serverId) => {
+              // Re-adopted an existing mail server — select it; the
+              // server-change effect refetches its live status.
+              const opt = await loadServerOption(serverId);
+              if (opt) setSelectedServer(opt);
+            }}
           />
         )}
 

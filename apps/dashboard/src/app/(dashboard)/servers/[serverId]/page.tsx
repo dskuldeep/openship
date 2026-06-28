@@ -1,7 +1,7 @@
 "use client";
 
 import { useState, useEffect, useCallback } from "react";
-import { useRouter } from "next/navigation";
+import { useRouter, useSearchParams } from "next/navigation";
 import {
   ArrowLeft,
   CheckCircle2,
@@ -18,6 +18,7 @@ import {
   User,
   KeyRound,
   Shield,
+  Network,
 } from "lucide-react";
 import { ApiError, getApiErrorMessage, isAbortError, systemApi } from "@/lib/api";
 import { useToast } from "@/context/ToastContext";
@@ -26,6 +27,7 @@ import { PageContainer } from "@/components/ui/PageContainer";
 import { useSetupStream } from "@/hooks/useSetupStream";
 import { useMonitorStream } from "@/hooks/useMonitorStream";
 import type { ServerInfo, ComponentStatus, SetupComponentProgress, SetupLogEvent } from "@/lib/api/system";
+import { ServerForm } from "../_components/server-form";
 import { OverviewTab } from "./_components/overview-tab";
 import { ComponentsTab } from "./_components/components-tab";
 import { TerminalTab } from "./_components/terminal-tab";
@@ -36,14 +38,18 @@ import {
 } from "./_components/connection-banner";
 
 import { RateLimitSettings } from "./_components/rate-limit-settings";
+import { PortForwardingCard } from "./_components/port-forwarding-card";
+import { usePlatform } from "@/context/PlatformContext";
 
-type Tab = "overview" | "components" | "security" | "terminal";
+type Tab = "overview" | "components" | "security" | "ports" | "terminal";
 type ManualActionMode = "remove" | null;
 
 interface TabDef {
   key: Tab;
   label: string;
   icon: React.ElementType;
+  /** Desktop-only tabs are filtered out in non-desktop deployments. */
+  desktopOnly?: boolean;
 }
 
 // Mail management lives in /emails - that page picks any server and reads
@@ -52,6 +58,9 @@ const TABS: TabDef[] = [
   { key: "overview",   label: "Overview",   icon: LayoutGrid },
   { key: "components", label: "Components", icon: Blocks },
   { key: "security",   label: "Security",   icon: Shield },
+  // Port forwarding is meaningful only in desktop mode (the orchestrator IS
+  // the user's machine); hidden elsewhere.
+  { key: "ports",      label: "Ports",      icon: Network, desktopOnly: true },
   { key: "terminal",   label: "Terminal",   icon: Terminal },
 ];
 
@@ -61,8 +70,14 @@ export default function ServerDetailPage({
   params: Promise<{ serverId: string }>;
 }) {
   const router = useRouter();
+  const searchParams = useSearchParams();
+  const editing = searchParams.get("edit") === "true";
   const { showToast } = useToast();
   const { showModal, hideModal } = useModal();
+  // Port forwarding is meaningful only in desktop mode (the orchestrator IS
+  // the user's machine). Backend routes are independently gated by assertDesktop.
+  const { deployMode } = usePlatform();
+  const isDesktop = deployMode === "desktop";
   const [serverId, setServerId] = useState<string>("");
   const [server, setServer] = useState<ServerInfo | null>(null);
   const [components, setComponents] = useState<ComponentStatus[]>([]);
@@ -407,6 +422,46 @@ export default function ServerDetailPage({
     );
   }
 
+  // Edit view shares the same route as the detail page (?edit=true) and reuses
+  // the credentials form so add/edit stay in sync.
+  if (editing) {
+    return (
+      <PageContainer>
+          <div className="flex items-center gap-3 mb-6">
+            <button
+              onClick={() => router.push(`/servers/${serverId}`)}
+              className="w-8 h-8 rounded-lg hover:bg-muted flex items-center justify-center transition-colors"
+            >
+              <ArrowLeft className="size-4 text-muted-foreground" />
+            </button>
+            <div>
+              <h1
+                className="text-2xl font-medium text-foreground/80"
+                style={{ letterSpacing: "-0.2px" }}
+              >
+                Edit Server
+              </h1>
+              <p className="text-sm text-muted-foreground/70 mt-0.5">
+                Update connection details for {server.name || server.sshHost}
+              </p>
+            </div>
+          </div>
+
+          <div className="max-w-2xl">
+            <ServerForm
+              key={server.id}
+              server={server}
+              submitLabel="Save Changes"
+              onSaved={({ server: updated }) => {
+                setServer(updated);
+                router.push(`/servers/${serverId}`);
+              }}
+            />
+          </div>
+      </PageContainer>
+    );
+  }
+
   const allHealthy =
     components.length > 0 && components.every((c) => c.healthy);
   const actionBusy = setupStream.isConnected || setupStream.isConnecting || isRemoving;
@@ -459,7 +514,7 @@ export default function ServerDetailPage({
           </div>
           <div className="flex items-center gap-1.5">
             <button
-              onClick={() => router.push(`/servers/${serverId}/edit`)}
+              onClick={() => router.push(`/servers/${serverId}?edit=true`)}
               className="inline-flex items-center gap-2 px-4 py-2 bg-muted/50 text-foreground text-sm font-medium rounded-xl hover:bg-muted transition-colors"
             >
               <Settings2 className="size-4" />
@@ -517,7 +572,7 @@ export default function ServerDetailPage({
           <div className="min-w-0">
             {/* Tabs */}
             <div className="flex items-center gap-1 mb-6 border-b border-border/50">
-              {TABS.map(({ key, label, icon: Icon }) => (
+              {TABS.filter((t) => !t.desktopOnly || isDesktop).map(({ key, label, icon: Icon }) => (
                 <button
                   key={key}
                   onClick={() => setActiveTab(key)}
@@ -576,6 +631,12 @@ export default function ServerDetailPage({
 
             {activeTab === "security" && (
               <RateLimitSettings serverId={serverId} />
+            )}
+
+            {activeTab === "ports" && isDesktop && serverId && (
+              <div className="max-w-2xl">
+                <PortForwardingCard serverId={serverId} />
+              </div>
             )}
 
             {activeTab === "terminal" && (

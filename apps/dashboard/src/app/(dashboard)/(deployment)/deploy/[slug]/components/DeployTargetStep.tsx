@@ -1,7 +1,7 @@
 "use client";
 
 import React, { useEffect, useState, useCallback, useRef } from "react";
-import { Server, Cloud, Cpu, ArrowRight, Pencil, ChevronDown, ChevronUp, CheckCircle2, Loader2, Plus, Sparkles, Settings2, Zap, Globe } from "lucide-react";
+import { Server, Cloud, Cpu, ArrowRight, Pencil, ChevronDown, ChevronUp, CheckCircle2, Loader2, Plus, Sparkles, Settings2, Zap, Globe, GitBranch } from "lucide-react";
 import { useDeployment } from "@/context/DeploymentContext";
 import { usesServiceDeployment } from "@/context/deployment/types";
 import type { DeploymentConfig } from "@/context/deployment/types";
@@ -647,7 +647,10 @@ const CloudPowerPicker: React.FC = () => {
 const DeployTargetStep: React.FC<DeployTargetStepProps> = ({ targets, onContinue, autoSkipAllowed = true }) => {
   const { config, updateConfig } = useDeployment();
   const { requireCloud } = useCloud();
-  const { selfHosted } = usePlatform();
+  const { selfHosted, deployMode } = usePlatform();
+  // Git credential forwarding is desktop-only — the relay forwards the
+  // operator's machine-local `gh`, which only exists on a desktop host.
+  const isDesktop = deployMode === "desktop";
   const { showToast } = useToast();
   const { showModal, hideModal } = useModal();
   const { ready, servers, hasCloudConnected, hasCloudOption, hasChoice, refreshServers } = targets;
@@ -1136,6 +1139,32 @@ const DeployTargetStep: React.FC<DeployTargetStepProps> = ({ targets, onContinue
               <Plus className="size-3.5" />
               Add your own server
             </button>
+          )}
+
+          {/* Git credential forwarding — desktop-only, server target only,
+              default off. Lets the remote clone with the operator's local `gh`
+              instead of build-local-then-upload. Nothing is persisted on the
+              remote; the relay closes when the build ends. */}
+          {isDesktop && config.deployTarget === "server" && (
+            <label className="flex items-start gap-2.5 cursor-pointer select-none rounded-xl border border-border/50 bg-card/40 px-4 py-3">
+              <input
+                type="checkbox"
+                checked={config.forwardGitCredentials === true}
+                onChange={(e) => updateConfig({ forwardGitCredentials: e.target.checked })}
+                className="mt-0.5 size-4 shrink-0 rounded border-border/60 bg-card text-primary focus:ring-2 focus:ring-primary/30 focus:ring-offset-0 cursor-pointer"
+              />
+              <span className="min-w-0">
+                <span className="flex items-center gap-1.5 text-sm font-medium text-foreground">
+                  <GitBranch className="size-3.5 text-muted-foreground" />
+                  Forward my git credentials
+                </span>
+                <span className="mt-0.5 block text-xs text-muted-foreground leading-snug">
+                  Clone on the server using your local{" "}
+                  <span className="font-mono text-foreground/80">gh</span> identity — no
+                  build-and-upload. Nothing is stored on the server.
+                </span>
+              </span>
+            </label>
           )}
         </div>
       )}

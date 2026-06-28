@@ -25,6 +25,10 @@ r.get("/status", { tag: "mail_server:read" }, mail.getStatus);
 // Cross-server mail-install summary - lets the /emails page auto-select
 // the only mail server when there's exactly one.
 r.get("/servers", { tag: "mail_server:list" }, mail.listMailServers);
+// Re-adopt an existing mail install whose orchestrator state was lost (lost PC):
+// scan a server for iRedMail + its on-server state, then adopt it back.
+r.post("/scan", { tag: "mail_server:write" }, mail.scanMailInstall);
+r.post("/adopt", { tag: "mail_server:write" }, mail.adoptMailServer);
 r.post("/setup", { tag: "mail_server:write" }, mail.startSetup);
 r.post("/setup/cancel", { tag: "mail_server:write" }, mail.cancelSetup);
 r.post("/setup/dns-ack", { tag: "mail_server:write" }, mail.acknowledgeDns);

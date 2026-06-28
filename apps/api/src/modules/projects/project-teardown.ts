@@ -34,6 +34,7 @@ import {
   collectProjectManifest,
   executeCleanup,
 } from "./project-cleanup.service";
+import { removeProjectFromServerManifests } from "../../lib/openship-manifest-sync";
 import { cancelBuildSession } from "../deployments/build.service";
 import { deleteWebhook as deleteGitHubWebhook } from "../github/github.service";
 import type { RequestContext } from "../../lib/request-context";
@@ -265,6 +266,11 @@ export async function teardownProject(
 
     // ── Step 4: Webmail filesystem + mail-state. ─────────────────────────
     await stepWebmailTeardown(project, push);
+
+    // Best-effort: drop this project from each server's .openship manifest so a
+    // later recover-from-server scan doesn't re-list it. Desktop-only inside;
+    // never gates the delete (reconcile's running-container check is the guard).
+    await removeProjectFromServerManifests(project).catch(() => {});
 
     // ── ATOMICITY GATE: never drop the DB row while the SOURCE is dirty. ──
     // If runtime cleanup (containers / images / volumes / cloud workspace /

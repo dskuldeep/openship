@@ -26,6 +26,7 @@ import {
 import { platform } from "../../lib/controller-helpers";
 import { internalApiUrl, runtimeTarget } from "../../config";
 import { resolveDeploymentRuntime, resolveDeploymentPlatform } from "../../lib/deployment-runtime";
+import { syncProjectToServerManifest } from "../../lib/openship-manifest-sync";
 import { ensureManagedEdgeProxy } from "../../lib/managed-edge-proxy";
 import { decryptEnvMap } from "../../lib/encryption";
 import {
@@ -37,6 +38,7 @@ import {
 import { normalizeTargetPath } from "../../lib/public-endpoints";
 import { withDefaults } from "../../lib/resources";
 import { resolveBuildGitToken } from "../github/clone-auth";
+import { openDeployRelay } from "../../lib/git-forwarding";
 import { resolveOrgOwner } from "../../lib/org-actor";
 import {
   createCheckRun,
@@ -725,7 +727,36 @@ async function executeBuildAndDeploy(project: Project, dep: Deployment, buildSes
     // would be DENIED by the github-access gate and break the build.
     const orgOwner = await resolveOrgOwner(dep.organizationId).catch(() => null);
     const actorUserId = orgOwner?.userId ?? "";
-    const gitToken = await resolveBuildGitToken({
+    const buildStrategy = snapshot.buildStrategy ?? "server";
+
+    // Resolved up front so the relay-fallback gate below can exclude
+    // multi-service builds (whose clone path differs).
+    const useServicePipeline = (await resolveServicePipelineMode(project, snapshot)).useServicePipeline;
+
+    // Desktop git credential relay is eligible ONLY for a single-app build that
+    // clones ON the remote host: effectiveTarget=server + the bare runtime
+    // (runBuildPipeline clones via the executor) + server strategy. Docker
+    // builds clone locally (token never leaves the orchestrator) and cloud
+    // builds run in the workspace — neither needs/uses the relay.
+    //
+    // Point-of-use, off by default: the operator opts in PER DEPLOY (the deploy
+    // flow's "Forward my git credentials" checkbox → snapshot.forwardGitCredentials).
+    // Desktop-only is enforced here too (defense-in-depth — never honor a forged
+    // flag on a non-desktop host; getLocalGhToken's CLOUD_MODE floor backs it up).
+    let allowRelayFallback = false;
+    if (
+      plat.target === "desktop" &&
+      snapshot.forwardGitCredentials === true &&
+      resolved.effectiveTarget === "server" &&
+      resolved.serverId &&
+      runtime.name === "bare" &&
+      buildStrategy === "server" &&
+      !useServicePipeline
+    ) {
+      allowRelayFallback = true;
+    }
+
+    const gitCred = await resolveBuildGitToken({
       ctx: buildBackgroundContext({
         userId: actorUserId,
         organizationId: dep.organizationId,
@@ -734,7 +765,8 @@ async function executeBuildAndDeploy(project: Project, dep: Deployment, buildSes
       projectId: project.id,
       owner: project.gitOwner ?? undefined,
       repo: project.gitRepo ?? undefined,
-      buildStrategy: snapshot.buildStrategy ?? "server",
+      buildStrategy,
+      allowRelayFallback,
     });
 
     // Monorepo sub-app rows (kind="monorepo") fan out through the standard
@@ -749,10 +781,8 @@ async function executeBuildAndDeploy(project: Project, dep: Deployment, buildSes
       sessionId: buildSessionId,
       envVars: buildEnv.envVars,
       resources: buildResources,
-      gitToken: gitToken ?? undefined,
+      gitToken: gitCred.token,
     });
-
-    const useServicePipeline = (await resolveServicePipelineMode(project, snapshot)).useServicePipeline;
 
     if (useServicePipeline && isMultiServiceRuntime(runtime)) {
       // snapshot.composeServices is a DeployableService[] - mixed compose +
@@ -781,7 +811,7 @@ async function executeBuildAndDeploy(project: Project, dep: Deployment, buildSes
         buildEnvVars: buildEnv.envVars,
         buildResources,
         runtimeResources: prodResources,
-        gitToken: gitToken ?? undefined,
+        gitToken: gitCred.token,
       });
 
       // Roll per-service results up into the project status, emit
@@ -805,7 +835,44 @@ async function executeBuildAndDeploy(project: Project, dep: Deployment, buildSes
       );
     }
 
-    const buildResult = await runtime.build(buildConfig, logger);
+    // Desktop git credential relay (fallback): the operator opted this server
+    // into forwarding and there's no App/PAT token. Open the relay (reverse
+    // tunnel + remote helper) right before the build so the clone fetches the
+    // gh identity on demand — nothing persisted on the build host — and tear it
+    // down in `finally` the moment the build (and its clone) finishes.
+    let deployRelay: { scriptPath: string; close: () => Promise<void> } | null = null;
+    if (gitCred.relay) {
+      if (!targetExecutor || !resolved.serverId) {
+        throw new Error(
+          "Git credential forwarding is enabled, but no SSH executor is available for this server.",
+        );
+      }
+      deployRelay = await openDeployRelay({
+        serverId: resolved.serverId,
+        executor: targetExecutor,
+        sessionId: buildSessionId,
+        // Repo-pin the relay to exactly this deploy's repo (when known) so it
+        // never vends creds for any other repo. Absent owner/repo (e.g. a
+        // local-path project) degrades to host-pin only.
+        expectedOwner: project.gitOwner ?? undefined,
+        expectedRepo: project.gitRepo ?? undefined,
+      });
+      if (!deployRelay) {
+        throw new Error(
+          "Git credential forwarding is enabled for this server, but its SSH auth method can't host the credential relay. Use key or password auth for this server, install the GitHub App, or add a per-project token.",
+        );
+      }
+      buildConfig.gitCredentialHelperPath = deployRelay.scriptPath;
+    }
+
+    let buildResult: Awaited<ReturnType<typeof runtime.build>>;
+    try {
+      buildResult = await runtime.build(buildConfig, logger);
+    } finally {
+      // Reverse tunnel + remote helper script torn down regardless of outcome —
+      // the credential is reachable only for the build's duration.
+      if (deployRelay) await deployRelay.close().catch(() => {});
+    }
     provisioned.imageRef = buildResult.imageRef;
 
     if (buildResult.status === "cancelled") {
@@ -842,6 +909,9 @@ async function executeBuildAndDeploy(project: Project, dep: Deployment, buildSes
       ssl,
       system,
       targetExecutor,
+      baseTarget: plat.target,
+      effectiveTarget: resolved.effectiveTarget,
+      serverId: resolved.serverId,
       usesManagedRouting,
       routeState,
       buildResult,
@@ -875,6 +945,12 @@ interface DeployPhaseInputs {
   ssl: Awaited<ReturnType<typeof platform>>["ssl"];
   system: Awaited<ReturnType<typeof platform>>["system"];
   targetExecutor: CommandExecutor | null;
+  /** Base platform target ("desktop" | "selfhosted" | "cloud") + the resolved
+   *  per-deployment target/server — used to gate the `.openship` manifest write
+   *  to desktop-mode server deploys only. */
+  baseTarget: string;
+  effectiveTarget: string;
+  serverId: string | null;
   usesManagedRouting: boolean;
   routeState: Awaited<ReturnType<typeof resolveProjectRouteState>>;
   buildResult: BuildResult;
@@ -1269,6 +1345,20 @@ async function executeServerDeploy(phase: DeployPhaseInputs): Promise<void> {
     containerId: deployResult.containerId!,
     url: deployResult.url,
     durationMs: buildResult.durationMs ?? 0,
+  });
+
+  // FINAL STEP (desktop-only, best-effort): mirror this project onto the
+  // server's .openship/manifest.json so a fresh orchestrator can re-adopt it.
+  // Self-gated inside — a no-op for VPS/self-hosted and non-server targets.
+  await syncProjectToServerManifest({
+    baseTarget: phase.baseTarget,
+    effectiveTarget: phase.effectiveTarget,
+    serverId: phase.serverId,
+    executor: phase.targetExecutor,
+    project,
+    deployment: dep,
+    containerId: deployResult.containerId!,
+    log: (msg) => logger.log(`${msg}\n`),
   });
 
   await archivePreviousDeployment(dep, project, logger);

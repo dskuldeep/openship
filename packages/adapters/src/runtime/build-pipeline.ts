@@ -138,8 +138,11 @@ export async function runBuildPipeline(
   config: BuildConfig,
   logger: BuildLogger,
 ): Promise<BuildPipelineResult> {
-  const startTime = Date.now();
-  let currentStep: BuildStep = "clone";
+  // Initialized here so the catch below always has a baseline (covers a
+  // failure during prepare). RESET after prepare so the reported build
+  // duration excludes one-time server provisioning.
+  let startTime = Date.now();
+  let currentStep: BuildStep = "prepare";
 
   const exec = (command: string) => env.exec(command, logger.callback);
   const buildDir = resolveBuildDirectory(env.projectDir, config.rootDirectory);
@@ -151,10 +154,19 @@ export async function runBuildPipeline(
   }
 
   try {
-    // ── Pre-build validation ────────────────────────────────────────
+    // ── Prepare: one-time server provisioning (toolchain install, source
+    // transfer). Shown as its own phase and EXCLUDED from build time — the
+    // build clock starts only once the server is ready. Near-instant on
+    // subsequent deploys (tools already present).
     if (env.preflight) {
-      await env.preflight(config, logger);
+      await logger.runStep("prepare", "Preparing server", async () => {
+        await env.preflight!(config, logger);
+      });
     }
+
+    // Build clock starts here — AFTER prepare — so toolchain provisioning
+    // doesn't inflate the build duration.
+    startTime = Date.now();
 
     // ── Step 1: Clone ──────────────────────────────────────────────
     currentStep = "clone";
@@ -167,24 +179,34 @@ export async function runBuildPipeline(
         "clone",
         `Cloning ${config.repoUrl} (branch: ${config.branch})`,
         async () => {
-          const cloneUrl = injectGitToken(config.repoUrl, config.gitToken);
-          // Git env preamble for every clone/fetch invocation. WHY:
-          //   GIT_TERMINAL_PROMPT=0 — don't prompt for credentials on a
-          //     missing token; fail fast with stderr instead of hanging
-          //     attached to a non-existent tty.
-          //   GIT_ASKPASS=/bin/echo — backstop for builds of git that
-          //     ignore GIT_TERMINAL_PROMPT for the askpass path. Echo
-          //     returns immediately so the prompt resolves to empty and
-          //     git errors out cleanly.
-          //   credential.helper= — disable any host-level credential
-          //     helper (osxkeychain, libsecret) from injecting stored
-          //     creds; the URL token is the only auth we want here.
-          //   --progress — git silences progress when stdout isn't a
-          //     tty (build pipes are stdout/stderr captures); forcing
-          //     it on keeps the log stream alive during long clones so
-          //     the user sees movement, not an idle "Cloning…" line.
-          const GIT_ENV =
-            "GIT_TERMINAL_PROMPT=0 GIT_ASKPASS=/bin/echo";
+          // Two auth modes for the clone:
+          //
+          //   Default (token / public): the token (if any) is injected into the
+          //   clone URL, and `-c credential.helper=` DISABLES any host-level
+          //   helper (osxkeychain, libsecret) so the URL token is the only auth.
+          //
+          //   Relay (desktop-only, config.gitCredentialHelperPath set): a plain
+          //   URL + a remote credential-helper script (reached via GIT_CONFIG_*,
+          //   git >=2.31, no ~/.gitconfig write) that fetches the operator's gh
+          //   token on demand over a reverse tunnel — so NO token lands in the
+          //   remote .git/config. Here we must NOT disable credential.helper:
+          //   the helper IS the auth.
+          //
+          // Shared GIT_ENV bits:
+          //   GIT_TERMINAL_PROMPT=0 — never block on an interactive prompt.
+          //   GIT_ASKPASS=/bin/echo — backstop so a missing credential fails
+          //     fast (token mode only; the relay supplies creds via the helper).
+          //   --progress — keep the log stream alive on non-tty build pipes.
+          const useHelper = !!config.gitCredentialHelperPath;
+          const cloneUrl = useHelper
+            ? config.repoUrl
+            : injectGitToken(config.repoUrl, config.gitToken);
+          const GIT_ENV = useHelper
+            ? `GIT_TERMINAL_PROMPT=0 GIT_CONFIG_COUNT=2 GIT_CONFIG_KEY_0=credential.helper GIT_CONFIG_VALUE_0=${sq(config.gitCredentialHelperPath!)} GIT_CONFIG_KEY_1=credential.useHttpPath GIT_CONFIG_VALUE_1=true`
+            : "GIT_TERMINAL_PROMPT=0 GIT_ASKPASS=/bin/echo";
+          // Disable host credential helpers in token mode; in relay mode the
+          // helper is exactly what we want, so leave it enabled.
+          const CRED = useHelper ? "" : "-c credential.helper=";
           if (config.commitSha) {
             // Depth 50 strikes a balance: deep enough to reach the
             // commit for the vast majority of rollbacks, but still
@@ -192,7 +214,7 @@ export async function runBuildPipeline(
             // targets fall through to the unshallow fallback below.
             try {
               await exec(
-                `${GIT_ENV} git -c credential.helper= clone --progress --depth 50 --branch ${sq(config.branch)} ${sq(cloneUrl)} ${sq(env.projectDir)} && cd ${sq(env.projectDir)} && git -c credential.helper= -c advice.detachedHead=false checkout ${sq(config.commitSha)}`,
+                `${GIT_ENV} git ${CRED} clone --progress --depth 50 --branch ${sq(config.branch)} ${sq(cloneUrl)} ${sq(env.projectDir)} && cd ${sq(env.projectDir)} && git ${CRED} -c advice.detachedHead=false checkout ${sq(config.commitSha)}`,
               );
             } catch (initialErr) {
               // Fallback: SHA not in the shallow window (rollback
@@ -205,12 +227,12 @@ export async function runBuildPipeline(
                 "warn",
               );
               await exec(
-                `cd ${sq(env.projectDir)} && ${GIT_ENV} git -c credential.helper= fetch --progress --unshallow && git -c credential.helper= -c advice.detachedHead=false checkout ${sq(config.commitSha)}`,
+                `cd ${sq(env.projectDir)} && ${GIT_ENV} git ${CRED} fetch --progress --unshallow && git ${CRED} -c advice.detachedHead=false checkout ${sq(config.commitSha)}`,
               );
             }
           } else {
             await exec(
-              `${GIT_ENV} git -c credential.helper= clone --progress --depth 1 --branch ${sq(config.branch)} ${sq(cloneUrl)} ${sq(env.projectDir)}`,
+              `${GIT_ENV} git ${CRED} clone --progress --depth 1 --branch ${sq(config.branch)} ${sq(cloneUrl)} ${sq(env.projectDir)}`,
             );
           }
         },

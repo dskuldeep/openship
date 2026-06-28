@@ -99,6 +99,16 @@ async function shutdown(signal: NodeJS.Signals): Promise<void> {
     console.warn("[shutdown] tunnel close failed:", err);
   }
 
+  // Close any live SSH port-forward tunnels (desktop-only feature; the
+  // manager is RAM-only, so this Map is empty on SaaS/VPS and the import
+  // is cheap). Dynamic import keeps it off the cloud startup path.
+  try {
+    const { stopAllTunnels } = await import("./lib/ssh-tunnel-manager");
+    await stopAllTunnels();
+  } catch (err) {
+    console.warn("[shutdown] port-forward close failed:", err);
+  }
+
   try {
     const runner = await getJobRunner();
     await runner.shutdown(20_000);

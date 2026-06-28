@@ -30,11 +30,13 @@ export interface BuildConfigFactoryOptions {
   envVars: Record<string, string>;
   resources: ResourceConfig;
   gitToken?: string;
+  /** Desktop-only: remote credential-helper script path (deploy relay fallback). */
+  gitCredentialHelperPath?: string;
   overrides?: Partial<BuildConfig>;
 }
 
 export function createBuildConfig(opts: BuildConfigFactoryOptions): BuildConfig {
-  const { project, dep, snapshot, sessionId, envVars, resources, gitToken, overrides } = opts;
+  const { project, dep, snapshot, sessionId, envVars, resources, gitToken, gitCredentialHelperPath, overrides } = opts;
 
   return {
     sessionId,
@@ -61,6 +63,7 @@ export function createBuildConfig(opts: BuildConfigFactoryOptions): BuildConfig 
     envVars,
     resources,
     gitToken,
+    gitCredentialHelperPath,
     ...overrides,
   };
 }

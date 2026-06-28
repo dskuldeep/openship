@@ -480,13 +480,11 @@ function buildHandlers(ctx: HandshakeCtx) {
       const data = evt.data;
       // Binary path - happens for almost every keystroke.
       if (data instanceof ArrayBuffer) {
-        if (state.sessionId) touchSession(state.sessionId);
-        try { state.shell.stdin.write(Buffer.from(data)); } catch { /* shell gone */ }
+        writeStdin(state, Buffer.from(data));
         return;
       }
       if (data instanceof Uint8Array || Buffer.isBuffer(data)) {
-        if (state.sessionId) touchSession(state.sessionId);
-        try { state.shell.stdin.write(Buffer.from(data as Uint8Array)); } catch { /* shell gone */ }
+        writeStdin(state, Buffer.from(data as Uint8Array));
         return;
       }
       // Text path - JSON control. Anything that doesn't parse or doesn't
@@ -547,6 +545,13 @@ function buildHandlers(ctx: HandshakeCtx) {
   };
 }
 
+/** Write client bytes to the shell's stdin. */
+function writeStdin(state: ConnState, buf: Buffer): void {
+  if (!state.shell) return;
+  if (state.sessionId) touchSession(state.sessionId);
+  try { state.shell.stdin.write(buf); } catch { /* shell gone */ }
+}
+
 // ─── Teardown ───────────────────────────────────────────────────────────────
 
 /**
@@ -591,11 +596,12 @@ async function teardown(
     state.shell = null;
   }
 
-  // Release the SSH connection retain we acquired at openShell time.
-  // Safe to call even if retain wasn't reached: sshManager.release()
-  // floors at 0.
-  sshManager.release(state.ctx.serverId);
-
+  // unregisterSession is the SINGLE definitive session-end. It owns releasing
+  // the SSH retain (acquired at openShell) — reached from every path including
+  // the idle/cap timeout, which unregisters BEFORE this teardown runs. Doing the
+  // release there (not here) keeps it atomic with session lifetime: the park path
+  // never reaches this, so a parked-then-resumed session keeps its connection
+  // pinned, and a parked-then-timed-out session still releases exactly once.
   if (!alreadyUnregistered && state.sessionId) {
     unregisterSession(state.sessionId);
   }

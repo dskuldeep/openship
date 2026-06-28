@@ -268,3 +268,17 @@ if (env.CLOUD_MODE) {
   startNotificationRunner();
   console.log("[boot] notification runner started");
 }
+
+// ─── Feature startup hooks (self-hosted only) ───────────────────────
+//
+// Registry-based home for boot behavior that individual features opt
+// into via `registerStartupHook` — e.g. desktop re-establishing its
+// saved port-forward tunnels. No-op under CLOUD_MODE; each hook is
+// further gated by its declared modes. The ad-hoc boot blocks above
+// stay as-is (some are cloud); new self-hosted boot work belongs here.
+{
+  const { registerStartupHooks } = await import("./lib/startup/register");
+  const { runStartupHooks } = await import("./lib/startup");
+  registerStartupHooks();
+  await runStartupHooks();
+}

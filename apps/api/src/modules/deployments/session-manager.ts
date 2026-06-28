@@ -45,17 +45,19 @@ export type SseWriter = (event: string, data: string) => boolean;
 // ─── Step-to-progress mapping ────────────────────────────────────────────────
 
 const STEP_INDEX: Record<string, number> = {
-  clone: 0,
-  install: 1,
-  build: 2,
-  deploy: 3,
+  prepare: 0,
+  clone: 1,
+  install: 2,
+  build: 3,
+  deploy: 4,
 };
 
 const STEP_PROGRESS: Record<string, number> = {
-  clone: 5,
-  install: 25,
-  build: 50,
-  deploy: 75,
+  prepare: 3,
+  clone: 10,
+  install: 30,
+  build: 55,
+  deploy: 80,
 };
 
 function progressForStep(step: string, stepStatus?: LogEntry["stepStatus"]): number {

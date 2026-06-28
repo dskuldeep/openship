@@ -160,6 +160,22 @@ export function assertNotCloud(c: Context): Response | null {
   return null;
 }
 
+/**
+ * Desktop-only route guard. Returns a 404 Response unless the platform target
+ * resolves to "desktop", or `null` when the route may proceed.
+ *
+ * Pairs with `localOnly` for desktop-exclusive features (e.g. SSH port-forward
+ * tunnels): `localOnly` keeps them out of SaaS, this also keeps them out of a
+ * self-hosted VPS — where forwarding a remote port to "localhost" is
+ * meaningless. Defense-in-depth on top of routing-level gates.
+ */
+export function assertDesktop(c: Context): Response | null {
+  if (resolvePlatformConfig().target !== "desktop") {
+    return c.json({ error: "Not available in this mode" }, 404);
+  }
+  return null;
+}
+
 // ─── Platform resolution ─────────────────────────────────────────────────────
 
 /**

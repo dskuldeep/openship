@@ -1,0 +1,89 @@
+# Git credential forwarding (desktop-only)
+
+Lets a **server build clone on a remote server using the operator's LOCAL `gh` identity** — so you
+don't have to use the Openship Cloud GitHub App token *and* don't have to build locally then upload —
+**without persisting any credential on the remote**. One consumer:
+
+| Consumer | Entry point | Use |
+|---|---|---|
+| **Deployment** | `openDeployRelay()` ([deploy.ts](./deploy.ts)) | Clone on a self-hosted server during a server build, repo-pinned to the deploy's repo. |
+
+It is **point-of-use, off by default**: there is **no persistent server flag**. The operator opts in
+**per deploy** via the "Forward my git credentials" checkbox in the deploy flow's target step; the
+choice is persisted into the deployment's config snapshot. The build pipeline re-checks **desktop mode**
+server-side before opening a relay (never trust a client-sent flag on a non-desktop host), and the
+`gh`-token path self-disables under `CLOUD_MODE`.
+
+> The interactive **terminal** does *not* forward credentials. It was intentionally dropped: a terminal
+> is interactive (arbitrary repos → can't be repo-pinned) with a longer live window, making it the one
+> path that would vend creds for *any* repo. Concentrating on the deploy path — repo known up front,
+> window = build duration — gives one tight, well-scoped path. SSH-protocol git (`git@github.com`) is
+> not covered either (that needs connection-level SSH-agent forwarding); deploys clone over HTTPS.
+
+## How it works — HTTPS credential relay (`https://github.com`, the `gh` token)
+
+On-demand, never-persisted. Flow:
+
+1. **Reverse tunnel** — `reverseForward` asks the remote to listen on an ephemeral `127.0.0.1` port
+   and pipe each connection back to this process over the existing SSH connection.
+2. **Helper script** — `writeHelperScript` ([relay.ts](./relay.ts)) drops a `0700` bash script at
+   `~/.openship/cred-<session>.sh`. It holds **no secret** — just `/dev/tcp/127.0.0.1/<port>` + a
+   per-session nonce. git is pointed at it via `GIT_CONFIG_*` env (no `~/.gitconfig` write), and the
+   clone uses a **plain URL** (no token in the remote `.git/config`).
+3. **Relay** — `openRelay` + `handleConnection` ([relay.ts](./relay.ts)) speak git's credential
+   wire-protocol: validate the **nonce** (`timingSafeEqual`), pin **`host == github.com` + https**,
+   **pin the repo** to the deploy's `owner/repo` (case-insensitive — denies any other), resolve the
+   token via **`getLocalGhToken()`**, reply `username=x-access-token` + `password=<token>`. Per-relay
+   **rate limit**; a structured **log line per request** (never the token).
+
+The token reaches the remote only inside the git process's memory for that one clone — never on disk,
+env, or `.git/config`. The relay opens right before `runtime.build` and closes in a `finally`, so it's
+live only for the build's duration.
+
+## Scope of the forwarded token (important)
+The `gh` token is **account-wide** — GitHub doesn't let us downscope an OAuth/`gh` token on the fly.
+**True per-repo scoping comes only from the GitHub App installation token, which the deploy pipeline
+already PREFERS**; this relay is the fallback for the local-`gh` case. The **repo-pin is therefore
+defense-in-depth, not a hard wall**: a same-uid/root process on the live remote that can read the
+`0700` helper could pose as the deploy's repo and still pull the full token. What the repo-pin *does*
+guarantee is the relay never vends creds for any **other** repo. The hard protections remain:
+desktop-only + per-deploy opt-in + short build-bounded window + nonce + host-pin.
+
+## Security model
+- Per-operation, never-persisted token; nonce-gated; host- and repo-pinned; rate-limited; logged
+  (token-free).
+- Open **only while the build is live** (opened pre-build, closed in `finally`).
+- **Inherent trust assumption (same as VS Code):** while the tunnel is live, a same-uid/root process on
+  that remote can read the `0700` script and obtain the (account-wide) token. That is why this is
+  **desktop-only + opt-in per deploy**.
+
+## Coverage
+- **Key/password-auth servers** (ssh2 path) → the HTTPS relay works (`reverseForward` available).
+- **Agent-auth servers** (OS-`ssh` path) → `reverseForward` is unavailable, so `openDeployRelay`
+  returns `null` and the build errors clearly (use key/password auth, the GitHub App, or a per-project
+  token).
+
+## Files (this folder)
+- `relay.ts` — the security core: reverse-tunnel handler + credential wire-protocol + nonce + host pin
+  + repo pin + `gh` token + rate-limit + log + idempotent `close()`; the `0700` helper script
+  (`buildHelperScript`/`writeHelperScript`).
+- `deploy.ts` — `openDeployRelay` (the one consumer).
+- `index.ts` — public API.
+
+## Touch points outside this folder (intentional — generic infra / policy)
+- **Reverse-tunnel primitive**: `reverseForward` on `packages/adapters/src/system/ssh-executor.ts`
+  (+ `CommandExecutor.reverseForward` in `packages/adapters/src/system/types.ts`).
+- **Deploy choice thread**: `DeploymentConfig.forwardGitCredentials`
+  (`apps/dashboard/src/context/deployment/types.ts`) + the `DeployTargetStep` checkbox → the
+  `buildAccess` payload (`useDeploymentBuild.tsx` + `apps/dashboard/src/lib/api/deploy.ts`) →
+  `BuildAccessInput` → `DeploymentConfigSnapshot` in `requestBuildAccess`
+  (`apps/api/src/modules/deployments/build.service.ts`) → the `allowRelayFallback` gate (desktop +
+  server-build + opt-in) and the `openDeployRelay` call passing `project.gitOwner/gitRepo`
+  (`apps/api/src/modules/deployments/build-pipeline.ts`).
+- **Deploy token fallback**: `resolveBuildGitToken` in `apps/api/src/modules/github/clone-auth.ts`
+  (returns `{ relay: true }` when no App/PAT + the deploy opted in) + the credential-helper clone branch
+  in `packages/adapters/src/runtime/build-pipeline.ts`.
+
+## Status
+Typechecked + adversarially reviewed. **Not yet runtime-tested** against a live server. No DB migration
+is required.

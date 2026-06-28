@@ -14,7 +14,7 @@
  *
  * State model:
  *   - Durable state ("what HAS been installed") lives on the target VPS at
- *     /root/.openship-mail-state.json. Purge the VPS, state goes with it.
+ *     /root/.openship/mail-state.json. Purge the VPS, state goes with it.
  *   - Ephemeral state ("is an install running RIGHT NOW") lives as one
  *     `activeSession` variable in this process. Lost on API restart, which
  *     is fine - if openship restarts mid-install, the on-server state file
@@ -39,6 +39,7 @@ import { permission } from "../../lib/permission";
 import { isServerInOrg } from "../../lib/controller-helpers";
 import {
   MAIL_SETUP_STEPS,
+  detectMailInstall,
   TOTAL_STEPS,
   STEP_RUNNERS,
   STEP_TIMEOUT_MS,
@@ -358,6 +359,117 @@ export async function listMailServers(c: Context) {
     .filter((r): r is NonNullable<typeof r> => r !== null);
 
   return c.json({ servers: out });
+}
+
+/**
+ * POST /mail/scan  { serverId }
+ *
+ * Probe a server for an EXISTING mail install whose orchestrator state was lost
+ * (e.g. the desktop was rebuilt). Read-only — detects iRedMail (postfix +
+ * dovecot active) and reads the on-server state file, so the user can re-adopt
+ * a server they already set up instead of reinstalling.
+ */
+export async function scanMailInstall(c: Context) {
+  if (env.CLOUD_MODE) return c.json({ error: "Not available" }, 404);
+
+  const { serverId } = await c.req.json<{ serverId?: string }>();
+  if (!serverId) return c.json({ error: "serverId is required" }, 400);
+
+  await permission.assert(getRequestContext(c), {
+    resourceType: "mail_server",
+    resourceId: serverId,
+    action: "write",
+  });
+  const ctx = getRequestContext(c);
+  if (!(await isServerInOrg(ctx, serverId))) {
+    return c.json({ error: "Server not found" }, 404);
+  }
+
+  try {
+    const { iredmailInstalled, state } = await sshManager.withExecutor(
+      serverId,
+      async (exec) => ({
+        iredmailInstalled: await detectMailInstall(exec),
+        state: await readState(exec),
+      }),
+    );
+    const installComplete =
+      !!state &&
+      MAIL_SETUP_STEPS.length > 0 &&
+      MAIL_SETUP_STEPS.every(
+        (step) => state.completedSteps[String(step.id)]?.success === true,
+      );
+    return c.json({
+      serverId,
+      iredmailInstalled,
+      hasState: !!state,
+      domain: state?.domain ?? null,
+      installComplete,
+      webmailPresent: !!state?.webmail?.installed,
+      // Something to adopt iff a live stack OR a state file with a domain exists.
+      adoptable: iredmailInstalled || !!state?.domain,
+    });
+  } catch (err) {
+    return c.json({ error: `Scan failed: ${safeErrorMessage(err)}` }, 502);
+  }
+}
+
+/**
+ * POST /mail/adopt  { serverId }
+ *
+ * Re-adopt an existing mail server detected by /mail/scan: upsert the
+ * `mail_servers` row from the on-server state so the dashboard manages it
+ * again. Idempotent — no reinstall, nothing changes on the server.
+ */
+export async function adoptMailServer(c: Context) {
+  if (env.CLOUD_MODE) return c.json({ error: "Not available" }, 404);
+
+  const { serverId } = await c.req.json<{ serverId?: string }>();
+  if (!serverId) return c.json({ error: "serverId is required" }, 400);
+
+  await permission.assert(getRequestContext(c), {
+    resourceType: "mail_server",
+    resourceId: serverId,
+    action: "write",
+  });
+  const ctx = getRequestContext(c);
+  if (!(await isServerInOrg(ctx, serverId))) {
+    return c.json({ error: "Server not found" }, 404);
+  }
+
+  try {
+    const { iredmailInstalled, state } = await sshManager.withExecutor(
+      serverId,
+      async (exec) => ({
+        iredmailInstalled: await detectMailInstall(exec),
+        state: await readState(exec),
+      }),
+    );
+    const domain = state?.domain;
+    if (!domain) {
+      return c.json(
+        {
+          error: iredmailInstalled
+            ? "A mail stack is running but no Openship state file was found — re-run setup to manage it."
+            : "No mail server found on this server.",
+        },
+        404,
+      );
+    }
+    const installComplete =
+      MAIL_SETUP_STEPS.length > 0 &&
+      MAIL_SETUP_STEPS.every(
+        (step) => state.completedSteps[String(step.id)]?.success === true,
+      );
+    await repos.mailServer.upsert({
+      serverId,
+      domain,
+      installedAt: installComplete ? new Date() : null,
+    });
+    return c.json({ success: true, serverId, domain, completed: installComplete });
+  } catch (err) {
+    return c.json({ error: `Adopt failed: ${safeErrorMessage(err)}` }, 502);
+  }
 }
 
 /**

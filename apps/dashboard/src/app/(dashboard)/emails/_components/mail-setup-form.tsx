@@ -14,6 +14,7 @@ import {
   Sparkles,
 } from "lucide-react";
 import ServerSelector, { type ServerOption } from "@/components/shared/ServerSelector";
+import { AdoptMailModal } from "./adopt-mail-modal";
 
 /**
  * Browser-side strong-password generation. 18 random bytes →
@@ -38,6 +39,8 @@ interface MailSetupFormProps {
   onPasswordChange: (v: string) => void;
   onServerSelect: (s: ServerOption | null) => void;
   onStart: () => void;
+  /** Called after an existing mail server is re-adopted from a scan. */
+  onAdopted: (serverId: string) => void;
 }
 
 export function MailSetupForm({
@@ -49,7 +52,9 @@ export function MailSetupForm({
   onPasswordChange,
   onServerSelect,
   onStart,
+  onAdopted,
 }: MailSetupFormProps) {
+  const [adoptOpen, setAdoptOpen] = useState(false);
   return (
     <div className="grid grid-cols-1 lg:grid-cols-[1fr_380px] gap-6">
       {/* Setup form */}
@@ -115,15 +120,33 @@ export function MailSetupForm({
           </div>
         </div>
 
-        <button
-          onClick={onStart}
-          disabled={!domain || !adminPassword || !selectedServerId || running}
-          className="inline-flex items-center gap-2 px-5 py-2.5 bg-primary text-primary-foreground text-sm font-medium rounded-xl hover:bg-primary/90 transition-all hover:shadow-lg hover:shadow-primary/25 disabled:opacity-50 disabled:cursor-not-allowed"
-        >
-          <Play className="size-4" />
-          Start Setup
-        </button>
+        <div className="flex flex-wrap items-center gap-x-4 gap-y-2">
+          <button
+            onClick={onStart}
+            disabled={!domain || !adminPassword || !selectedServerId || running}
+            className="inline-flex items-center gap-2 px-5 py-2.5 bg-primary text-primary-foreground text-sm font-medium rounded-xl hover:bg-primary/90 transition-all hover:shadow-lg hover:shadow-primary/25 disabled:opacity-50 disabled:cursor-not-allowed"
+          >
+            <Play className="size-4" />
+            Start Setup
+          </button>
+          {/* Disaster recovery: re-adopt a mail server already installed on a
+              server (e.g. after losing the orchestrator PC) without reinstalling. */}
+          <button
+            type="button"
+            onClick={() => setAdoptOpen(true)}
+            disabled={running}
+            className="text-sm text-muted-foreground hover:text-foreground underline-offset-2 hover:underline disabled:opacity-50"
+          >
+            Already have a mail server? Adopt it
+          </button>
+        </div>
       </div>
+
+      <AdoptMailModal
+        isOpen={adoptOpen}
+        onClose={() => setAdoptOpen(false)}
+        onAdopted={onAdopted}
+      />
 
       {/* Info sidebar */}
       <div className="space-y-4">

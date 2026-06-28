@@ -48,6 +48,11 @@ export {
 } from "./instance-settings.repo";
 export { createServerRepo, type Server, type NewServer } from "./server.repo";
 export {
+  createServerTunnelRepo,
+  type ServerTunnel,
+  type NewServerTunnel,
+} from "./server-tunnel.repo";
+export {
   createMailServerRepo,
   type MailServer,
   type NewMailServer,
@@ -145,6 +150,7 @@ import { createServiceDeploymentRepo } from "./service-deployment.repo";
 import { createSettingsRepo } from "./settings.repo";
 import { createInstanceSettingsRepo } from "./instance-settings.repo";
 import { createServerRepo } from "./server.repo";
+import { createServerTunnelRepo } from "./server-tunnel.repo";
 import { createMailServerRepo } from "./mail-server.repo";
 import { createAnalyticsRepo } from "./analytics.repo";
 import { createTerminalSessionRepo } from "./terminal-session.repo";
@@ -195,6 +201,7 @@ export const repos = {
   settings: createSettingsRepo(db),
   instanceSettings: createInstanceSettingsRepo(db),
   server: createServerRepo(db),
+  serverTunnel: createServerTunnelRepo(db),
   mailServer: createMailServerRepo(db),
   analytics: createAnalyticsRepo(db),
   terminalSession: createTerminalSessionRepo(db),

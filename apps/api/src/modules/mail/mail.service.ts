@@ -57,6 +57,23 @@ function errMsg(err: unknown): string {
 }
 
 /**
+ * Probe whether a working iRedMail stack is already installed on the server.
+ * iRedMail is "present" when both postfix and dovecot are active systemd
+ * services. Used by the install pre-flight (to skip the engine + rotate the
+ * postmaster password) AND by the "scan & adopt" flow (to re-adopt a server
+ * whose orchestrator state was lost). Pure read — no mutation.
+ */
+export async function detectMailInstall(exec: CommandExecutor): Promise<boolean> {
+  const postfixState = (
+    await exec.exec("systemctl is-active postfix 2>/dev/null || echo missing")
+  ).trim();
+  const dovecotState = (
+    await exec.exec("systemctl is-active dovecot 2>/dev/null || echo missing")
+  ).trim();
+  return postfixState === "active" && dovecotState === "active";
+}
+
+/**
  * Run a command with real-time log streaming.
  * Every stdout/stderr line is forwarded to the StepLogger so the frontend
  * sees actual SSH output as it happens.
@@ -623,14 +640,7 @@ export async function stepRunInstaller(
   // (via doveadm + UPDATE) to match the value the dashboard is about
   // to surface. The other daemons stay untouched.
   log(stepId, "info", "Checking whether iRedMail is already installed...");
-  const postfixState = (
-    await exec.exec("systemctl is-active postfix 2>/dev/null || echo missing")
-  ).trim();
-  const dovecotState = (
-    await exec.exec("systemctl is-active dovecot 2>/dev/null || echo missing")
-  ).trim();
-  const alreadyInstalled =
-    postfixState === "active" && dovecotState === "active";
+  const alreadyInstalled = await detectMailInstall(exec);
 
   if (alreadyInstalled) {
     log(

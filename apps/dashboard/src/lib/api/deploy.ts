@@ -201,6 +201,9 @@ export const deployApi = {
     }>;
     cloudResourceTier?: CloudResourceTier;
     cloudResourceCustom?: CloudResourceCustom;
+    /** Desktop-only, per-deploy: forward the local `gh` identity for an
+     *  on-server clone (relay). The API enforces desktop + server-build gating. */
+    forwardGitCredentials?: boolean;
   }) =>
     api.post<any>(endpoints.deploy.buildAccess, payload),
 

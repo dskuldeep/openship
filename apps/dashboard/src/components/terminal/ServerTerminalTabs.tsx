@@ -113,8 +113,11 @@ export function ServerTerminalTabs({
   const counterRef = useRef(1);
   const [shells, setShells] = useState<ShellEntry[]>(() => {
     const loaded = loadShells(serverId);
-    if (loaded && loaded.shells.length > 0) {
-      counterRef.current = Math.max(loaded.counter, loaded.shells.length);
+    // Respect prior state INCLUDING an explicitly-emptied panel (loaded but
+    // zero shells) — we only seed a starter shell on a truly fresh visit
+    // (no stored state at all).
+    if (loaded) {
+      counterRef.current = Math.max(loaded.counter, loaded.shells.length, 1);
       return loaded.shells;
     }
     return [{ id: genId(), label: "Shell 1", resumeToken: null }];
@@ -188,22 +191,6 @@ export function ServerTerminalTabs({
     });
   }, [shells]);
 
-  // Restore one shell if the user closes the last. Empty terminal
-  // panel is a dead-end UX. Effect (not render-time setState) so we
-  // don't violate React's "no setState during render" rule.
-  useEffect(() => {
-    if (shells.length === 0) {
-      counterRef.current += 1;
-      const fresh: ShellEntry = {
-        id: genId(),
-        label: `Shell ${counterRef.current}`,
-        resumeToken: null,
-      };
-      setShells([fresh]);
-      setActiveId(fresh.id);
-    }
-  }, [shells.length]);
-
   return (
     <div className={`flex h-full w-full flex-col ${className}`}>
       {/* ── Tab strip ────────────────────────────────────────────────── */}
@@ -275,6 +262,19 @@ export function ServerTerminalTabs({
           All mounted, only one visible. The hidden ones keep their WS
           open so output keeps flowing into scrollback. */}
       <div className="relative min-h-0 flex-1">
+        {shells.length === 0 && (
+          <div className="absolute inset-0 flex flex-col items-center justify-center gap-3 text-center">
+            <p className="text-sm text-muted-foreground/70">No open terminals.</p>
+            <button
+              type="button"
+              onClick={handleAdd}
+              className="inline-flex items-center gap-1.5 rounded-xl border border-border/50 bg-muted/30 px-4 py-2 text-[13px] font-medium text-foreground transition-colors hover:bg-muted/60"
+            >
+              <Plus className="size-3.5" />
+              New shell
+            </button>
+          </div>
+        )}
         {shells.map((shell) => {
           const isActive = shell.id === activeId;
           return (

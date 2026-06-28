@@ -414,6 +414,9 @@ export class BareRuntime implements RuntimeAdapter {
     if (toolcheck.ready) return;
 
     const requiredTools = toolcheck.tools.filter((tool) => !tool.healthy);
+    // Make the one-time nature explicit: this only installs on a fresh server;
+    // subsequent deploys find the tools present and skip straight past prepare.
+    plog.log("Installing build tools (one-time server setup)…\n");
     plog.log(`${requiredTools.map((tool) => tool.message).join("\n")}\n`);
 
     const results = await installTools(

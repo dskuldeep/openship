@@ -32,7 +32,7 @@ export type { SetupState, SetupStateStore, ComponentState } from "./state";
 export { FileStateStore } from "./state";
 
 // ─── Executor ────────────────────────────────────────────────────────────────
-export { LocalExecutor, SshExecutor, createExecutor } from "./executor";
+export { LocalExecutor, SshExecutor, SystemSshExecutor, createExecutor } from "./executor";
 
 // ─── Checks ──────────────────────────────────────────────────────────────────
 export {

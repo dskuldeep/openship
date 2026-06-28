@@ -27,6 +27,8 @@
 
 import { homedir } from "node:os";
 import { readFileSync } from "node:fs";
+import { execFile } from "node:child_process";
+import { promisify } from "node:util";
 import { repos } from "@repo/db";
 import {
   createExecutor,
@@ -39,6 +41,54 @@ import { decryptSecretField } from "@/lib/credential-encryption";
 import { resolveSafeSshKeyPath } from "@/lib/ssh-key-path";
 import { safeErrorMessage } from "@repo/core";
 
+const execFileAsync = promisify(execFile);
+
+/**
+ * Resolve the SSH agent socket for "agent" auth.
+ *
+ * The orchestrator is often a GUI-launched desktop app that never inherited the
+ * user's `SSH_AUTH_SOCK` from a login shell — so plain `process.env` is empty
+ * even though `ssh` works fine in the user's terminal. When the env var is
+ * unset, ask the OS for the per-user agent socket: on macOS `launchctl getenv
+ * SSH_AUTH_SOCK` returns it even for GUI processes (the same trick VS Code uses).
+ * Returns null when no agent can be found.
+ */
+async function resolveSshAuthSock(): Promise<string | null> {
+  // 1. Inherited env — covers shell- and service-launched processes on every
+  //    platform (the common case for the dev server and self-hosted installs).
+  const fromEnv = process.env.SSH_AUTH_SOCK;
+  if (fromEnv) return fromEnv;
+
+  // 2. GUI-launched apps (the desktop shell) often don't inherit it. Ask the
+  //    OS session manager for the per-user value.
+  if (process.platform === "darwin") {
+    // macOS: the value lives in the launchd user session.
+    try {
+      const { stdout } = await execFileAsync("launchctl", ["getenv", "SSH_AUTH_SOCK"]);
+      const sock = stdout.trim();
+      if (sock) return sock;
+    } catch {
+      // launchctl missing / no value — fall through.
+    }
+  } else if (process.platform === "linux") {
+    // Linux desktops that run an ssh-agent under the systemd user manager
+    // (gnome-keyring, the ssh-agent.service unit) export it there.
+    try {
+      const { stdout } = await execFileAsync("systemctl", ["--user", "show-environment"]);
+      const line = stdout.split("\n").find((l) => l.startsWith("SSH_AUTH_SOCK="));
+      const sock = line?.slice("SSH_AUTH_SOCK=".length).trim();
+      if (sock) return sock;
+    } catch {
+      // systemctl missing (non-systemd) / no value — fall through.
+    }
+  }
+  // Windows: the OpenSSH agent is a named pipe, not a socket, and the
+  // system-ssh path isn't supported there — return null. The caller still
+  // proceeds; `ssh` resolves auth itself (default keys / config) or fails
+  // with a clear error.
+  return null;
+}
+
 // ─── Shared SSH config builder ───────────────────────────────────────────────
 
 /** Settings shape accepted by `buildSshConfig`. */
@@ -50,6 +100,8 @@ export interface SshSettingsInput {
   sshPassword?: string | null;
   sshKeyPath?: string | null;
   sshKeyPassphrase?: string | null;
+  sshJumpHost?: string | null;
+  sshArgs?: string | null;
 }
 
 /**
@@ -68,6 +120,10 @@ export async function buildSshConfig(
     port: settings.sshPort ?? 22,
     username: settings.sshUser ?? "root",
   };
+
+  // Jump host / extra args are honored by the system-ssh path (agent auth).
+  if (settings.sshJumpHost?.trim()) config.sshJumpHost = settings.sshJumpHost.trim();
+  if (settings.sshArgs?.trim()) config.sshArgs = settings.sshArgs.trim();
 
   if (settings.sshAuthMethod === "password" && settings.sshPassword) {
     // Stored encrypted on insert; decrypted only here at the moment we
@@ -95,20 +151,17 @@ export async function buildSshConfig(
       config.privateKeyPassphrase = decryptSecretField(settings.sshKeyPassphrase);
     }
   } else if (settings.sshAuthMethod === "agent") {
-    // Use the host's SSH agent (SSH_AUTH_SOCK) — like VSCode Remote-SSH. No
-    // password or key is stored; the agent must already hold a key the
-    // server accepts (e.g. the operator ran `ssh-copy-id` / `ssh` to it
-    // before). Self-hosted only — this is the API host's own agent. The
-    // `sshAgent` field flows through toConnectConfig → ssh2's `agent` option.
-    const sock = process.env.SSH_AUTH_SOCK;
-    if (!sock) {
-      throw new Error(
-        "SSH agent auth is selected, but no agent is available on this host " +
-          "(SSH_AUTH_SOCK is unset). Start an ssh-agent and add the key, or " +
-          "switch this server to password/key auth.",
-      );
-    }
-    config.sshAgent = sock;
+    // "Agent" = authenticate exactly the way the operator's own `ssh <host>`
+    // does. We route through the OS `ssh` binary (useSystemSsh): only the real
+    // OpenSSH client reliably resolves the agent / ~/.ssh/config / default keys
+    // / keychain. We best-effort locate the agent socket and inject it into the
+    // ssh child's env (a GUI-launched app often lacks SSH_AUTH_SOCK). If none
+    // is found we still proceed — ssh can fall back to default keys / config,
+    // just like the terminal — and a genuine no-auth case surfaces as a clear
+    // ssh error on connect rather than being pre-empted here.
+    config.useSystemSsh = true;
+    const sock = await resolveSshAuthSock();
+    if (sock) config.sshAgent = sock;
   } else {
     return null;
   }
@@ -269,15 +322,17 @@ export class SshConnectionManager {
    *   Omit to drop all connections.
    */
   invalidate(serverId?: string): void {
+    // Explicit invalidation (settings changed / server deleted / shutdown) must
+    // apply even to a retained connection — force the drop.
     if (serverId) {
       debugSsh(`invalidate server=${serverId}`);
-      this.dropServer(serverId);
+      this.dropServer(serverId, true);
       // Config changed / explicit reset → give the breaker a fresh start.
       this.health.delete(serverId);
     } else {
       debugSsh("invalidate:all");
       for (const id of [...this.servers.keys()]) {
-        this.dropServer(id);
+        this.dropServer(id, true);
       }
       this.health.clear();
     }
@@ -392,9 +447,26 @@ export class SshConnectionManager {
 
   // ── Cleanup ────────────────────────────────────────────────────────────
 
-  private dropServer(serverId: string): void {
+  /**
+   * Drop a cached connection.
+   *
+   * A connection that is RETAINED (held by a live long-lived consumer — an
+   * interactive terminal or a metrics/Docker stream) is NOT dropped on the
+   * non-forced path: a transient command failure, the circuit breaker, or a
+   * `withExecutor` retry must never yank the shared SSH connection out from
+   * under an active terminal (for the system-ssh path that means `ssh -O exit`
+   * killing the ControlMaster and every session on it). Such a connection is
+   * dropped once its consumers `release()`. Explicit invalidation (settings
+   * change / server delete) passes `force` to drop it regardless.
+   */
+  private dropServer(serverId: string, force = false): void {
     const conn = this.servers.get(serverId);
     if (!conn) return;
+
+    if (!force && (this.retainCounts.get(serverId) ?? 0) > 0) {
+      debugSsh(`drop-server:skip-retained server=${serverId}`);
+      return;
+    }
 
     if (conn.idleTimer) clearTimeout(conn.idleTimer);
     this.retainCounts.delete(serverId);

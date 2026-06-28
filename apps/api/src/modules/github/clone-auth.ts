@@ -22,6 +22,19 @@ import { type BuildStrategy } from "@repo/core";
 import { tokenFor, requireTokenFor, type TokenContext } from "./github.token";
 import type { RequestContext } from "../../lib/request-context";
 
+/**
+ * Result of build-token resolution:
+ *   - `{ token }`        → inject into the clone URL (existing behavior).
+ *   - `{ relay: true }`  → no token, but the target server opted into git
+ *     credential forwarding: clone via the desktop relay (gh identity, never
+ *     persisted on the remote). The orchestrator opens the relay.
+ *   - `{}`               → no credential (a local build of a public repo).
+ */
+export interface BuildGitCredential {
+  token?: string;
+  relay?: boolean;
+}
+
 export async function resolveBuildGitToken(opts: {
   /** Caller's request context. Carries userId + organizationId; org-scoped
    *  App installation lookup uses ctx.organizationId. */
@@ -32,7 +45,17 @@ export async function resolveBuildGitToken(opts: {
    *  authorization (so a member granted only repo X can build X). */
   repo?: string | null;
   buildStrategy: BuildStrategy;
-}): Promise<string | null> {
+  /**
+   * Desktop-only: when a SERVER build has no remote token (no App / PAT),
+   * signal `{ relay: true }` instead of throwing — set by the orchestrator only
+   * when the operator opted in for THIS deploy (the deploy flow's "Forward my
+   * git credentials" choice → `snapshot.forwardGitCredentials`) and it's an
+   * eligible (non-docker) server build. The gh token is NOT returned here; it's
+   * fetched on demand by the relay's remote helper, so it never lands on the
+   * build host.
+   */
+  allowRelayFallback?: boolean;
+}): Promise<BuildGitCredential> {
   const tokenCtx: TokenContext = {
     projectId: opts.projectId,
     owner: opts.owner ?? undefined,
@@ -48,17 +71,25 @@ export async function resolveBuildGitToken(opts: {
     // local gh. getLocalGhToken self-guards to null in CLOUD_MODE.
     const { getLocalGhToken } = await import("./github.local-auth");
     const ghToken = await getLocalGhToken();
-    if (ghToken) return ghToken;
+    if (ghToken) return { token: ghToken };
 
     const r = await tokenFor(opts.ctx, "local", tokenCtx);
-    return r?.token ?? null;
+    return r?.token ? { token: r.token } : {};
   }
 
-  // SERVER / REMOTE build: the clone/build runs off this host (server's Docker
-  // daemon, cloud workspace), so we fetch the SaaS-minted App installation
-  // token (short-lived, repo-scoped) — gh is REFUSED here (HIGH #7: never ship
-  // the operator's broad token off-host). requireTokenFor throws an actionable
-  // error if nothing is resolvable.
-  const r = await requireTokenFor(opts.ctx, "remote", tokenCtx);
-  return r.token;
+  // SERVER / REMOTE build: the clone/build runs off this host. Prefer the
+  // SaaS-minted App installation token (short-lived, repo-scoped) or a PAT — gh
+  // is REFUSED in this chain (HIGH #7: never ship the operator's broad token
+  // off-host via the URL).
+  const r = await tokenFor(opts.ctx, "remote", tokenCtx);
+  if (r?.token) return { token: r.token };
+
+  // No remote token. If the target server opted into credential forwarding,
+  // the operator's gh identity is forwarded on demand via the relay (never
+  // persisted on the remote) — signal that. Otherwise surface the standard
+  // actionable error (requireTokenFor throws when tokenFor is null).
+  if (opts.allowRelayFallback) return { relay: true };
+  await requireTokenFor(opts.ctx, "remote", tokenCtx);
+  // Unreachable: requireTokenFor always throws when no token is resolvable.
+  return {};
 }

@@ -123,7 +123,7 @@ export {
   isSshAuthError,
 } from "./system/errors";
 
-export { LocalExecutor, SshExecutor, createExecutor } from "./system/executor";
+export { LocalExecutor, SshExecutor, SystemSshExecutor, createExecutor } from "./system/executor";
 
 export {
   checkAll as checkAllComponents,

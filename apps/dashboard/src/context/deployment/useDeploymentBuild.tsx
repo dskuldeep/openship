@@ -15,6 +15,7 @@ import { DeployCredentialModal } from "@/components/deployments/DeployCredential
 import type { DeploymentConfig, DeploymentState, DeploymentStatus } from "./types";
 import { syncActiveModeSnapshot } from "./mode-config";
 import {
+  BUILD_PHASES,
   DEFAULT_CONFIG,
   INITIAL_STATE,
   ensurePublicEndpoints,
@@ -93,6 +94,7 @@ function logTypeFromHydratedEntry(entry: Record<string, unknown>, text: string):
 }
 
 const STEPS = [
+  { label: "Preparing", icon: "server-59-1658435258.png" },
   { label: "Cloning", icon: "git%20branch-159-1658431404.png" },
   { label: "Installing", icon: "npm-184-1693375161.png" },
   { label: "Building", icon: "tools-118-1658432731.png" },
@@ -125,6 +127,9 @@ export function useDeploymentBuild(
   const canStreamContainer = useRef<boolean>(false);
   const lastEventIdRef = useRef<number | undefined>(undefined);
   const lastErrorRef = useRef<{ message: string; timestamp: number } | null>(null);
+  /** Wall-clock when each build phase (by step index) became current — used to
+   *  derive live per-phase durations as the build advances. Reset per deploy. */
+  const phaseStartRef = useRef<Record<number, number>>({});
 
   // ── Derived ───────────────────────────────────────────────────────────────
 
@@ -134,7 +139,7 @@ export function useDeploymentBuild(
       ? "failed"
       : state.deploymentSuccess
         ? "ready"
-        : state.currentStepIndex >= 3
+        : state.currentStepIndex >= 4
           ? "deploying"
           : "building";
 
@@ -161,20 +166,32 @@ export function useDeploymentBuild(
 
   const handleSuccessMessage = useCallback((data?: any) => {
     const warningMessage = typeof data?.warningMessage === "string" ? data.warningMessage : "";
+    const now = Date.now();
 
-    setState((prev) => ({
-      ...prev,
-      deploymentSuccess: true,
-      deploymentFailed: false,
-      deploymentCanceled: false,
-      currentProgress: 100,
-      currentStepIndex: 4,
-      isDeploying: false,
-      failureMessage: "",
-      warningMessage,
-      screenshots: data?.screenshots || prev.screenshots,
-      projectId: data?.project_id || prev.projectId,
-    }));
+    setState((prev) => {
+      // The final phase (deploy) completes via this success event, not a
+      // currentStep transition — finalize its live duration here.
+      const nextDurations = { ...prev.phaseDurations };
+      const id = BUILD_PHASES[prev.currentStepIndex]?.id;
+      const startedAt = phaseStartRef.current[prev.currentStepIndex];
+      if (id && startedAt != null && nextDurations[id] == null) {
+        nextDurations[id] = Math.max(0, now - startedAt);
+      }
+      return {
+        ...prev,
+        deploymentSuccess: true,
+        deploymentFailed: false,
+        deploymentCanceled: false,
+        currentProgress: 100,
+        currentStepIndex: 5,
+        isDeploying: false,
+        failureMessage: "",
+        warningMessage,
+        screenshots: data?.screenshots || prev.screenshots,
+        projectId: data?.project_id || prev.projectId,
+        phaseDurations: nextDurations,
+      };
+    });
 
     if (warningMessage) {
       const textEncoder = new TextEncoder();
@@ -214,11 +231,30 @@ export function useDeploymentBuild(
   );
 
   const handleProgressUpdate = useCallback((currentStep: number, progress: number) => {
-    setState((prev) => ({
-      ...prev,
-      currentStepIndex: currentStep,
-      currentProgress: progress,
-    }));
+    const now = Date.now();
+    // Mark when this phase became current (first sighting wins; running +
+    // completed events for the same step share an index).
+    if (phaseStartRef.current[currentStep] == null) {
+      phaseStartRef.current[currentStep] = now;
+    }
+    setState((prev) => {
+      // Finalize live durations for any phase we've advanced past.
+      let nextDurations = prev.phaseDurations;
+      for (let i = prev.currentStepIndex; i < currentStep; i++) {
+        const id = BUILD_PHASES[i]?.id;
+        const startedAt = phaseStartRef.current[i];
+        if (id && startedAt != null && nextDurations[id] == null) {
+          if (nextDurations === prev.phaseDurations) nextDurations = { ...prev.phaseDurations };
+          nextDurations[id] = Math.max(0, now - startedAt);
+        }
+      }
+      return {
+        ...prev,
+        currentStepIndex: currentStep,
+        currentProgress: progress,
+        phaseDurations: nextDurations,
+      };
+    });
   }, []);
 
   const handleCanceled = useCallback(
@@ -367,6 +403,7 @@ export function useDeploymentBuild(
     lastErrorRef.current = null;
 
     const localBuildStartedAt = new Date().toISOString();
+    phaseStartRef.current = {};
     setState((prev) => ({
       ...prev,
       isDeploying: true,
@@ -374,6 +411,7 @@ export function useDeploymentBuild(
       buildLogs: [],
       currentProgress: 0,
       currentStepIndex: 0,
+      phaseDurations: {},
       deploymentSuccess: false,
       deploymentFailed: false,
       deploymentCanceled: false,
@@ -488,6 +526,13 @@ export function useDeploymentBuild(
             : config.buildStrategy,
         deployTarget: config.deployTarget,
         serverId: config.serverId,
+        // Per-deploy git credential forwarding — only sent for a server target
+        // (the only build that clones on-host). The API re-checks desktop +
+        // server-build before honoring it.
+        forwardGitCredentials:
+          config.deployTarget === "server" && config.forwardGitCredentials === true
+            ? true
+            : undefined,
         runtimeMode:
           config.projectType === "docker" || isServiceDeployment
             ? "docker"
@@ -704,6 +749,12 @@ export function useDeploymentBuild(
             packageManager: apiConfig.packageManager || prev.packageManager,
             buildImage: apiConfig.buildImage || prev.buildImage,
             branch: apiConfig.branch || prev.branch,
+            // Actual build/deploy target of THIS deployment (from the snapshot),
+            // so the detail UI reflects how it really ran, not the live default.
+            buildStrategy: apiConfig.buildStrategy || prev.buildStrategy,
+            deployTarget: apiConfig.deployTarget || prev.deployTarget,
+            serverId: apiConfig.serverId ?? prev.serverId,
+            serverName: apiConfig.serverName ?? prev.serverName,
             envVars: apiConfig.envVars || prev.envVars,
             projectType: data.projectType || prev.projectType,
             modeSnapshots: (data.projectType || prev.projectType) === "services"
@@ -789,6 +840,9 @@ export function useDeploymentBuild(
           errorCode: !isActive ? (data.errorCode || "") : "",
           errorDetails: null,
           buildLogs,
+          // Authoritative per-phase durations computed server-side from the
+          // step events (live tracking is best-effort until this lands).
+          phaseDurations: data.phaseDurations || {},
           buildDurationMs: data.buildDurationMs ?? null,
           buildStartedAt: data.buildStartedAt ?? null,
           buildRetryCarryMs: prev.buildRetryCarryMs,
@@ -910,6 +964,7 @@ export function useDeploymentBuild(
           isTerminalReady.current = false;
         }
 
+        phaseStartRef.current = {};
         setState((prev) => ({
           ...prev,
           isDeploying: true,
@@ -922,6 +977,7 @@ export function useDeploymentBuild(
           errorDetails: null,
           pendingPrompt: null,
           currentStepIndex: 0,
+          phaseDurations: {},
           buildLogs: [],
           screenshots: [],
           serviceStatuses: [],
@@ -973,6 +1029,7 @@ export function useDeploymentBuild(
 
   const reset = useCallback(() => {
     lastErrorRef.current = null;
+    phaseStartRef.current = {};
     setConfig(DEFAULT_CONFIG);
     setState(INITIAL_STATE);
     buildStream.disconnect();

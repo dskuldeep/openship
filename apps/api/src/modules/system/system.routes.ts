@@ -18,6 +18,7 @@ import * as setup from "./setup.controller";
 import * as serverCheck from "./server-check.controller";
 import * as serversCtrl from "./servers.controller";
 import * as rateLimit from "./rate-limit.controller";
+import * as tunnels from "./tunnels.controller";
 import * as migration from "./migration/migration.controller";
 
 const r = secureRouter(new Hono(), {
@@ -64,6 +65,17 @@ r.delete("/servers/:id", { tag: "server:admin" }, serversCtrl.deleteServer);
 /* ── Per-server rate limiting (OpenResty level) ─────────────────── */
 r.get("/servers/:id/rate-limit", { tag: "server:read" }, rateLimit.getRateLimit);
 r.patch("/servers/:id/rate-limit", { tag: "server:write" }, rateLimit.updateRateLimit);
+
+/* ── Port-forward tunnels (DESKTOP-only; handlers add assertDesktop) ─
+ * VS Code-style forwarding of a remote server port to localhost. Config
+ * persists in server_tunnels; live sockets live in ssh-tunnel-manager.
+ * `:id` is the server resource the permission middleware resolves on.
+ */
+r.get("/servers/:id/tunnels", { tag: "server:read" }, tunnels.listTunnels);
+r.post("/servers/:id/tunnels", { tag: "server:write" }, tunnels.saveTunnel);
+r.post("/servers/:id/tunnels/:tunnelId/start", { tag: "server:write" }, tunnels.startTunnelHandler);
+r.post("/servers/:id/tunnels/:tunnelId/stop", { tag: "server:write" }, tunnels.stopTunnelHandler);
+r.delete("/servers/:id/tunnels/:tunnelId", { tag: "server:write" }, tunnels.deleteTunnel);
 
 /* ── Server check & install (dashboard setup wizard) ─────────────
  * These endpoints target a server identified by `serverId` in the

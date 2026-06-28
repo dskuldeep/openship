@@ -169,6 +169,14 @@ export const endpoints = {
     servers: "system/servers",
     server: (id: string) => `system/servers/${id}`,
     serverRateLimit: (id: string) => `system/servers/${id}/rate-limit`,
+    // Port-forward tunnels (desktop-only)
+    tunnels: (serverId: string) => `system/servers/${serverId}/tunnels`,
+    tunnelStart: (serverId: string, tunnelId: string) =>
+      `system/servers/${serverId}/tunnels/${tunnelId}/start`,
+    tunnelStop: (serverId: string, tunnelId: string) =>
+      `system/servers/${serverId}/tunnels/${tunnelId}/stop`,
+    tunnel: (serverId: string, tunnelId: string) =>
+      `system/servers/${serverId}/tunnels/${tunnelId}`,
     migration: {
       preflight: "system/migration/preflight",
       start: "system/migration/start",
@@ -185,6 +193,8 @@ export const endpoints = {
     steps: "mail/steps",
     status: "mail/status",
     servers: "mail/servers",
+    scan: "mail/scan",
+    adopt: "mail/adopt",
     setup: "mail/setup",
     cancelSetup: "mail/setup/cancel",
     acknowledgeDns: "mail/setup/dns-ack",

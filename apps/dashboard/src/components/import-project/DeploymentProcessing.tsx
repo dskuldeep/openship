@@ -7,6 +7,12 @@ import {
   XCircle,
   Loader2,
   Clock,
+  Server,
+  Cloud,
+  Globe,
+  GitBranch,
+  Hammer,
+  Layers,
 } from "lucide-react";
 import type { Terminal } from "@xterm/xterm";
 import BuildTerminal from "./BuildTerminal";
@@ -22,6 +28,67 @@ import { useModal } from "@/context/ModalContext";
 
 interface DeploymentProcessingProps {
   onRedeploy: () => void; // Keep this as it updates URL
+}
+
+/** Compact duration label: "8s", "1m 02s". */
+function formatDurationMs(ms: number): string {
+  const totalSec = Math.max(0, Math.round(ms / 1000));
+  if (totalSec < 60) return `${totalSec}s`;
+  const m = Math.floor(totalSec / 60);
+  const s = totalSec % 60;
+  return `${m}m ${s.toString().padStart(2, "0")}s`;
+}
+
+/** Human label for the build/deploy target shown in Deployment Details. */
+function describeBuildTarget(config: {
+  deployTarget: string;
+  serverName?: string;
+}): string {
+  if (config.deployTarget === "cloud") return "Openship Cloud";
+  if (config.deployTarget === "server") {
+    return config.serverName ? `Server · ${config.serverName}` : "Server";
+  }
+  if (config.deployTarget === "local") return "Local machine";
+  return "—";
+}
+
+/** Where the build runs (vs where it deploys, shown by Instance). Concise so it
+ *  fits the narrow info column without truncating. */
+function describeBuildStrategy(config: {
+  deployTarget: string;
+  buildStrategy: string;
+}): string {
+  if (config.buildStrategy === "local") return "Local build";
+  if (config.deployTarget === "cloud") return "Cloud build";
+  if (config.deployTarget === "server") return "Server build";
+  return "Host build";
+}
+
+/** One themed row in the Deployment Details list: colored icon chip + label + value. */
+function DetailRow({
+  icon: Icon,
+  label,
+  value,
+  chipClass = "bg-muted/60",
+  iconClass = "text-muted-foreground",
+}: {
+  icon: React.ComponentType<{ className?: string }>;
+  label: string;
+  value: React.ReactNode;
+  chipClass?: string;
+  iconClass?: string;
+}) {
+  return (
+    <div className="flex items-center gap-3 min-w-0">
+      <div className={`w-9 h-9 rounded-lg flex items-center justify-center shrink-0 ${chipClass}`}>
+        <Icon className={`size-4 ${iconClass}`} />
+      </div>
+      <div className="min-w-0 flex-1">
+        <p className="text-xs text-muted-foreground">{label}</p>
+        <div className="text-sm font-medium text-foreground truncate">{value}</div>
+      </div>
+    </div>
+  );
 }
 
 const DeploymentProcessing: React.FC<DeploymentProcessingProps> = ({ onRedeploy }) => {
@@ -120,16 +187,6 @@ const DeploymentProcessing: React.FC<DeploymentProcessingProps> = ({ onRedeploy 
     onTerminalReady();
   }, [terminalRef, onTerminalReady]);
 
-  // Get medium variant screenshot URL
-  const getScreenshotUrl = () => {
-    if (!state.screenshots || state.screenshots.length === 0) return null;
-    const firstScreenshot = state.screenshots[0];
-    const mediumVariant = firstScreenshot?.variants?.find(v => v.variant === "medium");
-    return mediumVariant?.url || firstScreenshot?.url;
-  };
-
-  const screenshotUrl = getScreenshotUrl();
-
   const handleViewDashboard = () => {
     if (state.projectId) {
       router.push(`/projects/${state.projectId}`);
@@ -145,15 +202,6 @@ const DeploymentProcessing: React.FC<DeploymentProcessingProps> = ({ onRedeploy 
         <div className="py-5 relative">
           <div className="flex items-center justify-between">
             <div className="flex items-center gap-4">
-              <div className="flex border border-border/50 bg-muted/50 rounded-xl w-12 h-12 justify-center items-center">
-                {deploymentStatus === "failed" || deploymentStatus === "cancelled" ? (
-                  <XCircle className="w-6 h-6 text-destructive" />
-                ) : deploymentStatus === "ready" ? (
-                  <CheckCircle2 className="w-6 h-6 text-primary" />
-                ) : (
-                  <Loader2 className="w-6 h-6 text-primary animate-spin" />
-                )}
-              </div>
               <div>
                 <h1 className="text-xl font-semibold text-foreground">
                   {deploymentStatus === "cancelled"
@@ -200,70 +248,67 @@ const DeploymentProcessing: React.FC<DeploymentProcessingProps> = ({ onRedeploy 
         <div className="grid grid-cols-1 lg:grid-cols-3 gap-8">
           {/* Main Content */}
           <div className="lg:col-span-2 space-y-6">
-            {/* Progress Steps */}
-            <div className="bg-card rounded-2xl border border-border/50 p-8 transition-all duration-300">
-              <h2 className="text-base font-normal text-foreground mb-6">Deployment Progress</h2>
+            {hasWarning && (
+              <div className="rounded-2xl border border-amber-500/30 bg-amber-500/8 px-4 py-3">
+                <p className="text-sm font-medium text-amber-700 dark:text-amber-300">
+                  Deployment finished, but some services still need attention.
+                </p>
+                <p className="mt-1 text-sm text-amber-700/80 dark:text-amber-300/80">
+                  {state.warningMessage}
+                </p>
+              </div>
+            )}
 
-              {hasWarning && (
-                <div className="mb-6 rounded-2xl border border-amber-500/30 bg-amber-500/8 px-4 py-3">
-                  <p className="text-sm font-medium text-amber-700 dark:text-amber-300">
-                    Deployment finished, but some services still need attention.
-                  </p>
-                  <p className="mt-1 text-sm text-amber-700/80 dark:text-amber-300/80">
-                    {state.warningMessage}
-                  </p>
-                </div>
-              )}
-
-              {/* Steps */}
+            {/* Steps — progress tracker above the terminal. */}
+            <div className="bg-card rounded-2xl border border-border/50 px-7 py-6">
               <div className="relative">
-                {/* Progress Line */}
-                <div className="absolute top-6 left-[24px] right-[24px] z-0 h-[2px] bg-border/50">
+                <div className="absolute top-5 left-5 right-5 h-[2px] bg-border/50 z-0">
                   <div
-                    className="h-full transition-all duration-500 bg-primary"
-                    style={{
-                      width: `${(state.currentStepIndex / (steps.length - 1)) * 100}%`,
-                    }}
+                    className="h-full bg-primary transition-all duration-500"
+                    style={{ width: `${(state.currentStepIndex / (steps.length - 1)) * 100}%` }}
                   />
                 </div>
-
-                {/* Step Items */}
                 <div className="relative flex justify-between z-10">
                   {steps.map((step, index) => {
                     const isCompleted = index < state.currentStepIndex;
-                    const isCurrent = index === state.currentStepIndex && !state.deploymentSuccess && !state.deploymentFailed && !state.deploymentCanceled;
-                    const hasFailed = (state.deploymentFailed || state.deploymentCanceled) && index === state.currentStepIndex;
+                    const isCurrent =
+                      index === state.currentStepIndex &&
+                      !state.deploymentSuccess &&
+                      !state.deploymentFailed &&
+                      !state.deploymentCanceled;
+                    const hasFailed =
+                      (state.deploymentFailed || state.deploymentCanceled) &&
+                      index === state.currentStepIndex;
                     const isReady = state.deploymentSuccess && index === steps.length - 1;
-
                     return (
-                      <div key={index} className="flex flex-col items-center z-10 px-2">
+                      <div key={index} className="flex flex-col items-center gap-2.5 z-10">
                         <div
-                          style={{ boxShadow: '0 0 0 8px var(--th-card-bg-solid)' }}
-                          className={`rounded-full flex items-center justify-center transition-all duration-300 relative w-12 h-12 ${
+                          style={{ boxShadow: "0 0 0 6px var(--th-card-bg-solid)" }}
+                          className={`rounded-full flex items-center justify-center w-10 h-10 transition-all duration-300 ${
                             hasFailed
-                              ? 'bg-destructive'
+                              ? "bg-destructive"
                               : isReady || isCompleted
-                                ? 'bg-primary'
+                                ? "bg-primary"
                                 : isCurrent
-                                  ? 'bg-foreground'
-                                  : 'bg-card border-2 border-border'
+                                  ? "bg-foreground"
+                                  : "bg-muted border border-border"
                           }`}
                         >
                           {hasFailed ? (
-                            generateIcon('error%20triangle-16-1662499385.png', 26, '#fff')
+                            <XCircle className="w-5 h-5 text-white" />
                           ) : isReady || isCompleted ? (
-                            generateIcon('check%20circle-68-1658234612.png', 26, 'var(--primary-foreground)')
+                            <CheckCircle2 className="w-5 h-5 text-primary-foreground" />
                           ) : isCurrent ? (
-                            <Loader2 className="w-6 h-6 text-background animate-spin" />
+                            <Loader2 className="w-5 h-5 text-background animate-spin" />
                           ) : (
-                            generateIcon(step.icon, 24, 'var(--th-text-muted)')
+                            generateIcon(step.icon, 18, "var(--th-text-muted)")
                           )}
                         </div>
                         <span
-                          className={`text-sm font-normal mt-3 ${
+                          className={`text-xs font-medium ${
                             hasFailed || isCompleted || isCurrent || isReady
-                              ? 'text-foreground'
-                              : 'text-muted-foreground'
+                              ? "text-foreground"
+                              : "text-muted-foreground"
                           }`}
                         >
                           {step.label}
@@ -273,22 +318,6 @@ const DeploymentProcessing: React.FC<DeploymentProcessingProps> = ({ onRedeploy 
                   })}
                 </div>
               </div>
-
-              {/* Progress Bar */}
-              {deploymentStatus !== "ready" && deploymentStatus !== "failed" && deploymentStatus !== "cancelled" && (
-                <div className="mt-6">
-                  <div className="flex items-center justify-between text-sm mb-2">
-                    <span className="text-muted-foreground font-medium">Overall Progress</span>
-                    <span className="font-bold text-foreground">{Math.round(state.currentProgress)}%</span>
-                  </div>
-                  <div className="h-1.5 rounded-full overflow-hidden bg-border/50">
-                    <div
-                      className="h-full transition-all duration-300 bg-primary"
-                      style={{ width: `${state.currentProgress}%` }}
-                    />
-                  </div>
-                </div>
-              )}
             </div>
 
             {/* Build Terminal */}
@@ -316,143 +345,12 @@ const DeploymentProcessing: React.FC<DeploymentProcessingProps> = ({ onRedeploy 
 
           {/* Sidebar */}
           <div className="lg:sticky lg:top-6 h-fit space-y-6">
-            {/* Preview Card */}
-            <div className="bg-card rounded-2xl border border-border/50 p-6">
-              <h3 className="text-base font-normal text-foreground mb-4">Preview</h3>
-
-              {deploymentStatus === "ready" ? (
-                <div className="space-y-4">
-                  <button
-                    onClick={() => window.open(`https://${domain}`, "_blank")}
-                    className="w-full group cursor-pointer"
-                  >
-                    <div
-                      className="aspect-video bg-muted/50 rounded-xl border border-border/50 flex items-center justify-center overflow-hidden relative transition-all duration-300"
-                    >
-                      {screenshotUrl ? (
-                        <img
-                          src={screenshotUrl}
-                          alt="Site preview"
-                          className="w-full h-full object-cover"
-                        />
-                      ) : (
-                        <div className="relative w-full h-full flex items-center justify-center overflow-hidden bg-primary/5">
-                          {/* Animated gradient orbs */}
-                          <div className="absolute top-0 left-0 w-32 h-32 rounded-full blur-3xl opacity-30 animate-pulse" style={{ animationDuration: '3s' }}></div>
-                          <div className="absolute bottom-0 right-0 w-40 h-40 rounded-full blur-3xl opacity-20 animate-pulse" style={{ animationDuration: '4s', animationDelay: '1s' }}></div>
-
-                          {/* Subtle grid pattern */}
-                          <div className="absolute inset-0 opacity-[0.04]" style={{ backgroundImage: 'linear-gradient(currentColor 1px, transparent 1px), linear-gradient(90deg, currentColor 1px, transparent 1px)', backgroundSize: '24px 24px' }}></div>
-
-                          {/* Content */}
-                          <div className="relative text-center space-y-4">
-                            {/* Icon with glow effect */}
-                            <div className="inline-flex items-center justify-center w-16 h-16 rounded-2xl border border-primary/30 shadow-lg shadow-primary/20">
-                              <div className="relative">
-                                {generateIcon('cloud%20connected-57-1658236831.png', 32, 'var(--color-primary)')}
-                                {/* Ping animation */}
-                                <span className="absolute inset-0 w-8 h-8 rounded-full border-2 border-primary/40 animate-ping opacity-75"></span>
-                              </div>
-                            </div>
-
-                            <div>
-                              <p className="text-base font-semibold text-foreground tracking-tight">Deployment Live</p>
-                              <div className="flex items-center justify-center gap-1.5 mt-2">
-                                <div className="w-1.5 h-1.5 rounded-full bg-primary animate-pulse"></div>
-                                <p className="text-xs font-medium text-primary">Ready to visit</p>
-                              </div>
-                            </div>
-                          </div>
-                        </div>
-                      )}
-                      <div className="absolute inset-0 bg-foreground/0 group-hover:bg-foreground/10 transition-all flex items-center justify-center backdrop-blur-0 group-hover:backdrop-blur-sm">
-                        <div className="opacity-0 group-hover:opacity-100 transition-all duration-300 transform scale-95 group-hover:scale-100">
-                          <div className="bg-foreground/80 backdrop-blur-md text-background px-5 py-2.5 rounded-xl flex items-center gap-2.5 shadow-xl border border-background/10">
-                            {generateIcon('earth-29-1687505545.png', 20, '#fff')}
-                            <span className="font-medium text-sm">Visit Site</span>
-                            {generateIcon('External_link_HtLszLDBXqHilHK674zh2aKoSL7xUhyboAzP.png', 18, '#fff')}
-                          </div>
-                        </div>
-                      </div>
-                    </div>
-                  </button>
-                </div>
-              ) : (
-                <div className="aspect-video bg-muted/30 rounded-xl border-2 border-border overflow-hidden relative">
-                  {/* Shimmer effect overlay */}
-                  <div
-                    className="absolute inset-0 -translate-x-full animate-[shimmer_2s_infinite]"
-                    style={{
-                      background: 'linear-gradient(90deg, transparent 0%, rgba(255, 255, 255, 0.8) 50%, transparent 100%)',
-                    }}
-                  />
-
-                  {/* Mock browser chrome */}
-                  <div className="h-8 bg-card/60 border-b border-border/50 flex items-center px-3 gap-2">
-                    <div className="flex gap-1.5">
-                      <div className="w-2.5 h-2.5 rounded-full bg-destructive/40 animate-pulse" />
-                      <div className="w-2.5 h-2.5 rounded-full bg-yellow-400/40 animate-pulse" style={{ animationDelay: '0.1s' }} />
-                      <div className="w-2.5 h-2.5 rounded-full bg-green-400/40 animate-pulse" style={{ animationDelay: '0.2s' }} />
-                    </div>
-                    <div className="flex-1 ml-4">
-                      <div className="h-4 bg-muted/60 rounded-md w-3/4 animate-pulse" style={{ animationDelay: '0.3s' }} />
-                    </div>
-                  </div>
-
-                  {/* Mock content */}
-                  <div className="p-6 space-y-4">
-                    <div className="h-6 bg-muted/60 rounded-lg w-1/3 animate-pulse" style={{ animationDelay: '0.1s' }} />
-                    <div className="space-y-2">
-                      <div className="h-4 bg-muted/60 rounded w-full animate-pulse" style={{ animationDelay: '0.2s' }} />
-                      <div className="h-4 bg-muted/60 rounded w-5/6 animate-pulse" style={{ animationDelay: '0.3s' }} />
-                      <div className="h-4 bg-muted/60 rounded w-4/6 animate-pulse" style={{ animationDelay: '0.4s' }} />
-                    </div>
-                    <div className="grid grid-cols-3 gap-3 mt-6">
-                      <div className="h-20 bg-muted/60 rounded-lg animate-pulse" style={{ animationDelay: '0.2s' }} />
-                      <div className="h-20 bg-muted/60 rounded-lg animate-pulse" style={{ animationDelay: '0.3s' }} />
-                      <div className="h-20 bg-muted/60 rounded-lg animate-pulse" style={{ animationDelay: '0.4s' }} />
-                    </div>
-                  </div>
-
-                  {/* Status text */}
-                  <div className="absolute inset-0 flex items-center justify-center bg-card/5 backdrop-blur-[2px]">
-                    <div className="text-center px-6 py-3 rounded-xl bg-card/90 backdrop-blur-sm border border-border/50 shadow-lg">
-                      <div className="flex items-center gap-3">
-                        <div className="relative">
-                          {(deploymentStatus === "failed" || deploymentStatus === "cancelled") ? (
-                            <>
-                              {generateIcon('error%20triangle-16-1662499385.png', 20, 'currentColor')}
-                            </>
-                          ) : (
-                            <>
-                              <Loader2 className="w-5 h-5 text-primary animate-spin" />
-                              <div className="absolute inset-0 w-5 h-5 border-2 border-primary/30 rounded-full animate-ping" />
-                            </>
-                          )}
-                        </div>
-                        <div>
-                          <p className="text-sm font-normal text-foreground">
-                            {deploymentStatus === "cancelled" ? "Deployment cancelled" : deploymentStatus === "failed" ? "Deployment failed" : "Building preview"}
-                          </p>
-                          {(deploymentStatus !== "failed" && deploymentStatus !== "cancelled") && (
-                            <div className="flex gap-1 mt-1">
-                              <span className="w-1.5 h-1.5 bg-primary rounded-full animate-bounce" />
-                              <span className="w-1.5 h-1.5 bg-primary rounded-full animate-bounce" style={{ animationDelay: '0.1s' }} />
-                              <span className="w-1.5 h-1.5 bg-primary rounded-full animate-bounce" style={{ animationDelay: '0.2s' }} />
-                            </div>
-                          )}
-                        </div>
-                      </div>
-                    </div>
-                  </div>
-                </div>
-              )}
-            </div>
-
-            {/* Deployment Info */}
+            {/* Build phases — per-phase timings; "prepare" is the one-time
+                server provisioning, excluded from the build clock below. */}
+            {/* Deployment details — clean info list */}
             <DeploymentDetails />
 
-            {/* Action Button */}
+            {/* Actions — under the details card */}
             <div className="bg-card rounded-2xl border border-border/50 p-4">
               {deploymentStatus === "deploying" || deploymentStatus === "building" ? (
                 <button
@@ -465,11 +363,8 @@ const DeploymentProcessing: React.FC<DeploymentProcessingProps> = ({ onRedeploy 
                 >
                   {state.isStopping ? (
                     <>
-                      <svg className="animate-spin h-4 w-4" fill="none" viewBox="0 0 24 24">
-                        <circle className="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="4"></circle>
-                        <path className="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4zm2 5.291A7.962 7.962 0 014 12H0c0 3.042 1.135 5.824 3 7.938l3-2.647z"></path>
-                      </svg>
-                      Stopping...
+                      <Loader2 className="w-4 h-4 animate-spin" />
+                      Stopping…
                     </>
                   ) : (
                     'Stop Deployment'
@@ -483,9 +378,6 @@ const DeploymentProcessing: React.FC<DeploymentProcessingProps> = ({ onRedeploy 
                   >
                     Redeploy
                   </button>
-                  {/* Manage/delete happens in the full project view (draft
-                      view's Danger zone for never-deployed, Advanced tab
-                      otherwise) — not inline on the build screen. */}
                   {state.projectId && (
                     <button
                       onClick={() => router.push(`/projects/${state.projectId}`)}
@@ -503,7 +395,6 @@ const DeploymentProcessing: React.FC<DeploymentProcessingProps> = ({ onRedeploy 
                   Open Dashboard
                 </button>
               ) : null}
-
             </div>
 
           </div>
@@ -514,40 +405,30 @@ const DeploymentProcessing: React.FC<DeploymentProcessingProps> = ({ onRedeploy 
   );
 };
 
+/** Live-ticking total build time (excludes one-time prep). Isolated so the 1s
+ *  tick re-renders only this label, not the whole page. */
+const BuildTimeLabel = memo(() => {
+  const { state } = useDeployment();
+  const [, setTick] = useState(0);
+  const isLive =
+    !state.deploymentSuccess && !state.deploymentFailed && !state.deploymentCanceled;
+  useEffect(() => {
+    if (!isLive) return;
+    const id = setInterval(() => setTick((t) => t + 1), 1000);
+    return () => clearInterval(id);
+  }, [isLive]);
+  return <>{formatDurationMs(resolveBuildElapsedMs(state))}</>;
+});
+BuildTimeLabel.displayName = "BuildTimeLabel";
+
 const DeploymentDetails = memo(() => {
   const { state, deploymentStatus, config } = useDeployment();
   const { baseDomain } = usePlatform();
-  const [buildTime, setBuildTime] = useState<number>(() => {
-    return Math.round(resolveBuildElapsedMs(state) / 1000);
-  });
   const router = useRouter();
   const hasWarning = deploymentStatus === "ready" && !!state.warningMessage;
   const endpointHosts = getPublicEndpointHosts(config.publicEndpoints, baseDomain, config.projectName);
   const domain = endpointHosts[0] ?? "";
   const extraEndpointCount = endpointHosts.length > 1 ? endpointHosts.length - 1 : 0;
-
-  useEffect(() => {
-    setBuildTime(Math.round(resolveBuildElapsedMs(state) / 1000));
-  }, [
-    state.buildDurationMs,
-    state.buildStartedAt,
-    state.buildRetryCarryMs,
-    state.deploymentSuccess,
-    state.deploymentFailed,
-    state.deploymentCanceled,
-  ]);
-
-  useEffect(() => {
-    if (state.deploymentSuccess || state.deploymentFailed || state.deploymentCanceled) {
-      return;
-    }
-
-    const timerInterval = setInterval(() => {
-      setBuildTime((prev) => prev + 1);
-    }, 1000);
-
-    return () => clearInterval(timerInterval);
-  }, [state.deploymentSuccess, state.deploymentFailed, state.deploymentCanceled]);
 
   const handleEdit = () => {
     const slug = encodeRepoSlug(config.owner, config.repo);
@@ -563,15 +444,49 @@ const DeploymentDetails = memo(() => {
     router.push(`/deploy/${slug}?${params.toString()}`);
   };
 
-  const formatTime = (seconds: number) => {
-    const mins = Math.floor(seconds / 60);
-    const secs = seconds % 60;
-    return `${mins}:${secs.toString().padStart(2, "0")}`;
-  };
+  const statusLabel = deploymentStatus === "cancelled"
+    ? "Cancelled"
+    : deploymentStatus === "failed"
+      ? "Failed"
+      : hasWarning
+        ? "Ready with warnings"
+        : deploymentStatus === "ready"
+          ? "Ready"
+          : "Building";
+  const statusColor =
+    deploymentStatus === "failed" || deploymentStatus === "cancelled"
+      ? "text-destructive"
+      : hasWarning
+        ? "text-amber-600 dark:text-amber-300"
+        : deploymentStatus === "ready"
+          ? "text-primary"
+          : "text-foreground";
+  const statusBg =
+    deploymentStatus === "failed" || deploymentStatus === "cancelled"
+      ? "bg-destructive/10"
+      : hasWarning
+        ? "bg-amber-500/10"
+        : deploymentStatus === "ready"
+          ? "bg-primary/10"
+          : "bg-muted/60";
+  const statusIcon =
+    deploymentStatus === "failed" || deploymentStatus === "cancelled" ? (
+      <XCircle className="size-4 text-destructive" />
+    ) : hasWarning ? (
+      <CheckCircle2 className="size-4 text-amber-600 dark:text-amber-300" />
+    ) : deploymentStatus === "ready" ? (
+      <CheckCircle2 className="size-4 text-primary" />
+    ) : (
+      <Loader2 className="size-4 text-foreground animate-spin" />
+    );
+  const InstanceIcon = config.deployTarget === "cloud" ? Cloud : Server;
+  const domainValue = domain
+    ? `${domain}${extraEndpointCount > 0 ? ` +${extraEndpointCount}` : ""}`
+    : "—";
 
   return (
     <div className="bg-card rounded-2xl border border-border/50 p-6">
-      <div className="flex items-center justify-between mb-3">
+      <div className="flex items-center justify-between mb-4">
         <h3 className="text-base font-normal text-foreground">Deployment Details</h3>
         {(state.deploymentCanceled || state.deploymentFailed) && (
           <button onClick={handleEdit} className="flex items-center gap-2 -mr-1 cursor-pointer opacity-50 hover:opacity-100 transition-all duration-300">
@@ -580,56 +495,24 @@ const DeploymentDetails = memo(() => {
           </button>
         )}
       </div>
-      <div className="space-y-0">
-        <div className="flex justify-between items-center py-1.5 border-b border-border/50">
-          <span className="text-sm text-muted-foreground">Status</span>
-          <span
-            className={`text-sm font-normal px-3 py-1 rounded-full border 
-            ${deploymentStatus === "failed" || deploymentStatus === "cancelled"
-                ? "bg-destructive/10 text-destructive border-destructive/20"
-                : hasWarning
-                  ? "bg-amber-500/10 text-amber-700 dark:text-amber-300 border-amber-500/20"
-                : "bg-primary/10 text-primary border-primary/20"
-              }`}
-          >
-            {deploymentStatus === "cancelled"
-              ? "Cancelled"
-              : deploymentStatus === "failed"
-                ? "Failed"
-                : hasWarning
-                  ? "Ready with warnings"
-                  : deploymentStatus === "ready"
-                    ? "Ready"
-                    : "Building"}
-          </span>
+      <div className="space-y-4">
+        {/* Status — tinted chip + colored value */}
+        <div className="flex items-center gap-3 min-w-0">
+          <div className={`w-9 h-9 rounded-lg flex items-center justify-center shrink-0 ${statusBg}`}>
+            {statusIcon}
+          </div>
+          <div className="min-w-0 flex-1">
+            <p className="text-xs text-muted-foreground">Status</p>
+            <p className={`text-sm font-medium truncate ${statusColor}`}>{statusLabel}</p>
+          </div>
         </div>
-        <div className="flex justify-between items-center py-1.5 border-b border-border/50">
-          <span className="text-sm text-muted-foreground">Build Time</span>
-          <span className="text-sm font-normal text-foreground flex items-center gap-1.5">
-            <Clock className="w-3.5 h-3.5 text-muted-foreground" />
-            {formatTime(buildTime)}
-          </span>
-        </div>
-        <div className="flex justify-between items-center py-1.5 border-b border-border/50">
-          <span className="text-sm text-muted-foreground">{extraEndpointCount > 0 ? "Domains" : "Domain"}</span>
-          <span className="text-sm font-normal text-foreground">
-            {domain}
-            {extraEndpointCount > 0 ? ` +${extraEndpointCount} more` : ""}
-          </span>
-        </div>
-        <div className="flex justify-between items-center py-1.5 border-b border-border/50">
-          <span className="text-sm text-muted-foreground">Branch</span>
-          <span className="text-sm font-normal text-foreground flex items-center gap-1">
-            {generateIcon('git%20branch-159-1658431404.png', 16, 'currentColor')}
-            {config.branch}
-          </span>
-        </div>
-        <div className="flex justify-between items-center py-1.5">
-          <span className="text-sm text-muted-foreground">Framework</span>
-          <span className="text-sm font-normal text-foreground">{config.framework}</span>
-        </div>
+        <DetailRow icon={InstanceIcon} label="Instance" value={describeBuildTarget(config)} />
+        <DetailRow icon={Hammer} label="Build" value={describeBuildStrategy(config)} />
+        <DetailRow icon={Clock} label="Build time" value={<BuildTimeLabel />} />
+        <DetailRow icon={Layers} label="Framework" value={config.framework} />
+        <DetailRow icon={GitBranch} label="Branch" value={config.branch} />
+        <DetailRow icon={Globe} label={extraEndpointCount > 0 ? "Domains" : "Domain"} value={domainValue} />
       </div>
-
     </div>
   );
 });
