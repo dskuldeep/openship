@@ -48,6 +48,8 @@ interface BasicProjectData {
   cloudWorkspaceId?: string | null;
   deletedAt?: string | null;
   packageManager?: string;
+  /** How many recent versions retain their build artifact for rollback (snapshot strategy). null = instance default. */
+  rollbackWindow?: number | null;
   [key: string]: any;
 }
 
@@ -390,7 +392,7 @@ export const ProjectSettingsProvider: React.FC<ProviderProps> = ({
 
       const response = await projectsApi.getEnv(id);
 
-      if (response.success) {
+      if (response.data) {
         // Convert array format to expected format
         const envVarsArray = response.data || [];
         const envVars = {

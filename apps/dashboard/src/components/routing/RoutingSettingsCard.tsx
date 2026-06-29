@@ -1,7 +1,7 @@
 "use client";
 
 import React, { useCallback, useEffect, useMemo, useState } from "react";
-import { Globe, Shield, Server, X, Copy, Check, Info, Eye, EyeOff, Link2, ExternalLink, Hash } from "lucide-react";
+import { Globe, Shield, Server, X, Copy, Check, Info, Eye, EyeOff, Link2, Hash } from "lucide-react";
 import { domainsApi } from "@/lib/api";
 import { usePlatform } from "@/context/PlatformContext";
 import { normalizeSubdomain, normalizeSubdomainInput } from "@/utils/subdomain";
@@ -52,7 +52,6 @@ export function RoutingSettingsCard({
   targetMode = "proxy",
   targetPath,
   disabled = false,
-  liveUrl,
   exposed,
   onExposedChange,
   ports,
@@ -270,18 +269,19 @@ export function RoutingSettingsCard({
                 )}
               </div>
 
-              {(previewHostname || hasRecords) && (
+              {/* DNS hint — lazy: only shown once records are resolvable (or
+                  loading). No "enter a valid domain" nag; DNS isn't required up
+                  front (verified later at preflight / in domain settings). */}
+              {(loadingRecords || hasRecords) && (
                 <div className="rounded-lg border border-border/50 bg-muted/20 overflow-hidden">
                   <div className="flex items-center gap-2 px-3 py-2">
                     <Server className="size-3 text-muted-foreground shrink-0" />
                     {loadingRecords ? (
-                      <p className="text-sm text-muted-foreground flex-1">Fetching DNS records...</p>
-                    ) : hasRecords ? (
+                      <p className="text-sm text-muted-foreground flex-1">Checking DNS…</p>
+                    ) : (
                       <p className="text-sm text-muted-foreground flex-1">
                         Add a <span className="font-medium text-foreground">{dnsRecords.find((record) => record.type !== "TXT")?.type}</span> and <span className="font-medium text-foreground">TXT</span> record
                       </p>
-                    ) : (
-                      <p className="text-sm text-muted-foreground flex-1">Enter a valid domain to preview required DNS records</p>
                     )}
                     {hasRecords && (
                       <button
@@ -407,15 +407,6 @@ export function RoutingSettingsCard({
             </div>
           )}
 
-          {liveUrl && (
-            <div className="flex items-center gap-2">
-              <Link2 className="size-4 text-emerald-500" />
-              <a href={liveUrl} target="_blank" rel="noopener noreferrer" className="text-sm font-medium text-blue-500 dark:text-blue-400 hover:underline flex items-center gap-1.5">
-                {liveUrl.replace("https://", "")}
-                <ExternalLink className="size-3.5" />
-              </a>
-            </div>
-          )}
         </div>
       )}
 

@@ -225,6 +225,20 @@ export const projectsApi = {
   setOptions: (id: string | number, options: Record<string, any>) =>
     api.post<any>(endpoints.projects.options(id), options),
 
+  /** Commit-drift status for the "project outdated" banner: branch HEAD vs the
+   *  active deployment's commit. */
+  getCommitStatus: (id: string | number) =>
+    api.get<{
+      data: {
+        supported: boolean;
+        behind?: boolean;
+        branch?: string;
+        latestSha?: string | null;
+        latestMessage?: string | null;
+        deployedSha?: string | null;
+      };
+    }>(`projects/${id}/commit-status`),
+
   /** Enable or disable a project */
   toggle: (id: string | number, enable: boolean) =>
     api.post<any>(endpoints.projects.toggle(id, enable ? "enable" : "disable")),
@@ -243,12 +257,34 @@ export const projectsApi = {
   connectDomain: (id: string | number, body: { domain: string; includeWww: boolean }) =>
     api.post<any>(endpoints.projects.connect(id), body),
 
-  /** Set environment variables */
+  /** Set environment variables (full REPLACE of the environment scope) */
   setEnv: (id: string | number, envVars: any) =>
     api.put<any>(endpoints.projects.env(id), envVars),
 
-  /** Get environment variables */
-  getEnv: (id: string | number) => api.get<any>(endpoints.projects.env(id)),
+  /**
+   * MERGE env vars (partial): upsert + delete only the named keys, leaving every
+   * other var (incl. untouched masked secrets) intact. Safe for the editor.
+   */
+  mergeEnv: (
+    id: string | number,
+    body: {
+      environment: string;
+      upserts: Array<{ key: string; value: string; isSecret?: boolean }>;
+      deletes: string[];
+    },
+  ) => api.patch<{ upserted: number; deleted: number }>(endpoints.projects.env(id), body),
+
+  /** Get environment variables (secret values returned masked) */
+  getEnv: (id: string | number) =>
+    api.get<{
+      data: Array<{
+        id: string;
+        key: string;
+        value: string;
+        environment: string;
+        isSecret: boolean;
+      }>;
+    }>(endpoints.projects.env(id)),
 
   /** Get git settings */
   getGit: (id: string | number) => api.get<any>(endpoints.projects.git(id)),

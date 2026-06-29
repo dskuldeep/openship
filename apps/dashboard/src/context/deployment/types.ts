@@ -592,7 +592,7 @@ export interface DeploymentContextType {
   ) => Promise<{ success: boolean; error?: string; errorType?: string }>;
 
   // Build lifecycle
-  startDeployment: (overrides?: { runtimeMode?: RuntimeMode }) => Promise<string | null>;
+  startDeployment: (overrides?: { runtimeMode?: RuntimeMode; saveConfigOnly?: boolean }) => Promise<string | null>;
   connectToBuild: (deploymentId?: string, startBuild?: boolean) => Promise<void>;
   loadBuildSession: (deploymentId: string) => Promise<{ success: boolean; error?: string }>;
   stopDeployment: () => Promise<void>;

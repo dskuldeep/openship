@@ -29,11 +29,12 @@ import { Modal } from "@/components/ui/Modal";
 import { RepositoryList } from "../../../library/components/RepositoryList";
 
 export const GitSettings = () => {
-  const { gitData, refreshGit, id, projectData } = useProjectSettings();
+  const { gitData, refreshGit, id, projectData, updateProjectData } = useProjectSettings();
   const github = useGitHub();
   const { showToast } = useToast();
   const [isTogglingAutoDeploy, setIsTogglingAutoDeploy] = useState(false);
   const [isTogglingRollback, setIsTogglingRollback] = useState(false);
+  const [savingRollbackWindow, setSavingRollbackWindow] = useState(false);
   const [isLinking, setIsLinking] = useState(false);
   const [showPicker, setShowPicker] = useState(false);
   const [isSettingDomain, setIsSettingDomain] = useState(false);
@@ -145,6 +146,25 @@ export const GitSettings = () => {
       showToast(getApiErrorMessage(error, "Failed to update rollback strategy"), "error");
     } finally {
       setIsTogglingRollback(false);
+    }
+  };
+
+  const handleRollbackWindowChange = async (next: number) => {
+    const clamped = Math.max(0, Math.min(20, next));
+    const current = projectData?.rollbackWindow ?? 5;
+    if (clamped === current) return;
+    setSavingRollbackWindow(true);
+    try {
+      await projectsApi.update(id, { rollbackWindow: clamped });
+      updateProjectData({ rollbackWindow: clamped });
+      showToast(
+        `Keeping the last ${clamped} version${clamped === 1 ? "" : "s"} for rollback`,
+        "success",
+      );
+    } catch (error) {
+      showToast(getApiErrorMessage(error, "Failed to update rollback history"), "error");
+    } finally {
+      setSavingRollbackWindow(false);
     }
   };
 
@@ -416,7 +436,7 @@ export const GitSettings = () => {
                 </div>
               )}
 
-              <div className="grid gap-3 sm:grid-cols-2 xl:grid-cols-3">
+              <div className="grid gap-3 sm:grid-cols-2">
                 <InfoCard
                   icon={Zap}
                   title="Auto Deploy"
@@ -471,13 +491,13 @@ export const GitSettings = () => {
                   title="Rollback strategy"
                   value={
                     (gitData.defaultRollbackStrategy ?? "git") === "git"
-                      ? "Git-driven"
-                      : "Snapshot"
+                      ? "Rebuild (git)"
+                      : "Instant (snapshot)"
                   }
                   description={
                     (gitData.defaultRollbackStrategy ?? "git") === "git"
-                      ? "Rollback re-clones at the previous commit. No disk used."
-                      : "Previous artifact archived for instant rollback. Uses disk."
+                      ? "Rollback re-clones & rebuilds the old commit — cheaper, but slower and can fail if that commit no longer builds."
+                      : "Keeps each version's build artifact on disk for rollback in seconds. Uses extra disk, capped by the history limit."
                   }
                   action={
                     <button
@@ -499,6 +519,51 @@ export const GitSettings = () => {
                     </button>
                   }
                 />
+                {(() => {
+                  const isSnapshot = (gitData.defaultRollbackStrategy ?? "git") === "snapshot";
+                  const windowVal = projectData?.rollbackWindow ?? 5;
+                  return (
+                    <InfoCard
+                      icon={RotateCcw}
+                      title="Rollback history"
+                      value={`${windowVal} version${windowVal === 1 ? "" : "s"}`}
+                      description={
+                        isSnapshot
+                          ? "How many recent versions keep their build artifact for rollback. Older ones are pruned to reclaim disk."
+                          : "Applies only to Instant (snapshot) mode — Git mode keeps no artifacts to retain."
+                      }
+                      action={
+                        <div className="flex items-center gap-1.5">
+                          <button
+                            type="button"
+                            onClick={() => handleRollbackWindowChange(windowVal - 1)}
+                            disabled={!isSnapshot || savingRollbackWindow || windowVal <= 0}
+                            className="flex h-6 w-6 items-center justify-center rounded-md border border-border/60 text-foreground transition-colors enabled:hover:bg-muted disabled:cursor-not-allowed disabled:opacity-40"
+                            aria-label="Decrease rollback history"
+                          >
+                            −
+                          </button>
+                          <span className="w-5 text-center text-[13px] font-medium tabular-nums text-foreground">
+                            {savingRollbackWindow ? (
+                              <Loader2 className="mx-auto size-3.5 animate-spin text-muted-foreground" />
+                            ) : (
+                              windowVal
+                            )}
+                          </span>
+                          <button
+                            type="button"
+                            onClick={() => handleRollbackWindowChange(windowVal + 1)}
+                            disabled={!isSnapshot || savingRollbackWindow || windowVal >= 20}
+                            className="flex h-6 w-6 items-center justify-center rounded-md border border-border/60 text-foreground transition-colors enabled:hover:bg-muted disabled:cursor-not-allowed disabled:opacity-40"
+                            aria-label="Increase rollback history"
+                          >
+                            +
+                          </button>
+                        </div>
+                      }
+                    />
+                  );
+                })()}
               </div>
             </>
           )}

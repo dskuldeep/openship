@@ -22,6 +22,7 @@ import type {
   TCreateProjectEnvironmentBody,
   TUpdateProjectBody,
   TSetEnvVarsBody,
+  TMergeEnvVarsBody,
   TUpdateResourcesBody,
 } from "./project.schema";
 import { stat } from "node:fs/promises";
@@ -605,6 +606,28 @@ export async function setEnvVars(c: Context) {
       environment: body.environment,
       // Names only - never echo the secret values.
       varNames: (body.vars ?? []).map((v) => v.key),
+    },
+  });
+  return c.json(result);
+}
+
+export async function mergeEnvVars(c: Context) {
+  const ctx = getRequestContext(c);
+  const { userId, organizationId } = ctx;
+  const id = param(c, "id");
+  await permission.assert(getRequestContext(c), { resourceType: "project", resourceId: id, action: "write" });
+  const body = await c.req.json<TMergeEnvVarsBody>();
+  const result = await projectService.mergeEnvVars(id, organizationId, body);
+  audit.recordAsync(auditContextFrom(c, organizationId, userId), {
+    eventType: "project.updated",
+    resourceType: "project",
+    resourceId: id,
+    after: {
+      action: "envVars.merge",
+      environment: body.environment,
+      // Names only - never echo the secret values.
+      upsertedNames: (body.upserts ?? []).map((v) => v.key),
+      deletedNames: body.deletes ?? [],
     },
   });
   return c.json(result);
@@ -1690,6 +1713,15 @@ export async function setOptions(c: Context) {
     },
   });
   return c.json({ data: result });
+}
+
+/** GET /:id/commit-status — drift check for the "project outdated" banner. */
+export async function getCommitStatus(c: Context) {
+  const ctx = getRequestContext(c);
+  const id = param(c, "id");
+  await permission.assert(ctx, { resourceType: "project", resourceId: id, action: "read" });
+  const status = await projectService.getProjectCommitStatus(ctx, id, ctx.organizationId);
+  return c.json({ data: status });
 }
 
 // ─── Sleep mode ──────────────────────────────────────────────────────────────

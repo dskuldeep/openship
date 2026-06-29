@@ -16,7 +16,7 @@ import { useCloud } from "@/context/CloudContext";
 import { canUseCloudConnection, usePlatform } from "@/context/PlatformContext";
 import { useGitHub } from "@/context/GitHubContext";
 import { useModal } from "@/context/ModalContext";
-import { useRouter } from "next/navigation";
+import { useRouter, useSearchParams } from "next/navigation";
 
 // ─── Deploy checklist for compose ────────────────────────────────────────────
 
@@ -322,6 +322,23 @@ const Sidebar: React.FC = () => {
     await continueDeploy();
   }, [baseDomain, canConnectCloud, cloneGate.hasGlobalToken, cloneGate.needsPrompt, config.buildStrategy, config.deployTarget, config.owner, config.projectId, config.publicEndpoints, config.services, continueDeploy, githubState, hideModal, installUrl, isServices, requireCloud, selfHosted, showModal, updateConfig]);
 
+  // Edit mode (opened from the project Runtime page with ?mode=config): the
+  // finish button SAVES the config to the project and returns — no deploy, no
+  // deploy gates (cloud/clone/domain checks are deploy concerns). Deploying is
+  // the separate "Redeploy" action on the project page.
+  const searchParams = useSearchParams();
+  const isConfigMode = searchParams.get("mode") === "config";
+  const [isSaving, setIsSaving] = React.useState(false);
+  const handleSave = useCallback(async () => {
+    setIsSaving(true);
+    try {
+      const projectId = await startDeployment({ saveConfigOnly: true });
+      if (projectId) router.push(`/projects/${projectId}`);
+    } finally {
+      setIsSaving(false);
+    }
+  }, [startDeployment, router]);
+
   return (
     <div className="lg:sticky lg:top-6 h-fit space-y-4">
       {/* Repository Info */}
@@ -401,24 +418,46 @@ const Sidebar: React.FC = () => {
         />
       )}
 
-      {/* Deploy */}
-      <button
-        onClick={handleDeploy}
-        disabled={state.isDeploying}
-        className="w-full inline-flex items-center justify-center gap-2 px-5 py-3 bg-primary text-primary-foreground text-sm font-medium rounded-xl hover:bg-primary/90 transition-all hover:shadow-lg hover:shadow-primary/25 hover:-translate-y-0.5 disabled:opacity-50 disabled:cursor-not-allowed"
-      >
-        {state.isDeploying ? (
-          <>
-            <Loader2 className="size-4 animate-spin" />
-            Deploying…
-          </>
-        ) : (
-          <>
-            <Rocket className="size-4" />
-            Deploy
-          </>
-        )}
-      </button>
+      {/* Finish: Save (edit mode) or Deploy (create/first-deploy). Editing
+          config from the project Runtime page SAVES without deploying — deploy
+          is the separate "Redeploy" action. */}
+      {isConfigMode ? (
+        <button
+          onClick={handleSave}
+          disabled={isSaving}
+          className="w-full inline-flex items-center justify-center gap-2 px-5 py-3 bg-primary text-primary-foreground text-sm font-medium rounded-xl hover:bg-primary/90 transition-all hover:shadow-lg hover:shadow-primary/25 hover:-translate-y-0.5 disabled:opacity-50 disabled:cursor-not-allowed"
+        >
+          {isSaving ? (
+            <>
+              <Loader2 className="size-4 animate-spin" />
+              Saving…
+            </>
+          ) : (
+            <>
+              <Check className="size-4" />
+              Save changes
+            </>
+          )}
+        </button>
+      ) : (
+        <button
+          onClick={handleDeploy}
+          disabled={state.isDeploying}
+          className="w-full inline-flex items-center justify-center gap-2 px-5 py-3 bg-primary text-primary-foreground text-sm font-medium rounded-xl hover:bg-primary/90 transition-all hover:shadow-lg hover:shadow-primary/25 hover:-translate-y-0.5 disabled:opacity-50 disabled:cursor-not-allowed"
+        >
+          {state.isDeploying ? (
+            <>
+              <Loader2 className="size-4 animate-spin" />
+              Deploying…
+            </>
+          ) : (
+            <>
+              <Rocket className="size-4" />
+              Deploy
+            </>
+          )}
+        </button>
+      )}
 
       {/* Build Summary */}
       <BuildSummary />

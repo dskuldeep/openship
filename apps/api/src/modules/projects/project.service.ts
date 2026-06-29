@@ -19,6 +19,7 @@ export {
   createProject,
   updateProject,
   getGitInfo,
+  getProjectCommitStatus,
   setBranch,
   listProjectEnvironments,
   createProjectEnvironment,
@@ -32,7 +33,7 @@ export {
 export { previewProjectDeletion } from "./project-cleanup.service";
 export type { DeletionPreview, DeletionPreviewService } from "./project-cleanup.service";
 
-export { listEnvVars, setEnvVars } from "./project-env.service";
+export { listEnvVars, setEnvVars, mergeEnvVars } from "./project-env.service";
 
 export { getResources, updateResources, setSleepMode } from "./project-resources.service";
 

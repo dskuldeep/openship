@@ -84,6 +84,19 @@ export function createDeploymentRepo(db: Database) {
       return { ...row, createdAt: new Date(), updatedAt: new Date() } as Deployment;
     },
 
+    /**
+     * Next monotonic per-project deployment version (MAX(version)+1; 1 for the
+     * project's first). Safe against concurrent webhook races because the
+     * one-in-flight-per-project unique index serializes deployment creates.
+     */
+    async getNextVersion(projectId: string): Promise<number> {
+      const [row] = await db
+        .select({ max: sql<number>`COALESCE(MAX(${deployment.version}), 0)` })
+        .from(deployment)
+        .where(eq(deployment.projectId, projectId));
+      return Number(row?.max ?? 0) + 1;
+    },
+
     async updateStatus(id: string, status: string, extra?: Partial<NewDeployment>) {
       await db
         .update(deployment)

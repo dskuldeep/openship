@@ -143,30 +143,63 @@ export async function extractChangedFiles(
     return { files, forceAll: true, reason: "commit-token", truncated };
   }
 
-  // 4. Root-config triggers (Dockerfile, compose, package.json, …).
+  // 4 + 5. File-set-based force triggers (root-config / monorepo shared-package).
+  //   Shared with the manual smart-redeploy path via classifyChangedFiles.
+  const cls = classifyChangedFiles(files, {
+    isMonorepo: opts.isMonorepo,
+    monorepoSharedPaths: opts.monorepoSharedPaths,
+  });
+  return { files, forceAll: cls.forceAll, reason: cls.reason, truncated };
+}
+
+/**
+ * Decide whether a changed-files SET forces a full rebuild — independent of the
+ * push payload, so it's shared by the webhook (payload path) and the manual
+ * smart-redeploy path (compareCommits path). Mirrors steps 4–5 of
+ * extractChangedFiles: a root-config file (Dockerfile/compose/package.json/…)
+ * or a configured monorepo shared-path affects every service.
+ */
+export function classifyChangedFiles(
+  files: Iterable<string>,
+  opts: { isMonorepo?: boolean; monorepoSharedPaths?: string[] | null } = {},
+): { forceAll: boolean; reason?: string } {
   for (const f of files) {
     if (ROOT_CONFIG_FILES.has(f)) {
-      return { files, forceAll: true, reason: "root-config", truncated };
+      return { forceAll: true, reason: "root-config" };
     }
   }
-
-  // 5. Monorepo shared-package detection. Only runs when the project
-  //    has explicitly configured `monorepoSharedPaths` to a non-empty
-  //    list. No built-in default — see comment on the field for why.
   if (opts.isMonorepo && opts.monorepoSharedPaths && opts.monorepoSharedPaths.length > 0) {
-    const prefixes = opts.monorepoSharedPaths
-      .map(normalizeSharedPrefix)
-      .filter(Boolean);
+    const prefixes = opts.monorepoSharedPaths.map(normalizeSharedPrefix).filter(Boolean);
     if (prefixes.length > 0) {
       for (const f of files) {
         if (prefixes.some((p) => f.startsWith(p))) {
-          return { files, forceAll: true, reason: "shared-package", truncated };
+          return { forceAll: true, reason: "shared-package" };
         }
       }
     }
   }
+  return { forceAll: false };
+}
 
-  return { files, forceAll: false, truncated };
+/**
+ * Route a changed-files set to the affected routable services. Shared by the
+ * webhook and the manual smart-redeploy path so per-service targeting is
+ * identical (no duplicated matching logic).
+ *
+ *   - { mode: "all" }     → no routable services (single-app) → rebuild it.
+ *   - { mode: "services" }→ at least one service's rootDirectory changed.
+ *   - { mode: "skip" }    → routable services exist but none were affected.
+ */
+export function routeServicesByChanges(
+  routableServices: Array<{ id: string; rootDirectory: string | null }>,
+  files: Iterable<string>,
+): { mode: "all" } | { mode: "services"; serviceIds: string[] } | { mode: "skip" } {
+  if (routableServices.length === 0) return { mode: "all" };
+  const matched = routableServices
+    .filter((s) => serviceMatchesChanges(s.rootDirectory, files))
+    .map((s) => s.id);
+  if (matched.length === 0) return { mode: "skip" };
+  return { mode: "services", serviceIds: matched };
 }
 
 function unionCommitFiles(commits: GitHubPushPayload["commits"] = []): Set<string> {

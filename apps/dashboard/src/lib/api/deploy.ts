@@ -158,6 +158,9 @@ export const deployApi = {
     environment?: string;
     forceAll?: boolean;
     serviceIds?: string[];
+    /** Smart per-service routing for a manual multi-service redeploy: rebuild
+     *  only the services whose files changed since the active deployment. */
+    smartRoute?: boolean;
   }) => api.post<any>("deployments", body),
 
   /** Resolve project info from GitHub repo or local path - detects stack */

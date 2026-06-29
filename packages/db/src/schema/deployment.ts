@@ -70,6 +70,14 @@ export const deployment = pgTable("deployment", {
   imageRef: text("image_ref"),
   /** Build duration in milliseconds */
   buildDurationMs: integer("build_duration_ms"),
+  /**
+   * Monotonic per-project deployment number (v1, v2, …) for human-friendly
+   * history + the rollback UI. Assigned at create as MAX(version)+1 for the
+   * project; the one-in-flight-per-project unique index serializes creates so
+   * concurrent webhook races can't collide. Nullable for legacy rows created
+   * before this column existed.
+   */
+  version: integer("version"),
 
   /* ── Container details ──────────────────────────────────────────────── */
   /** Adapter container ID (for stop/start/destroy) */

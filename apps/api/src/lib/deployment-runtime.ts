@@ -81,7 +81,14 @@ async function resolveOrgServer(
   throw new Error("Deployment target is a server, but this deployment has no server ID. Redeploy and select a server explicitly.");
 }
 
-function resolveEffectiveTarget(base: Platform["target"], snapshot: DeploymentMeta): DeployTarget {
+/**
+ * THE authority for "given the host platform + this deployment's snapshot,
+ * where does it actually land?". Returns a concrete DeployTarget
+ * ("local" | "server" | "cloud") — never the host platform literal. Preflight
+ * and the build pipeline both route through this so their notion of the target
+ * can never drift (a drift caused the self-hosted→cloud-preflight 403).
+ */
+export function resolveEffectiveTarget(base: Platform["target"], snapshot: DeploymentMeta): DeployTarget {
   if (base === "desktop") return snapshot.deployTarget ?? "cloud";
   if (base === "selfhosted") {
     // Explicit server ID → always SSH
@@ -93,7 +100,7 @@ function resolveEffectiveTarget(base: Platform["target"], snapshot: DeploymentMe
   return "cloud";
 }
 
-function usesManagedRouting(base: Platform["target"], effectiveTarget: DeployTarget): boolean {
+export function usesManagedRouting(base: Platform["target"], effectiveTarget: DeployTarget): boolean {
   return base === "selfhosted" || (base === "desktop" && (effectiveTarget === "server" || effectiveTarget === "local"));
 }
 

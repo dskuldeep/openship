@@ -1,17 +1,21 @@
 /**
- * Shared deploy pipeline - activate → deactivate old → route.
- *
- * Mirrors build-pipeline.ts: the pipeline defines the SEQUENCE,
- * each runtime provides a DeployEnvironment that implements the steps.
- *
- * The pipeline is composed in the service layer from existing runtime
- * and routing adapter methods - no changes to the RuntimeAdapter interface.
+ * Shared deploy pipeline. The pipeline defines the SEQUENCE; each runtime
+ * provides a DeployEnvironment that implements the steps. Composed in the
+ * service layer from existing runtime + routing adapter methods.
  *
  *   - preflight:        (optional) validate prerequisites before committing
  *   - activate:         runtime.deploy()  → start container/workload/process
- *   - deactivate:       runtime.stop()    → stop previous deployment
+ *   - healthCheck:      (optional, deferred) readiness gate for the new one
  *   - resolveTargetUrl: runtime.getContainerIp() → internal URL for routing
  *   - routing:          routing.registerRoute()   → reverse-proxy config
+ *   - deactivate:       runtime.stop()/destroy()  → stop the PREVIOUS one
+ *
+ * The order of activate vs deactivate depends on env.canOverlap:
+ *   - OVERLAP (docker/cloud): activate new → health-gate → route → deactivate
+ *     old LAST. Old serves until traffic is repointed (zero-downtime) and a
+ *     failure before the repoint leaves it untouched (auto-revert).
+ *   - NON-OVERLAP (bare, fixed port): deactivate old → activate new → health →
+ *     route, and on failure reactivatePrevious to restore the old one.
  *
  * Cloud:       activate handles expose (URL returned), no resolveTargetUrl.
  * Self-hosted: activate creates container, resolveTargetUrl + routing wire Nginx.
@@ -60,6 +64,43 @@ export interface DeployEnvironment {
   deactivate(containerId: string): Promise<void>;
 
   /**
+   * Can the NEW deployment run SIMULTANEOUSLY with the previous one?
+   *
+   * true  (docker/cloud — unique container name + own host port / isolated
+   *        workspace): the pipeline starts → health-gates → routes the new
+   *        deployment BEFORE stopping the old one. A failure anywhere before
+   *        the route swap leaves the old one untouched and still serving =
+   *        zero-downtime on the happy path + zero-impact auto-revert.
+   * false (bare — fixed host port): the old process must be stopped before the
+   *        new one can bind, so the pipeline keeps the legacy stop-first order
+   *        and, on failure, calls reactivatePrevious to bring the old one back.
+   *
+   * Defaults to falsey (stop-first) — backward-compatible for static/compose.
+   */
+  canOverlap?: boolean;
+
+  /**
+   * Optional readiness gate for the just-activated deployment. Throw to mark
+   * the deploy failed — in the overlap path this auto-reverts to the old
+   * deployment (it was never touched).
+   *
+   * DEFERRED SEAM: no runtime implements this yet. It is the single insertion
+   * point for the (separately-designed) health-check execution — once a runtime
+   * provides it, the pipeline needs no further changes. Until then the call is
+   * a no-op.
+   */
+  healthCheck?(containerId: string, config: DeployConfig): Promise<void>;
+
+  /**
+   * Restart a previously-STOPPED deployment — the non-overlap (bare) auto-revert
+   * path. Only meaningful when deactivate() merely stopped the old deployment
+   * (keeping its artifact on disk) so it can be started again. Omit for runtimes
+   * that destroy on deactivate or run old+new concurrently (overlap never stops
+   * the old one before success, so there is nothing to restore).
+   */
+  reactivatePrevious?(previousContainerId: string): Promise<void>;
+
+  /**
    * Resolve the internal target URL for reverse-proxy routing.
    *
    * Return null if the container has no routable IP (e.g. not ready yet).
@@ -85,8 +126,16 @@ export interface DeploySsl {
 
 export interface DeployPipelineInput {
   config: DeployConfig;
-  /** Container ID of the currently-active deployment (to deactivate). */
+  /** Container ID of the currently-active deployment (undefined on first deploy). */
   previousContainerId?: string;
+  /**
+   * Whether this run should stop the previous deployment. Defaults to true.
+   * Set false when the caller's post-deploy step will stop+RETAIN the old one
+   * itself — e.g. snapshot rollback, where archivePreviousDeployment archives
+   * the artifact. previousContainerId stays accurate either way; this only
+   * controls whether the pipeline calls deactivate.
+   */
+  deactivatePrevious?: boolean;
   /** Verified domains that need routing. */
   domains: RoutedDomainInput[];
   /** Routing provider - omit when routing is handled by the runtime (cloud). */
@@ -113,14 +162,15 @@ export interface DeployPipelineResult {
 // ─── Pipeline ────────────────────────────────────────────────────────────────
 
 /**
- * Run the deploy pipeline: preflight → activate → deactivate old → route.
+ * Run the deploy pipeline. Order depends on env.canOverlap (see file header):
+ *   overlap     → activate → health-gate → route → deactivate old (last)
+ *   non-overlap → deactivate old → activate → health-gate → route
  *
- * Called by the service layer after a successful build. The service
- * composes the DeployEnvironment from the RuntimeAdapter's existing
- * methods, so no changes to the adapter interface are needed.
+ * Called by the service layer after a successful build. The service composes
+ * the DeployEnvironment from the RuntimeAdapter's existing methods.
  *
- * Step events ("deploy" running/completed/failed) are owned by this
- * pipeline, just as build-pipeline owns clone/install/build events.
+ * Step events ("deploy" running/completed/failed) are owned by this pipeline,
+ * just as build-pipeline owns clone/install/build events.
  */
 export async function runDeployPipeline(
   env: DeployEnvironment,
@@ -128,11 +178,25 @@ export async function runDeployPipeline(
   logger: BuildLogger,
 ): Promise<DeployPipelineResult> {
   const { config, previousContainerId, domains, routing, ssl, routeOptions, promptUser } = input;
+  const overlap = env.canOverlap === true;
 
   // Track the container we activate so a failure DURING/AFTER routing can
   // report it back to the caller for cleanup — a started-but-unrouted
   // container must not orphan.
   let activatedContainerId: string | undefined;
+
+  // Stop the previous deployment — best-effort, never aborts the deploy.
+  // Skipped when the caller opts out (deactivatePrevious === false): the old
+  // one keeps serving until the caller's own post-deploy step stops+retains it.
+  const deactivatePrevious = async () => {
+    if (!previousContainerId || input.deactivatePrevious === false) return;
+    try {
+      logger.log("Stopping previous deployment…\n");
+      await env.deactivate(previousContainerId);
+    } catch (err) {
+      logger.log(`Warning: failed to stop previous deployment: ${safeErrorMessage(err)}\n`, "warn");
+    }
+  };
 
   try {
     logger.step("deploy", "running", "Deploying...");
@@ -143,21 +207,17 @@ export async function runDeployPipeline(
       await env.preflight(config, promptUser ?? noopPrompt);
     }
 
-    // ── Step 1: Destroy previous deployment (release slug/domain) ──────
-    if (previousContainerId) {
-      try {
-        logger.log("Stopping previous deployment…\n");
-        await env.deactivate(previousContainerId);
-        // Give the OS a moment to release the port / socket.
-        await new Promise((r) => setTimeout(r, 1000));
-      } catch (err) {
-        // Log but don't abort - best-effort teardown so we can still try the new deploy.
-        const msg = safeErrorMessage(err);
-        logger.log(`Warning: failed to stop previous deployment: ${msg}\n`, "warn");
-      }
+    // ── Non-overlap only: stop OLD first (it holds the fixed port) ─────
+    // The new process can't bind until the old one releases the port, so
+    // there's an unavoidable downtime window here. Overlap runtimes skip
+    // this entirely — the old deployment keeps serving until the route swap.
+    if (!overlap && previousContainerId) {
+      await deactivatePrevious();
+      // Give the OS a moment to release the port / socket.
+      await new Promise((r) => setTimeout(r, 1000));
     }
 
-    // ── Step 2: Activate new deployment ──────────────────────────────
+    // ── Activate the new deployment ──────────────────────────────────
     const onLog: LogCallback = (entry) => logger.callback(entry);
     const { containerId, url } = await env.activate(config, onLog);
     activatedContainerId = containerId;
@@ -166,7 +226,14 @@ export async function runDeployPipeline(
       throw new Error("Deploy completed but no container was created");
     }
 
-    // ── Step 3: Register routes ──────────────────────────────────────
+    // ── Health gate (deferred seam — no-op until a runtime implements it) ─
+    // Runs BEFORE routes are repointed, so an unhealthy new deployment throws
+    // here and the overlap path auto-reverts to the still-running old one.
+    if (env.healthCheck) {
+      await env.healthCheck(containerId, config);
+    }
+
+    // ── Register routes (repoint traffic to the new deployment) ───────
     const routeTarget = env.resolveRoute
       ? await env.resolveRoute(containerId, config)
       : env.resolveTargetUrl
@@ -204,6 +271,13 @@ export async function runDeployPipeline(
       routeOptions,
     );
 
+    // ── Overlap only: now the new one is healthy + routed, stop OLD LAST ─
+    // Best-effort, and a no-op when the caller set deactivatePrevious=false
+    // (snapshot rollback — archivePreviousDeployment stops+retains it instead).
+    if (overlap) {
+      await deactivatePrevious();
+    }
+
     logger.step("deploy", "completed", "Deployed successfully");
 
     return { status: "ready", containerId, url };
@@ -213,6 +287,23 @@ export async function runDeployPipeline(
     const errorDetails = err instanceof DeployError ? err.details : undefined;
     logger.step("deploy", "failed", `Deploy failed: ${msg}`);
     logger.log(`\x1b[1;31mDeploy failed: ${msg}\x1b[0m\n`, "error");
+
+    // Non-overlap auto-revert: the old deployment was stopped before the new
+    // one started, so on failure try to restart it (best-effort; the bare
+    // release dir was kept by deactivate=stop). Overlap runtimes never stopped
+    // the old one pre-success, so there is nothing to restore.
+    if (!overlap && previousContainerId && env.reactivatePrevious) {
+      try {
+        logger.log("Deploy failed — restarting the previous deployment…\n", "warn");
+        await env.reactivatePrevious(previousContainerId);
+      } catch (revertErr) {
+        logger.log(
+          `Warning: failed to restart previous deployment: ${safeErrorMessage(revertErr)}\n`,
+          "warn",
+        );
+      }
+    }
+
     return { status: "failed", error: msg, errorCode, errorDetails, containerId: activatedContainerId };
   }
 }

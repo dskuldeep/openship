@@ -50,11 +50,28 @@ export async function create(c: Context) {
     forceAll?: boolean;
     /** Smart per-service target list. Mutually exclusive with forceAll. */
     serviceIds?: string[];
+    /** Manual smart redeploy: rebuild only services changed since the active deploy. */
+    smartRoute?: boolean;
   }>();
   if (body.projectId) {
     await permission.assert(getRequestContext(c), { resourceType: "project", resourceId: body.projectId, action: "write" });
   }
-  const result = await buildService.triggerDeployment(ctx, body);
+  // Construct the triggerDeployment arg from an explicit ALLOWLIST — never
+  // forward the raw body. triggerDeployment has internal-only fields
+  // (reuseSnapshot, rollbackStrategy, commitShaBefore) that must NOT be
+  // settable over HTTP: reuseSnapshot ships a frozen, un-normalized build
+  // snapshot verbatim (commands/target/runtimeMode), so leaking it would let a
+  // caller inject arbitrary build config. Those fields are only ever set by the
+  // internal rollback/webhook callers.
+  const result = await buildService.triggerDeployment(ctx, {
+    projectId: body.projectId,
+    branch: body.branch,
+    commitSha: body.commitSha,
+    environment: body.environment,
+    forceAll: body.forceAll,
+    serviceIds: body.serviceIds,
+    smartRoute: body.smartRoute,
+  });
   return c.json({ data: result }, 202);
 }
 

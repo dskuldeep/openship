@@ -148,6 +148,13 @@
       "when": 1782573643406,
       "tag": "0020_uneven_the_renegades",
       "breakpoints": true
+    },
+    {
+      "idx": 21,
+      "version": "7",
+      "when": 1782674221078,
+      "tag": "0021_shiny_firestar",
+      "breakpoints": true
     }
   ]
 }

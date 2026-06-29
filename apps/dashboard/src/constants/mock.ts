@@ -37,11 +37,29 @@ export interface Project {
   latestDeploymentStatus?: string | null;
   serviceCount?: number;
   hasMultipleServices?: boolean;
+  /** Set once soft-deleted; in practice teardown hard-deletes, so the list
+   *  rarely sees this. */
+  deletedAt?: string | null;
+  /** True while an atomic teardown is in flight — drives the "Deleting" status
+   *  in the list (the row is still returned because deletedAt is null). */
+  deletionInProgress?: boolean | null;
 
   /* ── Hosting info (enriched by API) ─────────────────────── */
   favicon?: string | null;
   deployTarget?: string | null;
   serverName?: string | null;
+  /** Runtime isolation mode (bare | docker) — editable in the Runtime tab. */
+  runtimeMode?: "bare" | "docker" | null;
+  /**
+   * Resource config as returned by /info (enrichProject → encodeResources):
+   * production/build hold the actual { cpuCores, memoryMb }.
+   */
+  resources?: {
+    production?: { cpuCores?: number; memoryMb?: number } | null;
+    build?: { cpuCores?: number; memoryMb?: number } | null;
+    sleepMode?: string;
+    port?: number;
+  } | null;
 
   createdAt: string;
   updatedAt: string;

@@ -8,6 +8,7 @@
     "build": "next build",
     "start": "next start",
     "lint": "next lint",
+    "test": "vitest run",
     "clean": "rm -rf .next .turbo node_modules"
   },
   "dependencies": {
@@ -40,6 +41,7 @@
     "@types/react-dom": "^19.1.0",
     "postcss": "^8.5.8",
     "tailwindcss": "^4.2.1",
-    "typescript": "^5.9.3"
+    "typescript": "^5.9.3",
+    "vitest": "^4.0.18"
   }
 }

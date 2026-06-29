@@ -456,10 +456,24 @@ export function useDeploymentConfig() {
         monorepoApps: preparedContext.monorepoApps,
         monorepoWorkspace: preparedContext.monorepoWorkspace,
         modeSnapshots: undefined,
-        framework: preparedContext.detectedStack,
+        // For an EXISTING project (projectId set — config edit or redeploy)
+        // prefer the SAVED framework so a fresh re-detection can't silently
+        // rewrite it on save. Fall back to detection for a brand-new deploy
+        // (or if the saved value is somehow missing). detectedFramework stays
+        // the fresh detection for informational/UI purposes.
+        framework:
+          projectId && project?.framework ? project.framework : preparedContext.detectedStack,
         detectedFramework: preparedContext.detectedStack,
         buildStrategy: normalizeBuildStrategy(preparedContext.projectType, preparedContext.stackDef),
-        runtimeMode: normalizeRuntimeMode(preparedContext.projectType),
+        // Same hydration rule as framework: for an EXISTING project keep the
+        // SAVED runtime isolation so a config-save can't silently rewrite a
+        // chosen "docker" back to the "bare" default. resolvePreparedRuntimeConfig
+        // hydrates every OTHER options field from the project but not this one,
+        // so without this the wizard would re-send the default and clobber it.
+        runtimeMode:
+          projectId && (project?.runtimeMode === "bare" || project?.runtimeMode === "docker")
+            ? project.runtimeMode
+            : normalizeRuntimeMode(preparedContext.projectType),
         packageManager: runtimeConfig.packageManager,
         buildImage: runtimeConfig.buildImage,
         branch,

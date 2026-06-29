@@ -35,8 +35,8 @@ export const LoadingSkeleton = () => {
       {/* Cards Skeleton */}
       <div className="bg-card rounded-2xl border border-border/50 divide-y divide-border/50">
         {[...Array(5)].map((_, i) => (
-          <div key={i} className="px-4 py-3.5 flex items-center gap-4 animate-pulse">
-            <div className="w-10 h-10 bg-muted rounded-xl shrink-0"></div>
+          <div key={i} className="px-4 py-4 flex items-center gap-4 animate-pulse">
+            <div className="h-9 w-9 bg-muted rounded-xl shrink-0"></div>
             <div className="flex-1 min-w-0">
               <div className="flex items-center gap-2 mb-1.5">
                 <div className="h-4 bg-muted rounded w-32"></div>

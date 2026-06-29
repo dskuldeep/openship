@@ -37,11 +37,9 @@ import {
 } from "./cloud-resources";
 import { platform } from "../../lib/controller-helpers";
 import { encrypt } from "../../lib/encryption";
-import {
-  getLatestCommit,
-  getRepository,
-} from "../github/github.service";
+import { getLatestCommit, getRepository } from "../github/github.service";
 import { assertGitHubRepoAccess } from "../github/github-access";
+import { resolveSmartRoute } from "./smart-route";
 import { type RequestContext } from "../../lib/request-context";
 import * as sessionManager from "./session-manager";
 import {
@@ -266,6 +264,10 @@ export function buildConfigSnapshot(
     // UI to pass it on every redeploy. The desktop picker still wins
     // when it does pass an explicit deployTarget (see line ~773).
     deployTarget: project.cloudWorkspaceId ? "cloud" : undefined,
+    // Runtime isolation mode persisted on the project (editable in the Runtime
+    // tab). So a redeploy/webhook deploy respects the saved choice instead of
+    // re-defaulting. The wizard's per-deploy override still wins when passed.
+    runtimeMode: (project.runtimeMode as "bare" | "docker" | null) ?? undefined,
   };
 }
 
@@ -288,6 +290,82 @@ async function resolveProjectBranch(ctx: RequestContext, project: Project, branc
   }
 
   return "main";
+}
+
+/**
+ * Single source of truth for a deployment's rollback context. Replaces the
+ * blocks that were hand-copied (with divergent defaults) across
+ * requestBuildAccess / triggerDeployment / redeployBuildSession / the webhook
+ * push path.
+ *
+ *   - rollbackStrategy: explicit override wins, else the project default, else
+ *     `"git"` (cheap re-clone at the prior commit; the unified default — set
+ *     `project.defaultRollbackStrategy = "snapshot"` for instant artifact
+ *     restore). createQueuedDeployment's backstop matches this same `"git"`.
+ *   - commitShaBefore: explicit override wins, else the last successful deploy
+ *     on this branch — the anchor a git-strategy rollback re-clones to.
+ */
+export async function resolveRollbackContext(
+  project: Project,
+  branch: string,
+  override?: { rollbackStrategy?: "snapshot" | "git"; commitShaBefore?: string },
+): Promise<{ rollbackStrategy: "snapshot" | "git"; commitShaBefore?: string }> {
+  const rollbackStrategy =
+    override?.rollbackStrategy ??
+    (project.defaultRollbackStrategy as "snapshot" | "git" | undefined) ??
+    "git";
+
+  let commitShaBefore = override?.commitShaBefore;
+  if (!commitShaBefore) {
+    const lastGood = await repos.deployment
+      .getLatestSuccessfulForBranch(project.id, branch)
+      .catch(() => null);
+    commitShaBefore = lastGood?.commitSha ?? undefined;
+  }
+
+  return { rollbackStrategy, commitShaBefore };
+}
+
+/**
+ * Single source of truth for a deployment snapshot's TARGET — deployTarget +
+ * serverId + runtimeMode. Used by BOTH deploy entry points (requestBuildAccess
+ * and triggerDeployment) so they can never diverge on where a project deploys.
+ *
+ * Precedence:
+ *   - deployTarget: explicit per-deploy override (the wizard picker)
+ *       > cloudWorkspaceId (the canonical "is a cloud project" primitive)
+ *       > the project's ACTIVE deployment's last target (what it runs on now)
+ *       > undefined (host default, resolved later by the pipeline's resolver).
+ *   - serverId: ONLY kept when the resolved target is "server". For cloud/local
+ *       it is dropped, so a non-server deploy can't carry a stale serverId and
+ *       mis-route (the bug the unconditional inheritance had).
+ *   - runtimeMode: override > project.runtimeMode column > active-meta.
+ */
+export async function resolveSnapshotTarget(
+  project: Project,
+  override?: { deployTarget?: DeployTarget; serverId?: string; runtimeMode?: "bare" | "docker" },
+): Promise<{ deployTarget?: DeployTarget; serverId?: string; runtimeMode?: "bare" | "docker" }> {
+  const activeMeta = project.activeDeploymentId
+    ? ((await repos.deployment.findById(project.activeDeploymentId).catch(() => null))
+        ?.meta as DeploymentConfigSnapshot | null)
+    : null;
+
+  const deployTarget: DeployTarget | undefined =
+    override?.deployTarget ??
+    (project.cloudWorkspaceId ? "cloud" : (activeMeta?.deployTarget ?? undefined)) ??
+    undefined;
+
+  const serverId =
+    deployTarget === "server"
+      ? (override?.serverId ?? activeMeta?.serverId ?? undefined)
+      : undefined;
+
+  const runtimeMode =
+    override?.runtimeMode ??
+    ((project.runtimeMode as "bare" | "docker" | null) ?? undefined) ??
+    (activeMeta?.runtimeMode ?? undefined);
+
+  return { deployTarget, serverId, runtimeMode };
 }
 
 function resolveRuntimeImage(project: Project): string {
@@ -396,7 +474,8 @@ export async function createQueuedDeployment(opts: {
   commitSha?: string;
   commitMessage?: string;
   trigger?: string;
-  /** Rollback policy for THIS deployment. Defaults to 'snapshot'. */
+  /** Rollback policy for THIS deployment. Defaults to 'git' (matches
+   *  resolveRollbackContext + the project default). */
   rollbackStrategy?: "snapshot" | "git";
   /** SHA active before this deploy — used by git-strategy rollback. */
   commitShaBefore?: string;
@@ -404,12 +483,19 @@ export async function createQueuedDeployment(opts: {
   forceAll?: boolean;
   /** Smart per-service targeting — passed through to the executor via meta. */
   serviceIds?: string[];
+  /** Changed-file paths traced for this version (file/root tracing). */
+  changedPaths?: string[] | null;
+  changedPathsTruncated?: boolean;
 }) {
   // Persist the smart-deploy serviceIds onto the snapshot so the
   // executor can find them without re-resolving from request scope.
   const meta: DeploymentConfigSnapshot = opts.serviceIds && opts.serviceIds.length > 0
     ? { ...opts.meta, targetServiceIds: opts.serviceIds }
     : opts.meta;
+
+  // Monotonic per-project version (v1, v2, …). The one-in-flight-per-project
+  // unique index below serializes concurrent creates, so MAX+1 can't collide.
+  const version = await repos.deployment.getNextVersion(opts.projectId);
 
   let dep;
   try {
@@ -423,6 +509,7 @@ export async function createQueuedDeployment(opts: {
       environment: opts.environment,
       framework: opts.framework,
       status: "queued",
+      version,
       meta,
       envVars: opts.envVars,
       // Default to git: most projects are GitHub-backed and re-cloning
@@ -432,6 +519,8 @@ export async function createQueuedDeployment(opts: {
       rollbackStrategy: opts.rollbackStrategy ?? "git",
       commitShaBefore: opts.commitShaBefore,
       forceAll: opts.forceAll ?? false,
+      changedPaths: opts.changedPaths ?? null,
+      changedPathsTruncated: opts.changedPathsTruncated ?? false,
     });
   } catch (err) {
     // Race: another caller raced past checkNoActiveBuild and won the
@@ -550,10 +639,14 @@ export async function requestBuildAccess(ctx: RequestContext, input: BuildAccess
     snapshot,
   );
 
-  // Persist deploy target from the UI (desktop-only picker)
-  if (deployTarget) {
-    snapshot.deployTarget = deployTarget;
-  }
+  // Resolve the snapshot's target (deployTarget + serverId + runtimeMode) from
+  // the single source of truth shared with triggerDeployment — UI override >
+  // cloudWorkspaceId > active-deployment meta. Keeps the two deploy entry points
+  // from diverging on where a project deploys.
+  const resolvedTarget = await resolveSnapshotTarget(project, { deployTarget, serverId, runtimeMode });
+  snapshot.deployTarget = resolvedTarget.deployTarget;
+  snapshot.serverId = resolvedTarget.serverId;
+  snapshot.runtimeMode = resolvedTarget.runtimeMode;
 
   // Resolve effective build strategy via settings service.
   // Pass deployTarget so that — absent an explicit per-deploy choice — the
@@ -564,12 +657,6 @@ export async function requestBuildAccess(ctx: RequestContext, input: BuildAccess
     buildStrategy ?? snapshot.buildStrategy,
     { deployTarget: snapshot.deployTarget },
   );
-  if (serverId) {
-    snapshot.serverId = serverId;
-  }
-  if (runtimeMode) {
-    snapshot.runtimeMode = runtimeMode;
-  }
   // Per-deploy git credential forwarding choice (desktop-only; default off).
   // We carry the raw choice; the build pipeline enforces desktop + server-build
   // gating before opening the relay, so a forged flag elsewhere is inert.
@@ -605,16 +692,11 @@ export async function requestBuildAccess(ctx: RequestContext, input: BuildAccess
     snapshot.branch,
   );
 
-  // ── Resolve rollback context (mirrors triggerDeployment) ──────────────
-  // Without this, deployments created via this access path get the
-  // schema default ("snapshot") with no `commitShaBefore` — so a later
-  // git-strategy rollback has no anchor SHA to fall back to.
-  const rollbackStrategy =
-    (project.defaultRollbackStrategy as "snapshot" | "git" | undefined) ?? "git";
-  const lastGood = await repos.deployment
-    .getLatestSuccessfulForBranch(project.id, snapshot.branch)
-    .catch(() => null);
-  const commitShaBefore = lastGood?.commitSha ?? undefined;
+  // ── Resolve rollback context (shared helper — single default) ─────────
+  const { rollbackStrategy, commitShaBefore } = await resolveRollbackContext(
+    project,
+    snapshot.branch,
+  );
 
   const dep = await createQueuedDeployment({
     projectId: project.id,
@@ -826,7 +908,7 @@ export async function getBuildSessionStatus(deploymentId: string) {
       buildStrategy: snapshot?.buildStrategy,
       deployTarget: snapshot?.deployTarget,
       serverId: snapshot?.serverId,
-      serverName: targetServer?.name ?? null,
+      serverName: targetServer?.name ?? targetServer?.sshHost ?? null,
       publicEndpoints: routeState.publicEndpoints.map((endpoint) => ({
         id: endpoint.id,
         ...(endpoint.port !== undefined ? { port: String(endpoint.port) } : {}),
@@ -940,10 +1022,19 @@ export async function redeployBuildSession(
   const resolvedBranch = await resolveProjectBranch(ctx, project, oldDep.branch ?? undefined);
 
   // Prefer the old deployment's snapshot; fall back to a fresh one from the project
-  const meta =
-    (oldDep.meta as DeploymentConfigSnapshot | null) ??
-    buildConfigSnapshot(project, resolvedBranch);
+  const frozenMeta = oldDep.meta as DeploymentConfigSnapshot | null;
+  const meta = frozenMeta ?? buildConfigSnapshot(project, resolvedBranch);
   const branch = meta.branch || resolvedBranch;
+
+  if (!frozenMeta) {
+    const t = await resolveSnapshotTarget(project);
+    meta.deployTarget = t.deployTarget;
+    meta.serverId = t.serverId;
+    meta.runtimeMode = t.runtimeMode;
+    meta.buildStrategy = await settingsService.resolveStrategy(meta.framework, meta.buildStrategy, {
+      deployTarget: meta.deployTarget,
+    });
+  }
 
   // Two redeploy modes:
   //   default            — rebuild against the LATEST commit on the branch.
@@ -986,15 +1077,11 @@ export async function redeployBuildSession(
     composeServices: currentComposeServices.length > 0 ? currentComposeServices : undefined,
   };
 
-  // ── Resolve rollback context (mirrors triggerDeployment) ──────────────
-  // The redeploy path must persist these the same way a fresh trigger
-  // does — otherwise a later git-strategy rollback has no anchor.
-  const rollbackStrategy =
-    (project.defaultRollbackStrategy as "snapshot" | "git" | undefined) ?? "git";
-  const lastGood = await repos.deployment
-    .getLatestSuccessfulForBranch(project.id, branch)
-    .catch(() => null);
-  const commitShaBefore = lastGood?.commitSha ?? undefined;
+  // ── Resolve rollback context (shared helper — single default) ─────────
+  const { rollbackStrategy, commitShaBefore } = await resolveRollbackContext(
+    project,
+    branch,
+  );
 
   const dep = await createQueuedDeployment({
     projectId: project.id,
@@ -1096,6 +1183,27 @@ export async function triggerDeployment(
      * `[redeploy-all]`), and by config-touch detection.
      */
     forceAll?: boolean;
+    /**
+     * Smart per-service routing for a MANUAL multi-service redeploy: trace the
+     * files changed between the active deployment's commit and the new HEAD and
+     * rebuild ONLY the affected services (same detection the webhook uses). Used
+     * by the dashboard "Redeploy" button. Falls back to a full rebuild for
+     * single-app projects, same-commit / config-only redeploys, or when the
+     * diff can't be determined. Ignored when forceAll/serviceIds is set.
+     */
+    smartRoute?: boolean;
+    /**
+     * ATOMIC redeploy of a PAST deployment's exact config + env (git-strategy
+     * rollback). When set, the new deployment ships this frozen snapshot + env
+     * VERBATIM instead of rebuilding from the project's current (mutable)
+     * columns / env_var table — so a rollback runs exactly what originally ran,
+     * even if the project config or env changed since. Leave undefined for a
+     * normal deploy (fresh snapshot from the project).
+     */
+    reuseSnapshot?: {
+      meta: DeploymentConfigSnapshot;
+      envVars: Record<string, string> | null;
+    };
   },
 ) {
   const project = await repos.project.findById(data.projectId);
@@ -1120,19 +1228,43 @@ export async function triggerDeployment(
 
   await checkNoActiveBuild(project.id);
 
-  const snapshot = buildConfigSnapshot(project, branch);
+  // ATOMIC rollback path: reuse the target deployment's frozen snapshot verbatim
+  // (its build config was already resolved + valid at original-deploy time).
+  // Normal path: build a fresh snapshot from the project's current columns.
+  const reuse = data.reuseSnapshot;
+  const snapshot = reuse
+    ? ({ ...reuse.meta } as DeploymentConfigSnapshot)
+    : buildConfigSnapshot(project, branch);
   const routeState = await resolveProjectRouteState(project);
 
-  // Non-UI callers (CI, webhook, manual API) don't pass buildStrategy, so the
-  // snapshot inherits `undefined` from buildConfigSnapshot and the later
-  // fallback at resolveBuildGitToken collapses everything to "server". Run
-  // it through resolveStrategy so a non-cloud stack with a "local" default
-  // gets the same answer the UI would give — single source of truth.
-  snapshot.buildStrategy = await settingsService.resolveStrategy(
-    snapshot.framework,
-    snapshot.buildStrategy,
-    { deployTarget: snapshot.deployTarget },
-  );
+  // Resolve the snapshot's target (deployTarget + serverId + runtimeMode) from
+  // the single source of truth shared with requestBuildAccess. buildConfigSnapshot
+  // only knows cloud-vs-undefined (it can't see which server a self-hosted project
+  // last deployed to — that lives in the deployment meta), so without this a
+  // redeploy/webhook of a self-hosted *server* project loses its target and, on a
+  // SaaS instance, defaults to cloud → wrong cloud preflight → 403. The resolver
+  // gates serverId on target==="server" so a non-server deploy can't carry a stale
+  // serverId. (reuse/rollback already carries the frozen target — leave it.)
+  if (!reuse) {
+    const resolvedTarget = await resolveSnapshotTarget(project);
+    snapshot.deployTarget = resolvedTarget.deployTarget;
+    snapshot.serverId = resolvedTarget.serverId;
+    snapshot.runtimeMode = resolvedTarget.runtimeMode;
+  }
+
+  if (!reuse) {
+    // Non-UI callers (CI, webhook, manual API) don't pass buildStrategy, so the
+    // snapshot inherits `undefined` from buildConfigSnapshot and the later
+    // fallback at resolveBuildGitToken collapses everything to "server". Run
+    // it through resolveStrategy so a non-cloud stack with a "local" default
+    // gets the same answer the UI would give — single source of truth. A reused
+    // snapshot already froze its resolved strategy, so leave it untouched.
+    snapshot.buildStrategy = await settingsService.resolveStrategy(
+      snapshot.framework,
+      snapshot.buildStrategy,
+      { deployTarget: snapshot.deployTarget },
+    );
+  }
 
   // ── Preflight: validate config before creating any resources ────
   await runDeploymentPreflight(snapshot, routeState, {
@@ -1141,9 +1273,16 @@ export async function triggerDeployment(
     projectId: project.id,
   });
 
-  // Copy env vars from project (already encrypted in env_var table)
-  const rawEnvMap = await repos.project.getEnvMap(project.id, environment);
-  const encryptedEnvVars = Object.keys(rawEnvMap).length > 0 ? rawEnvMap : null;
+  // Env: a reused snapshot ships the EXACT encrypted env captured with the
+  // target deployment (atomic rollback); a fresh deploy reads the project's
+  // current (already-encrypted) env_var table.
+  let encryptedEnvVars: Record<string, string> | null;
+  if (reuse) {
+    encryptedEnvVars = reuse.envVars;
+  } else {
+    const rawEnvMap = await repos.project.getEnvMap(project.id, environment);
+    encryptedEnvVars = Object.keys(rawEnvMap).length > 0 ? rawEnvMap : null;
+  }
 
   // ── Resolve commit info: fetch HEAD from GitHub if not provided ────
   let commitSha = data.commitSha;
@@ -1154,23 +1293,30 @@ export async function triggerDeployment(
     commitMessage = commitMessage ?? head.commitMessage;
   }
 
-  // ── Resolve rollback context ───────────────────────────────────────
-  // Default the strategy to the project's setting; explicit caller arg
-  // wins so the git-strategy rollback path can flip on a per-rollback
-  // basis even when the project default is "snapshot".
-  const rollbackStrategy =
-    data.rollbackStrategy ?? (project.defaultRollbackStrategy as "snapshot" | "git" | undefined) ?? "snapshot";
-  // commit_sha_before: prefer the explicit param; otherwise look up the
-  // last successful deploy on this branch so the git-rollback path has
-  // a stable anchor point.
-  let commitShaBefore = data.commitShaBefore;
-  if (!commitShaBefore) {
-    const lastGood = await repos.deployment
-      .getLatestSuccessfulForBranch(project.id, branch)
-      .catch(() => null);
-    commitShaBefore = lastGood?.commitSha ?? undefined;
-  }
-  const forceAll = data.forceAll ?? false;
+  // ── Resolve rollback context (shared helper — single default) ─────────
+  // Explicit caller arg wins so the git-strategy rollback path can flip on a
+  // per-rollback basis even when the project default is "snapshot".
+  const { rollbackStrategy, commitShaBefore } = await resolveRollbackContext(project, branch, {
+    rollbackStrategy: data.rollbackStrategy,
+    commitShaBefore: data.commitShaBefore,
+  });
+  // ── Smart per-service routing (manual multi-service redeploy) ─────────
+  // Resolve which services to (re)build via the shared helper — the one
+  // resolution concern that mirrors the other resolveX helpers. Inert unless
+  // smartRoute is set and the caller hasn't already targeted services / this
+  // isn't a reuse rollback. See resolveSmartRoute for the fallback policy.
+  const {
+    forceAll: resolvedForceAll,
+    serviceIds: resolvedServiceIds,
+    changedPaths: resolvedChangedPaths,
+  } = await resolveSmartRoute(ctx, project, {
+    smartRoute: data.smartRoute,
+    forceAll: data.forceAll,
+    serviceIds: data.serviceIds,
+    isReuse: !!reuse,
+    commitSha,
+    commitShaBefore,
+  });
 
   const dep = await createQueuedDeployment({
     projectId: project.id,
@@ -1185,8 +1331,9 @@ export async function triggerDeployment(
     envVars: encryptedEnvVars,
     rollbackStrategy,
     commitShaBefore,
-    forceAll,
-    serviceIds: data.serviceIds,
+    forceAll: resolvedForceAll,
+    serviceIds: resolvedServiceIds,
+    changedPaths: resolvedChangedPaths ?? null,
   });
 
   const buildSessionId = await kickoffBuild(project, dep);

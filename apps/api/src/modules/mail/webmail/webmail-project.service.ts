@@ -38,9 +38,11 @@ import {
   createQueuedDeployment,
   encryptEnvVars,
   metaWithPrevious,
+  resolveSnapshotTarget,
   runDeploymentPreflight,
   startBuild,
 } from "../../deployments/build.service";
+import * as settingsService from "../../settings/settings.service";
 import {
   listProjectRouteRows,
   syncProjectRouteState,
@@ -587,10 +589,11 @@ export interface StartWebmailDeployResult {
  *   4. Mint / reuse the branding token + session key in mail-state.
  *   5. Ensure persistent dirs on the target (/var/lib/openship-webmail).
  *   6. Build the env map (PORT, COOKIE_DOMAIN, IMAP/SMTP, secrets…).
- *   7. Snapshot from the project, override deploy-target picker bits,
- *      pin `buildStrategy = "server"` (the pipeline's "ship the source
- *      tree to the target as-is" mode - we're shipping the dist, not
- *      building anything).
+ *   7. Snapshot from the project, resolve the deploy target via
+ *      resolveSnapshotTarget (webmail intent as the override) and the
+ *      explicit `buildStrategy = "server"` via resolveStrategy (the
+ *      pipeline's "build the image at the target" mode — image build runs
+ *      on the target host / cloud builder, not the API host).
  *   8. Preflight - port availability, hostname validity, required fields.
  *   9. `createQueuedDeployment` + `startBuild`.
  *
@@ -755,28 +758,29 @@ export async function startWebmailDeploy(
   //       override the deploy-target picker bits the normal UI exposes. ──
   const snapshot = buildConfigSnapshot(project, "main");
   snapshot.serviceDeploymentMode = "single";
-  // `"server"` build strategy: image build happens at the deploy target
-  // (target host via dockerode-over-SSH for self-hosted, or the cloud
-  // platform's builder for cloud). `buildCommand` is empty so the
-  // Dockerfile only runs `bun install` before EXPOSE/CMD.
-  snapshot.buildStrategy = "server";
 
-  if (input.target.kind === "cloud") {
-    // Cloud uses Opshcloud's runtime (docker-in-cloud). Custom domain
-    // routing is handled by the cloud platform when `useProxyVariant` is
-    // false (operator-owned domain → CNAME to opsh.io). When it IS true,
-    // we don't pass the hostname here - the cloud workload accepts the
-    // opsh.io subdomain, and the mail VPS proxies the public hostname.
-    snapshot.deployTarget = "cloud";
-    snapshot.runtimeMode = "docker";
-  } else {
-    // Self-hosted: image built + run on the operator's server. Docker
-    // is the sandbox; the existing routing/SSL pipeline handles the
-    // hostname directly.
-    snapshot.deployTarget = "server";
-    snapshot.serverId = input.target.serverId;
-    snapshot.runtimeMode = "docker";
-  }
+  // Route the deploy target through the same authority the normal deploy entry
+  // points use, passing webmail's known intent as the override — instead of
+  // hand-pinning the fields (which re-implemented serverId-gating and could drift
+  // from resolveSnapshotTarget). Cloud → cloud runtime (docker-in-cloud); self →
+  // image built + run on the operator's server (docker sandbox over SSH).
+  const target = await resolveSnapshotTarget(project, {
+    deployTarget: input.target.kind === "cloud" ? "cloud" : "server",
+    serverId: input.target.kind === "self" ? input.target.serverId : undefined,
+    runtimeMode: "docker",
+  });
+  snapshot.deployTarget = target.deployTarget;
+  snapshot.serverId = target.serverId;
+  snapshot.runtimeMode = target.runtimeMode;
+
+  // `"server"` build strategy is webmail's INTENTIONAL explicit choice: the image
+  // build happens at the deploy target (target host via dockerode-over-SSH for
+  // self-hosted, or the cloud platform's builder for cloud), not on the API host.
+  // Pass it as the explicit value to the authority (which honors an explicit
+  // choice) so the decision still flows through resolveStrategy.
+  snapshot.buildStrategy = await settingsService.resolveStrategy(snapshot.framework, "server", {
+    deployTarget: target.deployTarget,
+  });
 
   // ── 9. Preflight - same call for both targets. The preflight dispatcher
   //       in deployments/preflight.ts branches on snapshot.deployTarget

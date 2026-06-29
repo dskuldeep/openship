@@ -118,10 +118,7 @@ export const DeploymentsContent: React.FC<DeploymentsContentProps> = ({
       {/* Header */}
       {!hideHeader && (
         <div className="mb-6">
-          <h1
-            className="text-2xl font-medium text-foreground/80"
-            style={{ letterSpacing: "-0.2px" }}
-          >
+          <h1 className="text-2xl font-semibold tracking-tight text-foreground">
             Deployments
           </h1>
           <p className="text-sm text-muted-foreground/70 mt-1">

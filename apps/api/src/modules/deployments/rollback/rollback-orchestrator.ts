@@ -30,7 +30,7 @@ import type { DeploymentRef } from "@repo/adapters";
 import { AppError } from "@repo/core";
 import { resolveDeploymentRuntime } from "../../../lib/deployment-runtime";
 import { resolveRollbackWindow } from "../release-retention";
-import { checkNoActiveBuild, triggerDeployment } from "../build.service";
+import { checkNoActiveBuild, triggerDeployment, type DeploymentConfigSnapshot } from "../build.service";
 import { buildBackgroundContext } from "../../../lib/request-context";
 
 // ─── Error codes (surfaced to the API layer) ────────────────────────────────
@@ -315,6 +315,19 @@ async function rollbackViaGit(
     label: "rollback:trigger",
   });
 
+  // ATOMIC: redeploy the target's CAPTURED config + env verbatim, not a fresh
+  // snapshot from the project's current (possibly-changed) columns / env_var
+  // table — so the rollback runs exactly what originally ran at this commit.
+  // Falls back to a fresh rebuild only if the target somehow has no snapshot
+  // (legacy rows); env still rides along.
+  const targetMeta = target.meta as DeploymentConfigSnapshot | null;
+  const reuseSnapshot = targetMeta
+    ? {
+        meta: targetMeta,
+        envVars: (target.envVars as Record<string, string> | null) ?? null,
+      }
+    : undefined;
+
   await triggerDeployment(rollbackCtx, {
     projectId: target.projectId,
     branch: target.branch,
@@ -330,6 +343,7 @@ async function rollbackViaGit(
     // Capture where we ARE now so this rollback is itself reversible.
     commitShaBefore: prevSha,
     forceAll: true,
+    ...(reuseSnapshot ? { reuseSnapshot } : {}),
   });
 }
 

@@ -12,6 +12,9 @@ type ProjectStatusSource = {
   activeDeploymentId?: string | null;
   latestDeploymentStatus?: string | null;
   deletedAt?: string | null;
+  /** True while an atomic teardown is in flight (the real in-progress flag;
+   *  teardown hard-deletes on success, so `deletedAt` is rarely set). */
+  deletionInProgress?: boolean | null;
 };
 
 export const PROJECT_STATUS_META: Record<
@@ -61,7 +64,7 @@ export const PROJECT_STATUS_META: Record<
 };
 
 export function getProjectStatus(project: ProjectStatusSource): ProjectStatus {
-  if (project.deletedAt) {
+  if (project.deletedAt || project.deletionInProgress) {
     return "deleting";
   }
 

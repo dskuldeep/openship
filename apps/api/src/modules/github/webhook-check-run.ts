@@ -78,12 +78,11 @@ export async function handleCheckRun(
   const actorUserId = owner.userId;
 
   const branch = dep.branch ?? project.gitBranch ?? "main";
-  // Re-running a single check rebuilds JUST that service at the same
-  // commit. The previous deploy's commitShaBefore is preserved so
-  // rollback semantics stay consistent. Respect the project's chosen
-  // rollback strategy.
-  const rollbackStrategy =
-    (project.defaultRollbackStrategy as "snapshot" | "git" | undefined) ?? "git";
+  // Re-running a single check rebuilds JUST that service at the same commit.
+  // We pass the ORIGINAL deploy's commitShaBefore explicitly so the rollback
+  // anchor stays the same as the first run (don't let it re-resolve to the
+  // latest successful deploy). The rollback STRATEGY defaults via the shared
+  // resolveRollbackContext helper inside triggerDeployment.
   await triggerDeployment(
     webhookActorCtx(actorUserId, project.organizationId, "webhook:github-check-rerequest"),
     {
@@ -94,7 +93,6 @@ export async function handleCheckRun(
       trigger: "webhook",
       serviceIds: [sd.serviceId],
       forceAll: false,
-      rollbackStrategy,
       commitShaBefore: dep.commitShaBefore ?? undefined,
     },
   ).catch((err) => {

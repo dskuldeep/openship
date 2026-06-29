@@ -13,6 +13,10 @@
 
 import type { DeploymentConfigSnapshot } from "./build.service";
 import { platform } from "../../lib/controller-helpers";
+import {
+  resolveEffectiveTarget,
+  usesManagedRouting as usesManagedRoutingFor,
+} from "../../lib/deployment-runtime";
 import { resolveServiceHostnameLabel } from "@repo/core";
 import { cloudClient } from "../../lib/cloud/client";
 import { isCloudConnectedForOrg } from "../../lib/cloud/session";
@@ -301,8 +305,7 @@ async function checkPublicEndpoints(
   ctx?: RequestContext,
 ): Promise<PreflightCheck[]> {
   const plat = platform();
-  const effectiveTarget =
-    plat.target === "desktop" ? (snapshot.deployTarget ?? "cloud") : plat.target;
+  const effectiveTarget = resolveEffectiveTarget(plat.target, snapshot);
   const isCloudStatic = effectiveTarget === "cloud" && !snapshot.hasServer;
   // Whether we can reach the SaaS to verify slugs / custom domains.
   const canBridgeCloud = Boolean(cloud?.runtime.ok && ctx?.userId);
@@ -567,23 +570,18 @@ async function resolveCloudPreflight(
 ): Promise<CloudPreflightData | null> {
   const plat = platform();
   // The deploy target. On SaaS we ARE the cloud, so cloud is implicit.
-  // Everywhere else read it from the snapshot (which buildConfigSnapshot
-  // derives from `project.cloudWorkspaceId`, the canonical "is this a
-  // cloud project" test per packages/db/src/schema/project.ts:231).
-  // Desktop falls back to "cloud" since that's the only managed target
-  // it can deploy to today.
-  const effectiveTarget: string =
-    plat.target === "cloud"
-      ? "cloud"
-      : (snapshot.deployTarget ?? (plat.target === "desktop" ? "cloud" : "server"));
+  // Resolve the effective target through the single authority so this matches
+  // exactly where the build pipeline will land the deploy (resolveDeploymentPlatform
+  // uses the same function). buildConfigSnapshot derives deployTarget from
+  // `project.cloudWorkspaceId`, the canonical "is this a cloud project" test.
+  const effectiveTarget = resolveEffectiveTarget(plat.target, snapshot);
 
   // Managed routing = "the deploy lands on the operator's own server,
   // but the public hostname is a free .openship.io slug served by
   // cloud edge". That's the only reason a server-target deploy needs
   // to ping cloud preflight. Cloud-target deploys obviously need it
-  // too (cloud IS doing the deploy).
-  const usesManagedRouting =
-    effectiveTarget === "server" || effectiveTarget === "local";
+  // too (cloud IS doing the deploy). Single authority shared with the pipeline.
+  const usesManagedRouting = usesManagedRoutingFor(plat.target, effectiveTarget);
   const hasManagedPublicEndpoints =
     opts?.publicEndpoints?.some((endpoint) => endpoint.domainType !== "custom") ?? false;
   const needsManagedProjectDomain =
@@ -936,12 +934,13 @@ async function checkCustomDomain(
   if (cloud?.runtime.ok && cloud.customDomain) {
     return checkCustomDomainCloudVerified(customDomain, cloud.customDomain);
   }
+  // Route the cloud-vs-self-hosted branch through the SAME authority the rest of
+  // preflight + the build pipeline use, so the DNS check can't disagree with where
+  // the deploy actually lands. (A hand-rolled ternary here drifted on a cloud-base
+  // host carrying a server/local snapshot — it would A-record-check a cloud deploy.)
   const plat = platform();
-  const isSelfHostedTarget =
-    plat.target === "selfhosted" ||
-    snapshot?.deployTarget === "server" ||
-    snapshot?.deployTarget === "local";
-  if (isSelfHostedTarget) {
+  const effectiveTarget = resolveEffectiveTarget(plat.target, snapshot ?? {});
+  if (effectiveTarget !== "cloud") {
     return checkCustomDomainSelfHosted(customDomain, snapshot);
   }
   return checkCustomDomainCloudCname(customDomain);
@@ -1030,13 +1029,11 @@ export async function runPreflightChecks(
 
   // Determine whether this deployment requires cloud directly or via managed routing
   const plat = platform();
-  const effectiveTarget =
-    plat.target === "desktop" ? (snapshot.deployTarget ?? "cloud") : plat.target;
-  // Keep in sync with deployment-runtime.ts:usesManagedRouting — same
-  // calculation, same outcome. See note inside resolveCloudPreflight.
-  const usesManagedRouting =
-    plat.target === "selfhosted" ||
-    (plat.target === "desktop" && (effectiveTarget === "server" || effectiveTarget === "local"));
+  const effectiveTarget = resolveEffectiveTarget(plat.target, snapshot);
+  // Managed routing = the deploy lands on the operator's own host (server/local)
+  // but the public hostname is served by cloud edge. Single authority shared
+  // with the pipeline (deployment-runtime.ts).
+  const usesManagedRouting = usesManagedRoutingFor(plat.target, effectiveTarget);
   const hasEndpointRouting = !!opts?.publicEndpoints?.length;
   const hasManagedProjectDomain =
     !hasEndpointRouting && !!opts?.slug && !opts?.customDomain && usesManagedRouting;

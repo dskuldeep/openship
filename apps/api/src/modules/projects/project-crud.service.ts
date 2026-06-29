@@ -10,7 +10,7 @@ import { normalizeRollbackWindow } from "../../lib/release-retention";
 import { env } from "../../config";
 import { assertResourceInOrg } from "../../lib/controller-helpers";
 import type { RequestContext } from "../../lib/request-context";
-import { getRepository, listBranches as listGitHubBranches } from "../github/github.service";
+import { getRepository, listBranches as listGitHubBranches, getLatestCommit } from "../github/github.service";
 import {
   deriveEnvironmentPublicEndpoints,
   deriveNextProjectRouteState,
@@ -431,7 +431,7 @@ export async function ensureProject(
       update.slug !== undefined ||
       update.port !== undefined
     ) {
-      const routing = await syncProjectRouteState(project, {
+      await syncProjectRouteState(project, {
         nextPublicEndpoints: data.publicEndpoints,
         slug: typeof update.slug === "string" ? update.slug : project.slug,
       });
@@ -612,7 +612,7 @@ export async function updateProject(
     update.slug !== undefined ||
     update.port !== undefined
   ) {
-    const routing = await syncProjectRouteState(p, {
+    await syncProjectRouteState(p, {
       nextPublicEndpoints: data.publicEndpoints,
       slug: typeof update.slug === "string" ? update.slug : p.slug,
     });
@@ -767,6 +767,48 @@ export async function createProjectEnvironment(
 
 // ─── Git info ────────────────────────────────────────────────────────────────
 
+/**
+ * Commit-drift check for the "your project is outdated" banner. Compares the
+ * branch HEAD on GitHub to the commit the ACTIVE deployment shipped. Fetched
+ * on-demand by the project page. Conservative: an unknown HEAD (API failure /
+ * rate limit) or a project with no successful deploy yet reports `behind:false`
+ * so we never show a false "outdated" nudge.
+ */
+export async function getProjectCommitStatus(
+  ctx: RequestContext,
+  projectId: string,
+  organizationId: string,
+) {
+  const p = await repos.project.findById(projectId);
+  assertResourceInOrg(p, "Project", organizationId, projectId);
+
+  // Only GitHub-backed projects have a remote branch HEAD to compare against.
+  if (!p.gitOwner || !p.gitRepo) {
+    return { supported: false as const };
+  }
+
+  const branch = p.gitBranch?.trim() || "main";
+  const head = await getLatestCommit(ctx, p.gitOwner, p.gitRepo, branch).catch(() => null);
+
+  let deployedSha: string | null = null;
+  if (p.activeDeploymentId) {
+    const dep = await repos.deployment.findById(p.activeDeploymentId).catch(() => null);
+    deployedSha = dep?.commitSha ?? null;
+  }
+
+  const latestSha = head?.sha ?? null;
+  const behind = Boolean(latestSha && deployedSha && latestSha !== deployedSha);
+
+  return {
+    supported: true as const,
+    behind,
+    branch,
+    latestSha,
+    latestMessage: head?.message ?? null,
+    deployedSha,
+  };
+}
+
 export async function getGitInfo(projectId: string, organizationId: string) {
   const p = await repos.project.findById(projectId);
   assertResourceInOrg(p, "Project", organizationId, projectId);
@@ -825,6 +867,7 @@ export async function updateOptions(
   if (options.startCommand !== undefined) update.startCommand = options.startCommand;
   if (options.productionPort !== undefined) update.port = options.productionPort;
   if (options.packageManager !== undefined) update.packageManager = options.packageManager;
+  if (options.buildImage !== undefined) update.buildImage = options.buildImage;
   if (options.framework !== undefined) update.framework = options.framework;
   if (options.productionMode !== undefined) update.productionMode = options.productionMode;
   if (options.hasServer !== undefined) {
@@ -834,15 +877,23 @@ export async function updateOptions(
     }
   }
   if (options.hasBuild !== undefined) update.hasBuild = options.hasBuild;
-
-  if (update.port !== undefined) {
-    const routing = await syncProjectRouteState(p, {
-      slug: p.slug,
-    });
+  // Runtime isolation mode (bare/docker) — editable in the Runtime tab; read by
+  // buildConfigSnapshot so every deploy/redeploy respects the saved choice.
+  // (Resources have their own dedicated path — projectsApi.setResources — so
+  // we deliberately do NOT also write them here.)
+  if (options.runtimeMode === "bare" || options.runtimeMode === "docker") {
+    update.runtimeMode = options.runtimeMode;
   }
 
+  // Persist the canonical config FIRST, then reconcile routes (best-effort) on a
+  // port change. Ordering the project write before route-sync means a route-sync
+  // failure can't leave config unsaved — and the next deploy re-syncs routes.
   if (Object.keys(update).length > 0) {
     await repos.project.update(projectId, update);
+  }
+
+  if (update.port !== undefined) {
+    await syncProjectRouteState(p, { slug: p.slug });
   }
 
   const updated = await repos.project.findById(projectId);

@@ -11,7 +11,7 @@ import {
 import { safeErrorMessage } from "@repo/core";
 import {
   extractChangedFiles,
-  serviceMatchesChanges,
+  routeServicesByChanges,
 } from "./webhook-changed-files";
 import { webhookActorCtx } from "./webhook-shared";
 import { resolveOrgOwner } from "../../lib/org-actor";
@@ -145,24 +145,18 @@ async function deployProjectFromPush(
     }
 
     if (!forceAll && routableServices.length > 0) {
-      const matched: string[] = [];
-      for (const svc of routableServices) {
-        if (serviceMatchesChanges(svc.rootDirectory, extracted.files)) {
-          matched.push(svc.id);
-        }
-      }
-
-      if (matched.length === 0) {
-        // No services affected → skip the deploy entirely. For
-        // single-service projects there are no routable services
-        // and the smart path doesn't enter this branch.
+      const routed = routeServicesByChanges(routableServices, extracted.files);
+      if (routed.mode === "skip") {
+        // No services affected → skip the deploy entirely. (mode "all" can't
+        // occur here since routableServices.length > 0.)
         console.log(
           `[GitHub Webhook] ${input.owner}/${input.repo}#${input.branch} project ${p.id}: no services affected by ${extracted.files.size} changed file(s) — skipping deploy.`,
         );
         return { skipped: true as const, projectId: p.id };
       }
-
-      serviceIds = matched;
+      if (routed.mode === "services") {
+        serviceIds = routed.serviceIds;
+      }
     }
   } else {
     // No payload was passed (manual trigger path going through this
@@ -184,22 +178,9 @@ async function deployProjectFromPush(
     );
   }
 
-  // Anchor for git-strategy rollback: the last successful deploy
-  // on this branch — we'll roll back to its commit if this one
-  // fails.
-  const lastGood = await repos.deployment
-    .getLatestSuccessfulForBranch(p.id, input.branch)
-    .catch(() => null);
-  const commitShaBefore = lastGood?.commitSha ?? undefined;
-
-  // Respect the project-level rollback strategy. Webhooks always
-  // have a verified commit_sha so git-strategy is a sensible
-  // default (set at the project level), but operators can opt
-  // their project into snapshot rollback if they prefer instant
-  // restore over disk savings.
-  const rollbackStrategy =
-    (p.defaultRollbackStrategy as "snapshot" | "git" | undefined) ?? "git";
-
+  // Rollback context (strategy + commit_sha_before anchor) is resolved inside
+  // triggerDeployment via the shared resolveRollbackContext helper — no need to
+  // recompute it here.
   const triggered = await triggerDeployment(
     webhookActorCtx(actorUserId, p.organizationId, "webhook:github-push"),
     {
@@ -210,8 +191,6 @@ async function deployProjectFromPush(
       trigger: "webhook",
       serviceIds,
       forceAll,
-      rollbackStrategy,
-      commitShaBefore,
     },
   );
 

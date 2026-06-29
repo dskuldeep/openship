@@ -291,7 +291,11 @@ const DeploymentProcessing: React.FC<DeploymentProcessingProps> = ({ onRedeploy 
                                 ? "bg-primary"
                                 : isCurrent
                                   ? "bg-foreground"
-                                  : "bg-muted border border-border"
+                                  : // Pending: SOLID fill (the `bg-muted` token is a
+                                    // translucent surface tint, so the connector line
+                                    // showed through). Use the solid card color so the
+                                    // line is fully occluded under the circle.
+                                    "bg-[var(--th-card-bg-solid)] border border-border"
                           }`}
                         >
                           {hasFailed ? (
@@ -305,7 +309,7 @@ const DeploymentProcessing: React.FC<DeploymentProcessingProps> = ({ onRedeploy 
                           )}
                         </div>
                         <span
-                          className={`text-xs font-medium ${
+                          className={`text-sm font-medium ${
                             hasFailed || isCompleted || isCurrent || isReady
                               ? "text-foreground"
                               : "text-muted-foreground"

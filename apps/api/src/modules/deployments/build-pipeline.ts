@@ -59,6 +59,7 @@ import {
   resolveProjectRouteState,
 } from "../domains/project-route.service";
 import { type DeploymentConfigSnapshot } from "./build.service";
+import * as settingsService from "../settings/settings.service";
 
 // ─── Terminal output collapsing ──────────────────────────────────────────────
 
@@ -691,14 +692,39 @@ async function executeBuildAndDeploy(project: Project, dep: Deployment, buildSes
     // Decrypt env vars from deployment (self-contained). decryptEnvMap
     // drops keys that fail decryption rather than leaking ciphertext into
     // the build environment.
+    const failedEnvKeys: string[] = [];
     const envMap = decryptEnvMap(
       (dep.envVars ?? {}) as Record<string, string>,
-      (key: string, err: unknown) =>
+      (key: string, err: unknown) => {
+        failedEnvKeys.push(key);
         console.warn(
           `[build] failed to decrypt env var ${key}: ${safeErrorMessage(err)}`,
-        ),
+        );
+      },
     );
-    const isLocalBuild = snapshot.buildStrategy === "local";
+    // Surface dropped env in the BUILD LOG (not just the server console) so a
+    // key-rotation data loss is visible to the operator instead of the build
+    // silently running with missing env.
+    if (failedEnvKeys.length > 0) {
+      logger.log(
+        `⚠ ${failedEnvKeys.length} environment variable(s) could not be decrypted and were skipped: ` +
+          `${failedEnvKeys.join(", ")}. The encryption key likely changed since they were saved — ` +
+          `re-enter them in the project's Environment settings and redeploy.`,
+        "warn",
+      );
+    }
+    // Single source of truth for buildStrategy, at the point of use. The deploy
+    // entry points already resolve this onto the snapshot, but a legacy frozen
+    // meta reused via rollback can arrive with it undefined — route through the
+    // authority (idempotent for an already-resolved value) instead of a hardcoded
+    // "server" fallback that would override the stack default ("local"). Resolved
+    // here, ABOVE isLocalBuild, so every reader in this function sees one value.
+    const buildStrategy = await settingsService.resolveStrategy(
+      snapshot.framework,
+      snapshot.buildStrategy,
+      { deployTarget: snapshot.deployTarget },
+    );
+    const isLocalBuild = buildStrategy === "local";
     const buildEnv = buildScopedEnvVars(envMap, {
       forceProductionNodeEnv: isLocalBuild,
     });
@@ -727,7 +753,6 @@ async function executeBuildAndDeploy(project: Project, dep: Deployment, buildSes
     // would be DENIED by the github-access gate and break the build.
     const orgOwner = await resolveOrgOwner(dep.organizationId).catch(() => null);
     const actorUserId = orgOwner?.userId ?? "";
-    const buildStrategy = snapshot.buildStrategy ?? "server";
 
     // Resolved up front so the relay-fallback gate below can exclude
     // multi-service builds (whose clone path differs).
@@ -1041,12 +1066,18 @@ function buildDeployEnvironment(
     isStaticSelfHosted: boolean;
     previousRuntime: DeployPhaseInputs["runtime"];
     plannedDomains: ReturnType<typeof buildProjectRouteDomains>;
+    canOverlap: boolean;
   },
 ): DeployEnvironment {
   const { runtime, system, targetExecutor, routeState, snapshot, logger } = phase;
-  const { staticBareRuntime, isStaticSelfHosted, previousRuntime, plannedDomains } = deps;
+  const { staticBareRuntime, isStaticSelfHosted, previousRuntime, plannedDomains, canOverlap } = deps;
 
   return {
+    canOverlap,
+    reactivatePrevious:
+      previousRuntime.name === "bare"
+        ? (id: string) => (id.includes("/") ? Promise.resolve() : previousRuntime.start(id))
+        : undefined,
     preflight: targetExecutor
       ? async (cfg, promptUser) => {
           if (system) {
@@ -1213,12 +1244,19 @@ async function executeServerDeploy(phase: DeployPhaseInputs): Promise<void> {
     }
   }
 
+  // Overlap-capable = the new deployment can run alongside the old one (docker
+  // unique-name + random host port; cloud isolated workspace). Bare binds a
+  // fixed port and static is file-backed → stop-first. Drives the cutover order
+  // AND the snapshot-artifact gate below.
+  const canOverlap = !isStaticSelfHosted && runtime.name !== "bare";
+
   // Runtime deploy environment (preflight + activate + deactivate + resolvers).
   const deployEnv = buildDeployEnvironment(phase, {
     staticBareRuntime,
     isStaticSelfHosted,
     previousRuntime,
     plannedDomains,
+    canOverlap,
   });
 
   const deploySsl = plannedDomains.some((domain) => domain.provisionSsl)
@@ -1278,11 +1316,20 @@ async function executeServerDeploy(phase: DeployPhaseInputs): Promise<void> {
     }
   }
 
+  // R1 gate: in overlap mode with SNAPSHOT strategy, let archivePreviousDeployment
+  // stop+RETAIN the old artifact (for rollback) instead of the pipeline stopping
+  // it — the old one keeps serving until the archive step (still zero-downtime).
+  // git strategy skips archive, so the pipeline stops the old one itself; bare
+  // (non-overlap) always stops first. previousContainerId stays accurate; the
+  // flag only controls whether the pipeline deactivates.
+  const deactivateOldInPipeline = !(canOverlap && dep.rollbackStrategy === "snapshot");
+
   const deployResult = await runDeployPipeline(
     deployEnv,
     {
       config: deployConfig,
       previousContainerId: prevDep?.containerId ?? undefined,
+      deactivatePrevious: deactivateOldInPipeline,
       domains: toRoutedDomainInputs(plannedDomains),
       routing,
       ssl: deploySsl,

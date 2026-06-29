@@ -1,0 +1,80 @@
+"use client";
+
+/**
+ * Shared callout — the app's standard "amber" warning treatment, extracted from
+ * the server detail page's ConnectionBanner so every warning across the product
+ * looks identical (theme-aware, dark-mode safe, semantic tones).
+ *
+ * Use for inline warnings AND inside modals. Compose extra content via children
+ * (e.g. a "suggested fix" list) and an actions row via `actions`.
+ *
+ * (Distinct from the legacy `AlertBox`, which uses hardcoded light-only colors
+ * and does not match the design system — prefer this.)
+ */
+import React from "react";
+import { AlertTriangle, type LucideIcon } from "lucide-react";
+
+type CalloutTone = "warning" | "danger" | "info";
+
+interface WarningCalloutProps {
+  /** Visual tone. Defaults to the amber "warning" treatment. */
+  tone?: CalloutTone;
+  title: string;
+  /** Optional body copy under the title. */
+  description?: React.ReactNode;
+  /** Override the leading icon (defaults to AlertTriangle). */
+  icon?: LucideIcon;
+  /** Extra content rendered under the description (lists, sub-cards, etc.). */
+  children?: React.ReactNode;
+  /** Buttons/links rendered in a wrapping row at the bottom. */
+  actions?: React.ReactNode;
+  className?: string;
+}
+
+const TONES: Record<CalloutTone, { container: string; iconBox: string }> = {
+  warning: {
+    container: "bg-amber-500/[0.06] border-amber-500/25",
+    iconBox: "bg-amber-500/10 text-amber-600 dark:text-amber-400",
+  },
+  danger: {
+    container: "bg-red-500/[0.06] border-red-500/25",
+    iconBox: "bg-red-500/10 text-red-600 dark:text-red-400",
+  },
+  info: {
+    container: "bg-primary/[0.06] border-primary/25",
+    iconBox: "bg-primary/10 text-primary",
+  },
+};
+
+export function WarningCallout({
+  tone = "warning",
+  title,
+  description,
+  icon,
+  children,
+  actions,
+  className = "",
+}: WarningCalloutProps) {
+  const t = TONES[tone];
+  const Icon = icon ?? AlertTriangle;
+
+  return (
+    <div className={`rounded-2xl border p-4 ${t.container} ${className}`}>
+      <div className="flex items-start gap-3">
+        <div className={`size-9 rounded-lg flex items-center justify-center shrink-0 ${t.iconBox}`}>
+          <Icon className="size-4" />
+        </div>
+        <div className="flex-1 min-w-0">
+          <p className="text-sm font-semibold text-foreground">{title}</p>
+          {description && (
+            <p className="text-[13px] text-muted-foreground mt-1 leading-relaxed">{description}</p>
+          )}
+          {children}
+          {actions && <div className="flex items-center gap-2 mt-3 flex-wrap">{actions}</div>}
+        </div>
+      </div>
+    </div>
+  );
+}
+
+export default WarningCallout;

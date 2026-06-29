@@ -54,8 +54,15 @@ r.post("/:id/enable", { tag: "project:write" }, ctrl.enable);
 r.post("/:id/disable", { tag: "project:write" }, ctrl.disable);
 
 /* ─── Environment variables ────────────────────────────────────────────── */
-r.get("/:id/env", { tag: "project:env_var:read" }, ctrl.listEnvVars);
-r.put("/:id/env", { tag: "project:env_var:write" }, ctrl.setEnvVars);
+// Project-scoped bulk routes (no per-env_var id in the URL) → gate on the
+// project, matching what the controllers already assert (permission.assert
+// project:read/write) and how /:id/options works. The previous
+// project:env_var:* tags required a :envVarId param these routes don't have,
+// so the permission middleware 400'd before the handler. Secret VALUES stay
+// protected by masking in listEnvVars, not by the route tag.
+r.get("/:id/env", { tag: "project:read" }, ctrl.listEnvVars);
+r.put("/:id/env", { tag: "project:write" }, ctrl.setEnvVars);
+r.patch("/:id/env", { tag: "project:write" }, ctrl.mergeEnvVars);
 
 /* ─── Per-project clone token (git credential override) ────────────────── */
 r.get("/:id/clone-token", { tag: "project:read" }, ctrl.getCloneToken);
@@ -63,6 +70,7 @@ r.patch("/:id/clone-token", { tag: "project:admin" }, ctrl.updateCloneToken);
 
 /* ─── Git ──────────────────────────────────────────────────────────────── */
 r.get("/:id/git", { tag: "project:read" }, ctrl.getGitInfo);
+r.get("/:id/commit-status", { tag: "project:read" }, ctrl.getCommitStatus);
 r.post("/:id/git/link", { tag: "project:write" }, ctrl.linkRepo);
 r.get("/:id/branches", { tag: "project:read" }, ctrl.listBranches);
 r.post("/:id/auto-deploy", { tag: "project:write" }, ctrl.setAutoDeploy);

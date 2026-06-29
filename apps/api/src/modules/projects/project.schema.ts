@@ -214,6 +214,28 @@ export const SetEnvVarsBody = Type.Object({
   ),
 });
 
+/**
+ * Partial MERGE of env vars — for the per-variable editor. Only the named keys
+ * are touched: `upserts` are inserted/updated, `deletes` are removed, every
+ * other var (including untouched masked secrets) is left intact. Avoids the
+ * destructive full-replace + masked-secret corruption of SetEnvVarsBody.
+ */
+export const MergeEnvVarsBody = Type.Object({
+  environment: EnvironmentEnum,
+  upserts: Type.Array(
+    Type.Object({
+      key: Type.String({ minLength: 1, maxLength: 256 }),
+      value: Type.String({ maxLength: 10000 }),
+      isSecret: Type.Optional(Type.Boolean({ default: false })),
+    }),
+    { minItems: 0, maxItems: 100 },
+  ),
+  deletes: Type.Array(Type.String({ minLength: 1, maxLength: 256 }), {
+    minItems: 0,
+    maxItems: 100,
+  }),
+});
+
 export const UpdateResourcesBody = Type.Object({
   production: Type.Optional(
     Type.Object({
@@ -243,4 +265,5 @@ export type TUpdateProjectBody = Static<typeof UpdateProjectBody> & {
 };
 export type TCreateProjectEnvironmentBody = Static<typeof CreateProjectEnvironmentBody>;
 export type TSetEnvVarsBody = Static<typeof SetEnvVarsBody>;
+export type TMergeEnvVarsBody = Static<typeof MergeEnvVarsBody>;
 export type TUpdateResourcesBody = Static<typeof UpdateResourcesBody>;

@@ -21,6 +21,8 @@ export interface ServiceDeploymentSummary {
 
 export interface Deployment {
   id: string;
+  /** Monotonic per-project version (v1, v2, …). Null for legacy rows. */
+  version: number | null;
   status: "success" | "failed" | "building" | "pending" | "canceled" | "cancelled" | "partial_failure";
   domain: string;
   framework: string;

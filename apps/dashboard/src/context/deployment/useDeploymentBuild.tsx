@@ -10,7 +10,7 @@ import { useGitHub } from "@/context/GitHubContext";
 import type { BuildLog } from "@/utils/deploymentPhaseDetector";
 import { useBuildStream } from "@/hooks/useSSEConnection";
 import { deployApi, projectsApi } from "@/lib/api";
-import { ApiError } from "@/lib/api/client";
+import { ApiError, getApiErrorMessage } from "@/lib/api/client";
 import { DeployCredentialModal } from "@/components/deployments/DeployCredentialModal";
 import type { DeploymentConfig, DeploymentState, DeploymentStatus } from "./types";
 import { syncActiveModeSnapshot } from "./mode-config";
@@ -387,8 +387,9 @@ export function useDeploymentBuild(
   // ── Lifecycle ─────────────────────────────────────────────────────────────
 
   const startDeployment = useCallback(async (
-    overrides?: { runtimeMode?: DeploymentConfig["runtimeMode"] },
+    overrides?: { runtimeMode?: DeploymentConfig["runtimeMode"]; saveConfigOnly?: boolean },
   ): Promise<string | null> => {
+    const saveConfigOnly = overrides?.saveConfigOnly === true;
     const isLocal = !!config.localPath;
     if (!isLocal && (!config.repo || !config.owner || !config.branch)) {
       showToast("Repository data is incomplete", "error", "Error");
@@ -403,30 +404,34 @@ export function useDeploymentBuild(
     lastErrorRef.current = null;
 
     const localBuildStartedAt = new Date().toISOString();
-    phaseStartRef.current = {};
-    setState((prev) => ({
-      ...prev,
-      isDeploying: true,
-      isStopping: false,
-      buildLogs: [],
-      currentProgress: 0,
-      currentStepIndex: 0,
-      phaseDurations: {},
-      deploymentSuccess: false,
-      deploymentFailed: false,
-      deploymentCanceled: false,
-      failureMessage: "",
-      warningMessage: "",
-      errorCode: "",
-      errorDetails: null,
-      pendingPrompt: null,
-      screenshots: [],
-      serviceStatuses: [],
-      buildStartedAt: localBuildStartedAt,
-      buildDurationMs: null,
-      buildRetryCarryMs:
-        prev.deploymentFailed || prev.deploymentCanceled ? resolveBuildElapsedMs(prev) : 0,
-    }));
+    // Save-only (Edit from the Runtime page) persists config and stops — it
+    // never builds, so skip resetting the build/progress state.
+    if (!saveConfigOnly) {
+      phaseStartRef.current = {};
+      setState((prev) => ({
+        ...prev,
+        isDeploying: true,
+        isStopping: false,
+        buildLogs: [],
+        currentProgress: 0,
+        currentStepIndex: 0,
+        phaseDurations: {},
+        deploymentSuccess: false,
+        deploymentFailed: false,
+        deploymentCanceled: false,
+        failureMessage: "",
+        warningMessage: "",
+        errorCode: "",
+        errorDetails: null,
+        pendingPrompt: null,
+        screenshots: [],
+        serviceStatuses: [],
+        buildStartedAt: localBuildStartedAt,
+        buildDurationMs: null,
+        buildRetryCarryMs:
+          prev.deploymentFailed || prev.deploymentCanceled ? resolveBuildElapsedMs(prev) : 0,
+      }));
+    }
 
     // Hoisted so the catch block can show the credential modal with the
     // freshly-ensured project id — for first deploys, config.projectId is
@@ -435,6 +440,48 @@ export function useDeploymentBuild(
     let ensuredProjectId: string | null = config.projectId ?? null;
 
     try {
+      // ── Save-only (Edit from the Runtime page): the project ALREADY exists,
+      // so persist build + runtime config in ONE atomic call (POST /:id/options)
+      // and STOP. Deliberately does NOT call `ensure` (which would resend git +
+      // publicEndpoints + a re-detected framework and clobber live config/routes)
+      // and does NOT touch env (env has its own per-variable editor — a blind
+      // replace here would wipe/corrupt masked secrets). No deploy. ────────────
+      if (saveConfigOnly) {
+        const projectId = config.projectId;
+        if (!projectId) {
+          showToast("Missing project — open this from the project's Runtime tab", "error", "Error");
+          return null;
+        }
+        try {
+          await projectsApi.setOptions(projectId, {
+            framework: config.framework,
+            packageManager: config.packageManager,
+            buildImage: config.buildImage,
+            installCommand: config.options.installCommand,
+            buildCommand: config.options.buildCommand,
+            startCommand: config.options.startCommand,
+            outputDirectory: config.options.outputDirectory,
+            productionPaths: config.options.productionPaths,
+            rootDirectory: config.options.rootDirectory,
+            productionPort:
+              config.options.hasServer && config.options.productionPort
+                ? Number(config.options.productionPort)
+                : undefined,
+            hasServer: config.options.hasServer,
+            hasBuild: config.options.hasBuild,
+            ...(config.runtimeMode === "bare" || config.runtimeMode === "docker"
+              ? { runtimeMode: config.runtimeMode }
+              : {}),
+          });
+          showToast("Configuration saved", "success", "Saved");
+          return projectId;
+        } catch (err) {
+          // Surface the REAL error (no more opaque "some settings failed").
+          showToast(getApiErrorMessage(err, "Failed to save configuration"), "error", "Save failed");
+          return null;
+        }
+      }
+
       const isServiceDeployment = usesServiceDeployment(config);
       const isMonorepoDeployment = config.projectType === "monorepo";
 

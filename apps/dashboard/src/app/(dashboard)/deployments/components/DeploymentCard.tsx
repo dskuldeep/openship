@@ -82,9 +82,17 @@ export const DeploymentCard: React.FC<DeploymentCardProps> = ({ deployment, onSt
 
   return (
     <div
-      className="group flex cursor-pointer items-center gap-4 px-4 py-4 transition-colors hover:bg-muted/25"
+      className="group relative flex cursor-pointer items-center gap-4 px-4 py-4 transition-colors hover:bg-muted/25"
       onClick={() => router.push(`/build/${deployment.id}`)}
     >
+      {/* Status accent rail — scan a deployment's status at a glance; subtle by
+          default, brightens on hover. Uses the same status color as the pill. */}
+      <span
+        aria-hidden
+        className="absolute inset-y-2 left-0 w-0.5 rounded-full opacity-50 transition-opacity group-hover:opacity-100"
+        style={{ backgroundColor: statusConfig.color }}
+      />
+
       {/* Framework icon */}
       <div className="flex h-9 w-9 shrink-0 items-center justify-center rounded-xl bg-muted/45 transition-colors group-hover:bg-muted/65">
         {frameworkConfig.icon ? (
@@ -102,11 +110,18 @@ export const DeploymentCard: React.FC<DeploymentCardProps> = ({ deployment, onSt
           <p className="text-sm font-semibold text-foreground truncate">
             {deployment.projectName || "Unknown Project"}
           </p>
+          {deployment.version != null && (
+            <span
+              className="shrink-0 rounded-md bg-muted/60 px-1.5 py-0.5 font-mono text-[10px] font-medium text-muted-foreground"
+              title={`Version ${deployment.version}`}
+            >
+              v{deployment.version}
+            </span>
+          )}
           <span
-            className={`inline-flex shrink-0 items-center gap-1 rounded-full px-2 py-0.5 text-[11px] font-medium ${statusConfig.bgColor}`}
+            className={`inline-flex shrink-0 items-center rounded-full px-2 py-0.5 text-[11px] font-medium ${statusConfig.bgColor}`}
             style={{ color: statusConfig.color }}
           >
-            <span className="w-1.5 h-1.5 rounded-full" style={{ backgroundColor: statusConfig.color }} />
             {statusConfig.label}
           </span>
           {/* Rollback-state chips. Surfaced from the orchestrator-aware

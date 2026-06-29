@@ -163,6 +163,13 @@ export const project = pgTable(
     buildResources: jsonb("build_resources"),
     /** Sleep mode: auto_sleep | always_on */
     sleepMode: text("sleep_mode").default("auto_sleep"),
+    /**
+     * Runtime isolation mode for this project's deploys: "bare" (direct host
+     * process) | "docker" (isolated container). Editable in the Runtime tab and
+     * snapshotted onto each deployment's config. Null = resolve the default at
+     * deploy time (the prior wizard-only behavior).
+     */
+    runtimeMode: text("runtime_mode"),
     /** Number of previous successful releases to retain for rollback (null = use instance default) */
     rollbackWindow: integer("rollback_window"),
     /**

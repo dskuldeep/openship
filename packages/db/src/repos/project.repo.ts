@@ -1,4 +1,4 @@
-import { eq, and, isNull, desc, sql, type SQL } from "drizzle-orm";
+import { eq, and, isNull, inArray, desc, sql, type SQL } from "drizzle-orm";
 import { generateId } from "@repo/core";
 import type { Database } from "../client";
 import { project, envVar } from "../schema";
@@ -414,29 +414,81 @@ export function createProjectRepo(db: Database) {
       await db.delete(envVar).where(eq(envVar.id, id));
     },
 
-    /** Bulk upsert env vars for a project + environment (optionally scoped to a service) */
+    /**
+     * Full REPLACE of env vars for a project + environment scope (optionally a
+     * service). Destructive: deletes the whole scope then inserts `vars`.
+     * Atomic — the delete + insert run in one transaction so an insert failure
+     * can't leave the scope wiped. Prefer `mergeEnvVars` for partial edits
+     * (it never touches untouched vars / masked secrets).
+     */
     async bulkSetEnvVars(
       projectId: string,
       environment: string,
       vars: { key: string; value: string; isSecret?: boolean }[],
       serviceId?: string | null,
     ) {
-      // Delete existing for this project+environment+service scope, then re-insert
-      await db.delete(envVar).where(and(...envVarScope(projectId, environment, serviceId ?? null)));
+      await db.transaction(async (tx) => {
+        await tx
+          .delete(envVar)
+          .where(and(...envVarScope(projectId, environment, serviceId ?? null)));
 
-      if (vars.length === 0) return;
+        if (vars.length === 0) return;
 
-      const rows = vars.map((v) => ({
-        id: generateId("env"),
-        projectId,
-        environment,
-        serviceId: serviceId ?? null,
-        key: v.key,
-        value: v.value,
-        isSecret: v.isSecret ?? false,
-      }));
+        await tx.insert(envVar).values(
+          vars.map((v) => ({
+            id: generateId("env"),
+            projectId,
+            environment,
+            serviceId: serviceId ?? null,
+            key: v.key,
+            value: v.value,
+            isSecret: v.isSecret ?? false,
+          })),
+        );
+      });
+    },
 
-      await db.insert(envVar).values(rows);
+    /**
+     * MERGE env vars: upsert the given keys, delete the given keys, and leave
+     * every other var (including untouched masked secrets) exactly as-is. Only
+     * the keys in (deletes ∪ upserts) are touched, all in one transaction.
+     * This is the safe path for a per-variable editor where secret VALUES the
+     * user didn't change are never re-sent.
+     */
+    async mergeEnvVars(
+      projectId: string,
+      environment: string,
+      upserts: { key: string; value: string; isSecret?: boolean }[],
+      deletes: string[],
+      serviceId?: string | null,
+    ) {
+      const affectedKeys = Array.from(
+        new Set([...deletes, ...upserts.map((u) => u.key)]),
+      );
+      if (affectedKeys.length === 0) return;
+
+      await db.transaction(async (tx) => {
+        await tx.delete(envVar).where(
+          and(
+            ...envVarScope(projectId, environment, serviceId ?? null),
+            inArray(envVar.key, affectedKeys),
+          ),
+        );
+
+        if (upserts.length > 0) {
+          await tx.insert(envVar).values(
+            upserts.map((v) => ({
+              id: generateId("env"),
+              projectId,
+              environment,
+              serviceId: serviceId ?? null,
+              key: v.key,
+              value: v.value,
+              isSecret: v.isSecret ?? false,
+            })),
+          );
+        }
+      });
     },
 
     /** Get a map of env vars for injection into builds/containers */

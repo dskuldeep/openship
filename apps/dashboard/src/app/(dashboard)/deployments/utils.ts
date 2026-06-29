@@ -9,6 +9,7 @@ export const mapRowToDeployment = (row: any): Deployment => {
   };
   return {
     id: row.id,
+    version: typeof row.version === "number" ? row.version : null,
     status: statusMap[row.status] ?? row.status,
     domain: row.url ?? "",
     framework: row.framework ?? "",
