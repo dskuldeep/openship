@@ -506,5 +506,26 @@ export function createProjectRepo(db: Database) {
       }
       return map;
     },
+
+    /**
+     * Env-var change metadata for a project+environment: each row's scope
+     * (serviceId, null = project-level / all services) and last-modified time.
+     * Used by smart redeploy to decide which services need an env-only
+     * refresh (updatedAt newer than the active deployment). Values are not
+     * returned (no decryption needed for a dirtiness check).
+     */
+    async listEnvVarChangeMeta(
+      projectId: string,
+      environment: string,
+    ): Promise<Array<{ serviceId: string | null; updatedAt: Date }>> {
+      const rows = await db.query.envVar.findMany({
+        where: and(
+          eq(envVar.projectId, projectId),
+          eq(envVar.environment, environment),
+        ),
+        columns: { serviceId: true, updatedAt: true },
+      });
+      return rows.map((r) => ({ serviceId: r.serviceId, updatedAt: r.updatedAt }));
+    },
   };
 }

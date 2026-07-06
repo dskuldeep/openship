@@ -95,11 +95,13 @@ const DropdownMenu: React.FC<DropdownMenuProps> = ({
       {/* Dropdown Menu */}
       {isOpen && (
         <div
-          className={`absolute z-50 mt-2 bg-popover border border-border/50 rounded-2xl overflow-hidden animate-in fade-in slide-in-from-top-2 duration-200 ${align === "right" ? "right-0" : "left-0"
+          className={`absolute z-50 mt-2 rounded-2xl border border-border/60 bg-popover/70 backdrop-blur-xl shadow-xl shadow-black/[0.08] overflow-hidden animate-in fade-in slide-in-from-top-2 duration-200 ${align === "right" ? "right-0" : "left-0"
             }`}
           style={{
+            // Frosted-glass surface: `bg-popover/70` (Tailwind v4 color-mix) tints
+            // it translucent and `backdrop-blur-xl` blurs the content behind it.
+            // Elevation via `shadow-xl shadow-black/[0.08]` — matches CustomSelect.
             minWidth: "220px",
-            boxShadow: "0 20px 40px rgba(0, 0, 0, 0.12), 0 4px 8px rgba(0, 0, 0, 0.06)",
           }}
         >
           <div className="py-2 px-2 flex flex-col">
@@ -115,7 +117,7 @@ const DropdownMenu: React.FC<DropdownMenuProps> = ({
                   <button
                     onClick={() => handleActionClick(action)}
                     disabled={action.disabled}
-                    className={`w-full hover:bg-muted active:bg-muted/80 px-3 py-3 text-left flex items-center gap-3 transition-all duration-200 rounded-xl ${action.disabled
+                    className={`w-full hover:bg-foreground/[0.06] active:bg-foreground/[0.1] px-3 py-2.5 text-left flex items-center gap-3 transition-all duration-200 rounded-xl ${action.disabled
                         ? "opacity-50 cursor-not-allowed"
                         : "cursor-pointer"
                       }`}

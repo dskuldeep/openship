@@ -1,7 +1,9 @@
 "use client";
 
+import { useMemo } from "react";
 import { useProjectSettings } from "@/context/ProjectSettingsContext";
 import { usePlatform } from "@/context/PlatformContext";
+import { DomainSwitcher } from "@/components/routing/DomainSwitcher";
 import { formatDate } from "@/utils/date";
 import { getProjectStatus, PROJECT_STATUS_META } from "@/utils/project-status";
 import {
@@ -37,16 +39,37 @@ const TAB_ICONS: Record<
 
 /** Desktop right-column navigation - matches LibrarySidebar / Home pattern */
 export const ProjectSidebar = () => {
-  const { projectData, projectNotFound, activeTab, tabs, setActiveTab, domain } =
-    useProjectSettings();
+  const {
+    projectData,
+    projectNotFound,
+    activeTab,
+    tabs,
+    setActiveTab,
+    domain,
+    domainsData,
+    selectedDomain,
+    setSelectedDomain,
+  } = useProjectSettings();
   const { selfHosted, baseDomain } = usePlatform();
   const status = getProjectStatus(projectData);
   const meta = PROJECT_STATUS_META[status];
   const localPort = projectData.port || 3000;
   const localUrl = `localhost:${localPort}`;
   const slugDomain = projectData.slug && baseDomain ? `${projectData.slug}.${baseDomain}` : "";
-  const displayUrl = domain || slugDomain || localUrl;
-  const isLocal = !domain && !slugDomain && !selfHosted;
+
+  // Route switch: pick which domain the Production line shows/opens (shared via
+  // context so switching here also refetches the overview analytics).
+  const domains = useMemo(
+    () =>
+      (domainsData?.domains ?? [])
+        .map((d: any) => d?.domain)
+        .filter((d: unknown): d is string => typeof d === "string" && d.length > 0),
+    [domainsData?.domains],
+  );
+
+  const activeDomain = selectedDomain || domain || "";
+  const displayUrl = activeDomain || slugDomain || localUrl;
+  const isLocal = !activeDomain && !slugDomain && !selfHosted;
   const siteHref = isLocal ? `http://${displayUrl}` : `https://${displayUrl}`;
 
   const handleTabChange = (tabId: string) => {
@@ -96,15 +119,22 @@ export const ProjectSidebar = () => {
             <span className="text-sm text-muted-foreground">
               {isLocal ? "Local" : "Production"}
             </span>
-            <a
-              href={siteHref}
-              target="_blank"
-              rel="noopener noreferrer"
-              className="inline-flex items-center gap-1.5 truncate text-sm font-medium text-foreground transition-colors hover:text-primary"
-            >
-              <span className="truncate">{displayUrl}</span>
-              <ExternalLink className="size-3 shrink-0" />
-            </a>
+            <div className="flex min-w-0 items-center gap-1.5">
+              {domains.length > 1 ? (
+                <DomainSwitcher domains={domains} value={activeDomain} onChange={setSelectedDomain} />
+              ) : (
+                <span className="truncate text-sm font-medium text-foreground">{displayUrl}</span>
+              )}
+              <a
+                href={siteHref}
+                target="_blank"
+                rel="noopener noreferrer"
+                aria-label="Open"
+                className="shrink-0 text-muted-foreground transition-colors hover:text-primary"
+              >
+                <ExternalLink className="size-3 shrink-0" />
+              </a>
+            </div>
           </div>
           {projectData.last_deployed && (
             <div className="flex items-center justify-between gap-4">

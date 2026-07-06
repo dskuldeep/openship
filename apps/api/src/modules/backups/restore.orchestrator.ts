@@ -34,7 +34,7 @@ import {
   type ServiceHandle,
 } from "@repo/adapters";
 import { decryptEnvMap } from "../../lib/encryption";
-import { resolveDeploymentPlatform } from "../../lib/deployment-runtime";
+import { resolveDeploymentPlatform, resolveTargetPlatform } from "../../lib/deployment-runtime";
 import { safeErrorMessage } from "@repo/core";
 import { assertResourceInOrg } from "../../lib/controller-helpers";
 import type { RequestContext } from "../../lib/request-context";
@@ -50,6 +50,11 @@ export interface PrepareRestoreInput {
   /** Generate a confirmation token the dashboard echoes back when
    *  applying. Used for audit + defense against accidental restore. */
   confirmationToken: string;
+  /** "in_place" (default) restores onto the source. "to_fork" restores a
+   *  mail-server backup onto a DIFFERENT mail server (= migrate A→B). */
+  mode?: "in_place" | "to_fork";
+  /** Target mail server for a to_fork restore. Required when mode="to_fork". */
+  forkMailServerId?: string | null;
 }
 
 export class RestoreOrchestrator {
@@ -63,6 +68,11 @@ export class RestoreOrchestrator {
     }
     if (sourceRun.deletedAt) {
       throw new Error("This backup has been purged — nothing to restore");
+    }
+
+    const mode = opts.mode ?? "in_place";
+    if (mode === "to_fork" && !opts.forkMailServerId) {
+      throw new Error("A migration (to_fork) restore requires a target mail server");
     }
 
     // Refuse parallel restores of the same source — would race the
@@ -81,7 +91,8 @@ export class RestoreOrchestrator {
       serviceId: sourceRun.serviceId,
       organizationId: sourceRun.organizationId,
       status: "queued",
-      mode: "in_place",
+      mode,
+      forkMailServerId: opts.forkMailServerId ?? null,
       clientIp: opts.trigger.clientIp ?? null,
       confirmationToken: opts.confirmationToken,
     });
@@ -236,31 +247,47 @@ export class RestoreOrchestrator {
 
       const sourceRun = await repos.backupRun.findById(restore.runId);
       if (!sourceRun) throw new Error("Source backup run disappeared");
-      if (!sourceRun.serviceId) throw new Error("Source run has no serviceId");
-
-      const serviceRow = await repos.service.findById(sourceRun.serviceId);
-      if (!serviceRow) throw new Error("Target service disappeared");
 
       const destinationRow = await repos.backupDestination.findById(restore.destinationId);
       if (!destinationRow) throw new Error("Destination disappeared");
 
-      const project = await repos.project.findById(serviceRow.projectId);
-      if (!project) throw new Error("Project disappeared");
-
       const adapterRow = await toAdapterRow(destinationRow);
       const destination = resolveDestination(adapterRow);
 
-      const platform = await resolveDeploymentPlatform(
-        (await this.activeDeploymentMeta(project.id)) as Parameters<
-          typeof resolveDeploymentPlatform
-        >[0],
-        { organizationId: destinationRow.organizationId },
-      );
-      const executor = resolveExecutor(platform.platform.runtime.name, platform.platform.runtime);
+      // Resolve the TARGET — a deployed service, or a bare mail server. A
+      // mail restore can go in-place (onto the source) or to_fork (onto a
+      // DIFFERENT mail server = migrate A→B).
+      let executor: BackupExecutor;
+      let serviceHandle: ServiceHandle;
+      if (sourceRun.sourceKind === "mail_server") {
+        const targetMailServerId =
+          restore.mode === "to_fork" ? restore.forkMailServerId : sourceRun.mailServerId;
+        if (!targetMailServerId) {
+          throw new Error("Mail restore has no target mail server");
+        }
+        const built = await this.buildMailTarget(
+          targetMailServerId,
+          destinationRow.organizationId,
+        );
+        executor = built.executor;
+        serviceHandle = built.handle;
+      } else {
+        if (!sourceRun.serviceId) throw new Error("Source run has no serviceId");
+        const serviceRow = await repos.service.findById(sourceRun.serviceId);
+        if (!serviceRow) throw new Error("Target service disappeared");
+        const project = await repos.project.findById(serviceRow.projectId);
+        if (!project) throw new Error("Project disappeared");
+        const platform = await resolveDeploymentPlatform(
+          (await this.activeDeploymentMeta(project.id)) as Parameters<
+            typeof resolveDeploymentPlatform
+          >[0],
+          { organizationId: destinationRow.organizationId },
+        );
+        executor = resolveExecutor(platform.platform.runtime.name, platform.platform.runtime);
+        serviceHandle = await this.buildServiceHandle(serviceRow);
+      }
 
-      const serviceHandle = await this.buildServiceHandle(serviceRow);
-
-      // Stop the service so volume swap is safe.
+      // Stop the service so volume swap is safe. (No-op for bare/mail.)
       await executor.stopService(serviceHandle);
 
       try {
@@ -349,6 +376,47 @@ export class RestoreOrchestrator {
     }
   }
 
+  /**
+   * Resolve a mail server as a restore TARGET — the bare SSH executor +
+   * a synthetic ServiceHandle. Mirrors BackupOrchestrator.buildMailSource;
+   * resolveTargetPlatform enforces org membership (throws if the target
+   * isn't in the org). Used for in-place mail restores and to_fork
+   * migrations (A→B).
+   */
+  private async buildMailTarget(
+    mailServerId: string,
+    organizationId: string,
+  ): Promise<{ executor: BackupExecutor; handle: ServiceHandle }> {
+    const mailRow = await repos.mailServer.get(mailServerId);
+    if (!mailRow) throw new Error(`Target mail server ${mailServerId} not found`);
+    const domain = mailRow.domain ?? "mail";
+    const slug = (domain.replace(/[^a-zA-Z0-9.-]/g, "-").toLowerCase() || "mail").slice(0, 63);
+
+    const targetPlatform = await resolveTargetPlatform(
+      "server",
+      "bare",
+      mailServerId,
+      organizationId,
+    );
+    const executor = resolveExecutor(
+      targetPlatform.runtime.name,
+      targetPlatform.runtime,
+    );
+
+    const handle: ServiceHandle = {
+      id: mailServerId,
+      projectId: "",
+      name: "mail",
+      image: null,
+      env: {},
+      volumes: ["/var/vmail"],
+      containerId: null,
+      projectSlug: slug,
+      namespaceVolumes: false,
+    };
+    return { executor, handle };
+  }
+
   private async activeDeploymentMeta(projectId: string): Promise<Record<string, unknown>> {
     const project = await repos.project.findById(projectId);
     if (!project?.activeDeploymentId) return {};
@@ -397,6 +465,7 @@ export class RestoreOrchestrator {
       volumes: (serviceRow.volumes as string[] | null) ?? [],
       containerId,
       projectSlug: project.slug,
+      namespaceVolumes: serviceRow.namespaceVolumes,
     };
   }
 }

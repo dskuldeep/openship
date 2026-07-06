@@ -29,8 +29,6 @@ import {
   mailServerIdFromWebmailSlug,
 } from "../mail/webmail/webmail-project.service";
 
-// ─── Types ───────────────────────────────────────────────────────────────────
-
 export interface LifecycleContext {
   /**
    * Optional - runtime is only touched when cleanup of a provisioned
@@ -46,8 +44,6 @@ export interface LifecycleContext {
   /** Provisioned resources - set by the orchestrator as phases progress. */
   provisioned: { imageRef?: string };
 }
-
-// ─── Helpers ─────────────────────────────────────────────────────────────────
 
 function truncateError(msg: string): string {
   const max = SYSTEM.DEPLOYMENTS.MAX_ERROR_MESSAGE_LENGTH;
@@ -104,8 +100,6 @@ export async function setDeploymentStatus(
   );
 }
 
-// ─── Hooks ───────────────────────────────────────────────────────────────────
-
 export async function onFailure(
   ctx: LifecycleContext,
   error?: string,
@@ -114,8 +108,8 @@ export async function onFailure(
 ): Promise<void> {
   const { runtime, project, dep, buildSessionId, persistLogs, provisioned } = ctx;
 
-  // 1. Force destroy provisioned resources - always delete the workspace/container
-  //    on failure so the user doesn't have to manually clean up.
+  // Always delete the workspace/container on failure so the user doesn't
+  // have to manually clean up.
   if (runtime && provisioned.imageRef) {
     try {
       await cleanupBuildArtifact(runtime, provisioned.imageRef);
@@ -150,7 +144,10 @@ export async function onFailure(
     }
   }
 
-  // 2. Persist failure state
+  // INVARIANT: failure writes the DEPLOYMENT row only — NEVER the project row.
+  // The project's live-release pointer (activeDeploymentId) advances solely on
+  // success (onSuccess) so a failed deploy has zero effect on the project's
+  // live state. Do not add a setActiveDeployment call here.
   const errorMessage = error ? truncateError(error) : undefined;
   const collapsed = persistLogs();
   await repos.deployment.updateStatus(dep.id, "failed", { errorMessage });
@@ -160,9 +157,9 @@ export async function onFailure(
     errorMessage,
   });
 
-  // 3. Notify — dispatch to every subscribed channel (per-user prefs +
-  //    org defaults). Fire-and-forget: the dispatcher fans out across
-  //    email/webhook/in-app/slack based on each member's subscriptions.
+  // Notify — dispatch to every subscribed channel (per-user prefs +
+  // org defaults). Fire-and-forget: the dispatcher fans out across
+  // email/webhook/in-app/slack based on each member's subscriptions.
   const lastLogs = collapsed.slice(-50).map((l) => l.message).join("\n");
   notification.emit({
     organizationId: dep.organizationId,
@@ -179,7 +176,7 @@ export async function onFailure(
     },
   });
 
-  // 4. Audit — async fire-and-forget; never blocks the failure path.
+  // Audit — async fire-and-forget; never blocks the failure path.
   // actorUserId is null here because the lifecycle runs in background;
   // the user who triggered the deploy is recorded on the original
   // `deployment.created` audit_event row.
@@ -208,7 +205,6 @@ export async function onCancelled(
 ): Promise<void> {
   const { runtime, dep, buildSessionId, persistLogs, provisioned } = ctx;
 
-  // Force destroy provisioned resources
   if (runtime && provisioned.imageRef) {
     try {
       await cleanupBuildArtifact(runtime, provisioned.imageRef);
@@ -243,6 +239,9 @@ export async function onCancelled(
     });
   }
 
+  // INVARIANT: cancel writes the DEPLOYMENT row only — NEVER the project row.
+  // A cancelled redeploy leaves activeDeploymentId (the last successful release)
+  // exactly as it was. Do not add a setActiveDeployment call here.
   await repos.deployment.updateStatus(dep.id, "cancelled");
   await repos.deployment.finishBuildSession(buildSessionId, "cancelled", durationMs ?? 0, persistLogs());
   sessionManager.updateStatus(dep.id, "cancelled");

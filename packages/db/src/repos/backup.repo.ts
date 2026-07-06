@@ -245,6 +245,18 @@ export function createBackupPolicyRepo(db: Database) {
       return this.findProjectDefault(projectId);
     },
 
+    /** The single active policy for a mail server (mail_server source). */
+    async findActiveByMailServer(
+      mailServerId: string,
+    ): Promise<BackupPolicy | undefined> {
+      return db.query.backupPolicy.findFirst({
+        where: and(
+          eq(backupPolicy.mailServerId, mailServerId),
+          isNull(backupPolicy.deletedAt),
+        ),
+      });
+    },
+
     async findByWebhookToken(token: string): Promise<BackupPolicy | undefined> {
       return db.query.backupPolicy.findFirst({
         where: and(
@@ -367,6 +379,7 @@ export function createBackupRunRepo(db: Database) {
         offset?: number;
         projectId?: string;
         serviceId?: string;
+        mailServerId?: string;
       },
     ): Promise<BackupRun[]> {
       const conditions = [
@@ -375,6 +388,8 @@ export function createBackupRunRepo(db: Database) {
       ];
       if (opts?.projectId) conditions.push(eq(backupRun.projectId, opts.projectId));
       if (opts?.serviceId) conditions.push(eq(backupRun.serviceId, opts.serviceId));
+      if (opts?.mailServerId)
+        conditions.push(eq(backupRun.mailServerId, opts.mailServerId));
       return db.query.backupRun.findMany({
         where: and(...conditions),
         orderBy: (t, { desc }) => [desc(t.startedAt)],

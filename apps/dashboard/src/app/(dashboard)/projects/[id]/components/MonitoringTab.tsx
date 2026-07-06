@@ -11,11 +11,11 @@ import { useProjectSettings } from "@/context/ProjectSettingsContext";
 import { useAnalyticsData } from "@/hooks/useProjectEndpoints";
 
 export const MonitoringTab = () => {
-  const { id } = useProjectSettings();
+  const { id, selectedDomain } = useProjectSettings();
   // Atomic analytics fetch — own state, own loading, no context coupling.
   // The hook backs onto the same module-level caches as OverviewTab so
   // both tabs share one network request per endpoint.
-  const { data: analyticsData, isLoading: isLoadingAnalytics } = useAnalyticsData(id);
+  const { data: analyticsData, isLoading: isLoadingAnalytics } = useAnalyticsData(id, selectedDomain);
   const hasAnalytics = !!analyticsData;
 
   const formatNumber = (num: number): string => {

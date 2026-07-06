@@ -21,6 +21,19 @@ export function serviceKind(
   return service?.kind === "monorepo" ? "monorepo" : "compose";
 }
 
+/**
+ * Order services with a public domain (exposed / publicly-routed) first, so the
+ * ones a user actually browses to lead the list — in the project service list,
+ * the logs target picker, etc. Stable: within each group the original order
+ * (the compose sortOrder) is preserved, so it's display-only and doesn't affect
+ * deploy ordering (which is resolved server-side by dependency topo-sort).
+ */
+export function sortServicesByPublicFirst<T extends { exposed?: boolean | null }>(
+  services: readonly T[],
+): T[] {
+  return [...services].sort((a, b) => Number(!!b.exposed) - Number(!!a.exposed));
+}
+
 export interface Service {
   id: string;
   /** Discriminator. "compose" (default) or "monorepo" sub-app. */

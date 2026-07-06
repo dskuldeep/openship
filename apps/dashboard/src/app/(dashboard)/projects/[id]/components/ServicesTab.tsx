@@ -1,9 +1,9 @@
 "use client";
 
-import React, { useEffect, useState, useCallback } from "react";
+import React, { useEffect, useState, useCallback, useMemo } from "react";
 import { useProjectSettings } from "@/context/ProjectSettingsContext";
 import { usePlatform } from "@/context/PlatformContext";
-import { serviceKind, servicesApi, type Service, type ServiceContainer, type ServiceInput } from "@/lib/api/services";
+import { serviceKind, servicesApi, sortServicesByPublicFirst, type Service, type ServiceContainer, type ServiceInput } from "@/lib/api/services";
 import { deployApi } from "@/lib/api/deploy";
 import { useToast } from "@/context/ToastContext";
 import { resolveServiceHostnameLabel } from "@repo/core";
@@ -48,7 +48,11 @@ export const ServicesTab = () => {
   const [createOpen, setCreateOpen] = useState(false);
   const [driftBusy, setDriftBusy] = useState<string | null>(null);
 
-  const services = servicesData.services;
+  // Public (exposed) services lead the list — the ones users actually browse to.
+  const services = useMemo(
+    () => sortServicesByPublicFirst(servicesData.services),
+    [servicesData.services],
+  );
   const loading = servicesData.isLoading || containersLoading;
   const projectSlugBase = projectData.slug || projectData.name || "project";
   const selectedId = slug?.[1] ?? null;
@@ -344,42 +348,34 @@ export const ServicesTab = () => {
   /* ── Service list + detail panel ───────────────────────────────── */
   if (selectedService) {
     return (
-      <div className="space-y-5">
-        <div className="bg-card rounded-2xl border border-border/50 p-5">
-          <div className="flex items-center justify-between gap-4">
-            <div className="flex items-center gap-3 min-w-0">
-              <button
-                onClick={closeService}
-                className="inline-flex items-center gap-2 px-3 py-2 rounded-xl text-[13px] font-medium bg-foreground/[0.06] text-foreground hover:bg-foreground/[0.1] transition-colors shrink-0"
-              >
-                <ArrowLeft className="size-3.5" />
-                All services
-              </button>
-              <div className="min-w-0">
-                <h3 className="text-sm font-semibold text-foreground truncate">
-                  {selectedService.name}
-                </h3>
-                <p className="text-xs text-muted-foreground mt-0.5 truncate">
-                  Service settings, ports, logs, and container controls.
-                </p>
-              </div>
-            </div>
-
-            <button
-              onClick={fetchData}
-              className="inline-flex items-center gap-1.5 px-3 py-2 rounded-xl text-[13px] font-medium bg-foreground/[0.06] text-foreground hover:bg-foreground/[0.1] transition-colors shrink-0"
-            >
-              <RefreshCw className="size-3.5" />
-              Refresh
-            </button>
-          </div>
+      <div className="space-y-4">
+        {/* Slim breadcrumb row — the panel's hero is the single heading. */}
+        <div className="flex items-center justify-between gap-4">
+          <button
+            onClick={closeService}
+            className="inline-flex items-center gap-2 px-3 py-2 rounded-xl text-[13px] font-medium bg-foreground/[0.06] text-foreground hover:bg-foreground/[0.1] transition-colors"
+          >
+            <ArrowLeft className="size-3.5" />
+            All services
+          </button>
+          <button
+            onClick={fetchData}
+            className="inline-flex items-center gap-1.5 px-3 py-2 rounded-xl text-[13px] font-medium bg-foreground/[0.06] text-foreground hover:bg-foreground/[0.1] transition-colors"
+          >
+            <RefreshCw className="size-3.5" />
+            Refresh
+          </button>
         </div>
 
         <ServiceDetailPanel
+          // Key by service id so switching services (via the header switcher)
+          // remounts on the tab carried in the URL, with per-service state fresh.
+          key={selectedService.id}
           service={selectedService}
           container={containerFor(selectedService.id)}
           projectId={id}
           projectSlugBase={projectSlugBase}
+          initialTab={slug?.[2]}
           onRefresh={fetchData}
           onDeleted={closeService}
         />

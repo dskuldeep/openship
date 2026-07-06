@@ -550,6 +550,34 @@ export function createServiceRepo(db: Database) {
       return { ...row, createdAt: new Date(), updatedAt: new Date() } as ServiceDeployment;
     },
 
+    /**
+     * Insert-or-update a service_deployment row keyed by (deploymentId,
+     * serviceId) — respects the uq_service_deployment_dep_svc unique index.
+     * Used by a partial (smart) redeploy to carry an unchanged service's
+     * runtime row forward over the pre-created "skipped" row without
+     * violating the unique constraint.
+     */
+    async upsertServiceDeployment(data: Omit<NewServiceDeployment, "id">) {
+      const id = generateId("sd");
+      await db
+        .insert(serviceDeployment)
+        .values({ id, ...data })
+        .onConflictDoUpdate({
+          target: [serviceDeployment.deploymentId, serviceDeployment.serviceId],
+          set: {
+            serviceName: data.serviceName,
+            containerId: data.containerId ?? null,
+            status: data.status,
+            imageRef: data.imageRef ?? null,
+            hostPort: data.hostPort ?? null,
+            ip: data.ip ?? null,
+            reason: data.reason ?? null,
+            reasonSkipped: data.reasonSkipped ?? null,
+            updatedAt: new Date(),
+          },
+        });
+    },
+
     async updateServiceDeployment(id: string, data: Partial<NewServiceDeployment>) {
       await db
         .update(serviceDeployment)

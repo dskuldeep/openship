@@ -613,6 +613,35 @@ export async function listBranches(c: Context) {
   return c.json({ data });
 }
 
+/**
+ * GET /github/repos/:owner/:repo/clone-token - mint a short-lived GitHub App
+ * installation token and return a ready-to-run `git clone` command for the
+ * repo.
+ *
+ * Cloud / GitHub-App mode only: gh-CLI and PAT modes have no installation
+ * token, so this 409s there. The token is installation-scoped (the same
+ * credential the build pipeline clones with) and expires within the hour.
+ */
+export async function getCloneToken(c: Context) {
+  const ctx = getRequestContext(c);
+  const owner = param(c, "owner");
+  const repo = param(c, "repo");
+
+  const token = await githubAuth.getInstallationToken(ctx, owner);
+  if (!token) {
+    return c.json(
+      {
+        error:
+          "No GitHub App installation token is available for this owner. Connect the Openship GitHub App (cloud) for this account to use a clone token.",
+      },
+      409,
+    );
+  }
+
+  const cloneUrl = `https://x-access-token:${token}@github.com/${owner}/${repo}.git`;
+  return c.json({ token, cloneUrl, command: `git clone ${cloneUrl}` });
+}
+
 // ─── Files ───────────────────────────────────────────────────────────────────
 
 /** GET /github/repos/:owner/:repo/files - List files in a directory */

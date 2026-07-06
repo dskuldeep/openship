@@ -17,7 +17,7 @@ type StoredPublicEndpointInput = {
   domainType?: "free" | "custom" | null;
 };
 
-type ProjectDomainRow = Pick<
+export type ProjectDomainRow = Pick<
   Domain,
   "hostname" | "isPrimary" | "verified" | "serviceId" | "targetPort" | "targetPath" | "domainType"
 >;
@@ -60,7 +60,7 @@ function managedHostnameSuffix(): string {
   return `.${getRoutingBaseDomain().trim().toLowerCase()}`;
 }
 
-function managedHostnameToSlug(hostname: string): string | undefined {
+export function managedHostnameToSlug(hostname: string): string | undefined {
   const normalized = normalizeCustomDomain(hostname);
   const suffix = managedHostnameSuffix();
   if (!normalized?.endsWith(suffix)) return undefined;
@@ -91,10 +91,52 @@ export function publicEndpointHostname(
   return slug ? `${slug}${managedHostnameSuffix()}` : undefined;
 }
 
+/**
+ * Map ONE project-level domain row to a public endpoint: normalize hostname/port/
+ * path, enforce the port-XOR-path rule, and resolve free→slug / custom→hostname.
+ * Shared by routeRowsToPublicEndpoints (stored config) and the live-route mapper
+ * in project-route.service, so the domain-row → endpoint rule lives in one place.
+ * Caller is responsible for excluding service-scoped rows.
+ */
+export function routeDomainRowToPublicEndpoint(
+  domain: ProjectDomainRow,
+): StoredPublicEndpoint | null {
+  const hostname = normalizeCustomDomain(domain.hostname);
+  if (!hostname) return null;
+
+  const port = normalizePort(domain.targetPort) ?? undefined;
+  const targetPath = normalizeTargetPath(domain.targetPath);
+  const domainType = inferPublicRouteDomainType(hostname, domain.domainType);
+
+  // Exactly one of port / targetPath must be set (proxy vs static).
+  if ((port !== undefined) === Boolean(targetPath)) {
+    return null;
+  }
+
+  if (domainType === "free") {
+    const slug = managedHostnameToSlug(hostname);
+    if (!slug) return null;
+
+    return {
+      ...(port !== undefined ? { port } : {}),
+      ...(targetPath ? { targetPath } : {}),
+      domain: slug,
+      domainType,
+    } satisfies StoredPublicEndpoint;
+  }
+
+  return {
+    ...(port !== undefined ? { port } : {}),
+    ...(targetPath ? { targetPath } : {}),
+    customDomain: hostname,
+    domainType,
+  } satisfies StoredPublicEndpoint;
+}
+
 function routeRowsToPublicEndpoints(
   projectDomains: ProjectDomainRow[] | null | undefined,
 ): StoredPublicEndpoint[] {
-  const projectLevelDomains = (projectDomains ?? [])
+  return (projectDomains ?? [])
     .filter((domain) => !domain.serviceId)
     .sort((left, right) => {
       if (left.isPrimary !== right.isPrimary) {
@@ -102,42 +144,9 @@ function routeRowsToPublicEndpoints(
       }
 
       return left.hostname.localeCompare(right.hostname);
-    });
-
-  const endpoints: Array<StoredPublicEndpoint | null> = projectLevelDomains
-    .map((domain) => {
-      const hostname = normalizeCustomDomain(domain.hostname);
-      if (!hostname) return null;
-
-      const port = normalizePort(domain.targetPort) ?? undefined;
-      const targetPath = normalizeTargetPath(domain.targetPath);
-      const domainType = inferPublicRouteDomainType(hostname, domain.domainType);
-
-      if ((port !== undefined) === Boolean(targetPath)) {
-        return null;
-      }
-
-      if (domainType === "free") {
-        const slug = managedHostnameToSlug(hostname);
-        if (!slug) return null;
-
-        return {
-          ...(port !== undefined ? { port } : {}),
-          ...(targetPath ? { targetPath } : {}),
-          domain: slug,
-          domainType,
-        } satisfies StoredPublicEndpoint;
-      }
-
-      return {
-        ...(port !== undefined ? { port } : {}),
-        ...(targetPath ? { targetPath } : {}),
-        customDomain: hostname,
-        domainType,
-      } satisfies StoredPublicEndpoint;
-    });
-
-  return endpoints.filter((endpoint): endpoint is StoredPublicEndpoint => endpoint !== null);
+    })
+    .map(routeDomainRowToPublicEndpoint)
+    .filter((endpoint): endpoint is StoredPublicEndpoint => endpoint !== null);
 }
 
 function primaryProjectDomain(projectDomains?: ProjectDomainRow[] | null): string | undefined {

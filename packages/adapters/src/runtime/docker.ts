@@ -36,6 +36,7 @@ import type {
   ResourceUsage,
   ShellOptions,
   ShellSession,
+  ProvisionLock,
 } from "../types";
 import { PassThrough, Writable } from "node:stream";
 
@@ -80,8 +81,11 @@ import type {
   RollbackInput,
   MakeActiveResult,
 } from "./types";
-import { BuildLogger, parseLogLevel, sq } from "./build-pipeline";
+import { BuildLogger, parseLogLevel, sq, injectGitToken } from "./build-pipeline";
+import { scopeVolumeBinds, isHostPathSource } from "./volume-namespace";
 import { createDockerBuildContext, prepareSourceTree, resolveServiceDockerfile } from "./docker-build-context";
+import { resolveDockerfileCandidates } from "./docker-paths";
+import { generateDockerfile } from "./docker-build-plan";
 import { transferLocalDirectory } from "./transfer";
 import { safeErrorMessage, type ComposeAdvanced, type ComposeHealthcheck } from "@repo/core";
 import {
@@ -112,13 +116,14 @@ function resolveRestartPolicy(policy?: string) {
   return RESTART_POLICIES[policy ?? "always"] ?? RESTART_POLICIES.always;
 }
 
-/** Parse port specs ("8080:3000", "3000") into Docker ExposedPorts + PortBindings */
+/** Parse port specs ("8080:3000", "3000", "127.0.0.1:8080:80") into Docker
+ *  ExposedPorts + PortBindings */
 function parsePortBindings(portSpecs: string[]): {
   exposedPorts: Record<string, object>;
-  portBindings: Record<string, { HostPort: string }[]>;
+  portBindings: Record<string, { HostIp?: string; HostPort: string }[]>;
 } {
   const exposedPorts: Record<string, object> = {};
-  const portBindings: Record<string, { HostPort: string }[]> = {};
+  const portBindings: Record<string, { HostIp?: string; HostPort: string }[]> = {};
   for (const spec of portSpecs) {
     // A protocol suffix ("/udp", "/sctp") applies to the container port and sits
     // at the very end of the spec. Strip it first, then split host:container.
@@ -129,15 +134,22 @@ function parsePortBindings(portSpecs: string[]): {
     const mapping = slashIdx >= 0 ? spec.slice(0, slashIdx) : spec;
 
     const parts = mapping.split(":");
-    if (parts.length === 2) {
-      const [hostPort, containerPort] = parts;
-      const key = `${containerPort}/${protocol}`;
-      exposedPorts[key] = {};
-      portBindings[key] = [{ HostPort: hostPort }];
-    } else if (parts.length === 1) {
+    if (parts.length === 1) {
+      // containerPort only → Docker assigns a random host port
       const key = `${parts[0]}/${protocol}`;
       exposedPorts[key] = {};
-      portBindings[key] = [{ HostPort: "" }]; // random host port
+      portBindings[key] = [{ HostPort: "" }];
+    } else {
+      // [hostIp:]hostPort:containerPort. Parse from the RIGHT so both the
+      // 2-part (hostPort:containerPort) and 3-part IP-scoped form
+      // ("127.0.0.1:8080:80" — a loopback-only publish, which the dashboard
+      // editor emits) work; anything before hostPort is the host IP.
+      const containerPort = parts[parts.length - 1]!;
+      const hostPort = parts[parts.length - 2]!;
+      const hostIp = parts.length > 2 ? parts.slice(0, -2).join(":") : undefined;
+      const key = `${containerPort}/${protocol}`;
+      exposedPorts[key] = {};
+      portBindings[key] = [hostIp ? { HostIp: hostIp, HostPort: hostPort } : { HostPort: hostPort }];
     }
   }
   return { exposedPorts, portBindings };
@@ -304,12 +316,18 @@ export class DockerRuntime implements RuntimeAdapter {
   /** Resolved transport - single switch point for socket / ssh / tcp */
   readonly transport: DockerTransport;
   private readonly systemManager: DockerSystemManager | null;
+  private readonly provisionLock?: ProvisionLock;
 
-  constructor(opts?: DockerConnectionOptions, systemManager?: DockerSystemManager | null) {
+  constructor(
+    opts?: DockerConnectionOptions,
+    systemManager?: DockerSystemManager | null,
+    provisionLock?: ProvisionLock,
+  ) {
     this.connectionOptions = opts;
     this.transport = resolveDockerTransport(opts);
     this.docker = new Dockerode(this.transport.dockerodeOptions);
     this.systemManager = systemManager ?? null;
+    this.provisionLock = provisionLock;
   }
 
   supports(cap: RuntimeCapability): boolean {
@@ -624,6 +642,103 @@ export class DockerRuntime implements RuntimeAdapter {
     this.emitDockerStep(log, "install", "completed", "Image build finished");
   }
 
+  /**
+   * Clone the repo directly ON the remote host into `remoteContextDir` — the
+   * clone-on-server alternative to transferBuildContext (which clones on the
+   * orchestrator and rsyncs the tree). Runs `git clone` in a remote host shell,
+   * mirroring the bare runtime (build-pipeline.ts): the credential-helper relay
+   * (`config.gitCredentialHelperPath` — plain URL, nothing persisted) when set,
+   * else `injectGitToken(...)`. Strips `.git` so it never ships into the image.
+   */
+  private async cloneSourceOnRemote(
+    config: BuildConfig,
+    remoteContextDir: string,
+    log: BuildLogger,
+  ): Promise<void> {
+    const executor = this.connectionOptions?.executor;
+    if (!executor) throw new Error("Clone-on-server requires an SSH executor on connectionOptions");
+
+    const useHelper = !!config.gitCredentialHelperPath;
+    const cloneUrl = useHelper ? config.repoUrl : injectGitToken(config.repoUrl, config.gitToken);
+    const GIT_ENV = useHelper
+      ? `GIT_TERMINAL_PROMPT=0 GIT_CONFIG_COUNT=2 GIT_CONFIG_KEY_0=credential.helper GIT_CONFIG_VALUE_0=${sq(config.gitCredentialHelperPath!)} GIT_CONFIG_KEY_1=credential.useHttpPath GIT_CONFIG_VALUE_1=true`
+      : "GIT_TERMINAL_PROMPT=0 GIT_ASKPASS=/bin/echo";
+    // Token mode disables host helpers; relay mode keeps the helper (it IS the auth).
+    const CRED = useHelper ? "" : "-c credential.helper=";
+    const dir = sq(remoteContextDir);
+
+    log.log(
+      `Cloning ${config.repoUrl} on the server → ${remoteContextDir} ` +
+        `(${useHelper ? "forwarded credentials" : "token"})...\n`,
+    );
+    await executor.exec(`rm -rf ${dir} && mkdir -p ${dir}`);
+
+    const run = async (cmd: string) => {
+      const { code } = await executor.streamExec(cmd, (entry) =>
+        log.log(entry.message, parseLogLevel(entry.message)),
+      );
+      if (code !== 0) throw new Error(`git clone on server exited with code ${code}`);
+    };
+
+    if (config.commitSha) {
+      try {
+        await run(
+          `${GIT_ENV} git ${CRED} clone --progress --depth 50 --branch ${sq(config.branch)} ${sq(cloneUrl)} ${dir} && ` +
+            `cd ${dir} && git ${CRED} -c advice.detachedHead=false checkout ${sq(config.commitSha)}`,
+        );
+      } catch {
+        log.log(`Commit ${config.commitSha} not in the shallow clone; unshallowing and retrying.\n`, "warn");
+        await run(
+          `cd ${dir} && ${GIT_ENV} git ${CRED} fetch --progress --unshallow && ` +
+            `git ${CRED} -c advice.detachedHead=false checkout ${sq(config.commitSha)}`,
+        );
+      }
+    } else {
+      await run(
+        `${GIT_ENV} git ${CRED} clone --progress --depth 1 --branch ${sq(config.branch)} ${sq(cloneUrl)} ${dir}`,
+      );
+    }
+
+    // Never ship .git into the build image.
+    await executor.exec(`rm -rf ${sq(`${remoteContextDir}/.git`)}`).catch(() => {});
+  }
+
+  /**
+   * Resolve the Dockerfile for a build whose source lives on the REMOTE host
+   * (clone-on-server). Mirrors resolveServiceDockerfile but probes the remote
+   * tree with `test -f` instead of the local FS: a repository Dockerfile
+   * candidate is used when present; otherwise a Dockerfile is generated locally
+   * (pure fn) and written to the remote tree. Returns the dockerfile path
+   * relative to `remoteContextDir`.
+   */
+  private async resolveRemoteDockerfile(
+    config: BuildConfig,
+    remoteContextDir: string,
+    generatedName: string,
+    requireRepositoryDockerfile: boolean,
+  ): Promise<string> {
+    const executor = this.connectionOptions?.executor;
+    if (!executor) throw new Error("Clone-on-server requires an SSH executor on connectionOptions");
+
+    for (const candidate of resolveDockerfileCandidates(config.rootDirectory, config.dockerfilePath)) {
+      const out = await executor
+        .exec(`test -f ${sq(`${remoteContextDir}/${candidate}`)} && echo yes || true`)
+        .catch(() => "");
+      if (out.trim() === "yes") return candidate;
+    }
+
+    if (requireRepositoryDockerfile) {
+      const expected = config.dockerfilePath?.trim() || "Dockerfile";
+      throw new Error(
+        `No Dockerfile found in the cloned repo. Expected ${expected}${config.rootDirectory ? ` under ${config.rootDirectory}` : ""}.`,
+      );
+    }
+
+    // Generate one locally (pure function of config) and ship just the file.
+    await executor.writeFile(`${remoteContextDir}/${generatedName}`, generateDockerfile(config));
+    return generatedName;
+  }
+
   private async buildViaSshTarPipe(
     config: BuildConfig,
     buildContext: Awaited<ReturnType<typeof createDockerBuildContext>>,
@@ -776,6 +891,39 @@ export class DockerRuntime implements RuntimeAdapter {
         throw new Error(this.formatDockerConnectivityError(featureErr));
       }
 
+      const sshExecutor =
+        this.transport.kind === "ssh" ? this.connectionOptions?.executor : null;
+
+      // ── Clone-on-server path ───────────────────────────────────────────
+      // Clone the repo ON the remote host and build there — no local clone and
+      // no context transfer. Only for SSH server builds that opted in.
+      if (sshExecutor && config.cloneOnServer) {
+        const remoteContextDir = `/tmp/openship-build-${config.sessionId}`;
+        try {
+          this.emitDockerStep(log, "clone", "running", "Cloning source on the server...");
+          await this.cloneSourceOnRemote(config, remoteContextDir, log);
+          this.emitDockerStep(log, "clone", "completed", "Source cloned on the server");
+          const dockerfileName = await this.resolveRemoteDockerfile(
+            config,
+            remoteContextDir,
+            "Dockerfile.openship",
+            config.stack === "docker",
+          );
+          await this.buildImageOnRemote(config, remoteContextDir, dockerfileName, tag, log);
+        } finally {
+          sshExecutor.exec(`rm -rf ${sq(remoteContextDir)}`).catch(() => { /* best effort */ });
+        }
+
+        try {
+          await this.docker.getImage(tag).inspect();
+        } catch {
+          throw new Error(`Docker build finished but the image ${tag} was not created`);
+        }
+        log.log(`Image ${tag} is ready.\n`);
+        log.step("build", "completed", `Finalizing image ${tag}`);
+        return { sessionId: config.sessionId, status: "deploying", imageRef: tag, durationMs: Date.now() - startTime };
+      }
+
       this.emitDockerStep(log, "clone", "running", "Preparing Docker build context...");
 
       const buildContext = await createDockerBuildContext(config, {
@@ -824,9 +972,6 @@ export class DockerRuntime implements RuntimeAdapter {
       if (!buildContext.usesRepositoryDockerfile && !config.buildCommand) {
         this.emitDockerStep(log, "build", "skipped", "No build command configured");
       }
-
-      const sshExecutor =
-        this.transport.kind === "ssh" ? this.connectionOptions?.executor : null;
 
       if (sshExecutor) {
         // ── Fast SSH path ──────────────────────────────────────────────
@@ -893,43 +1038,81 @@ export class DockerRuntime implements RuntimeAdapter {
     // so the first spec's source config drives the single clone.
     const source = specs[0]!.config;
     const isSsh = this.transport.kind === "ssh" && !!this.connectionOptions?.executor;
+    const cloneOnServer = isSsh && !!source.cloneOnServer;
     const remoteContextDir = `/tmp/openship-build-${source.sessionId}`;
 
-    prepareLogger.step("clone", "running", "Preparing shared build context...");
-    const tree = await prepareSourceTree(source, { onLog: prepareLogger.callback });
+    // Acquire the shared source ONCE: clone-on-server clones directly on the
+    // remote host (no transfer); otherwise clone on the orchestrator (and
+    // transfer the tree below).
+    let tree: Awaited<ReturnType<typeof prepareSourceTree>> | null = null;
+    if (cloneOnServer) {
+      prepareLogger.step("clone", "running", "Cloning source on the server...");
+      await this.cloneSourceOnRemote(source, remoteContextDir, prepareLogger);
+      prepareLogger.step("clone", "completed", "Source cloned on the server");
+    } else {
+      prepareLogger.step("clone", "running", "Preparing shared build context...");
+      tree = await prepareSourceTree(source, { onLog: prepareLogger.callback });
+    }
 
     try {
       // Resolve/generate each service's Dockerfile INTO the shared tree, with a
       // per-service generated name so concurrent builds never clobber each other.
       const resolvedList = await Promise.all(
         specs.map(async (spec) => {
+          const generatedName = `Dockerfile.openship.${spec.config.sessionId}`;
+          const requireRepo = spec.requireRepositoryDockerfile ?? spec.config.stack === "docker";
           try {
-            const resolved = await resolveServiceDockerfile(tree.contextDir, spec.config, {
-              requireRepositoryDockerfile:
-                spec.requireRepositoryDockerfile ?? spec.config.stack === "docker",
-              generatedName: `Dockerfile.openship.${spec.config.sessionId}`,
+            if (cloneOnServer) {
+              const dockerfileName = await this.resolveRemoteDockerfile(
+                spec.config,
+                remoteContextDir,
+                generatedName,
+                requireRepo,
+              );
+              return {
+                spec,
+                dockerfileName,
+                contextEntries: null as string[] | null,
+                error: null as string | null,
+              };
+            }
+            const resolved = await resolveServiceDockerfile(tree!.contextDir, spec.config, {
+              requireRepositoryDockerfile: requireRepo,
+              generatedName,
             });
-            return { spec, resolved, error: null as string | null };
+            return {
+              spec,
+              dockerfileName: resolved.dockerfileName,
+              contextEntries: resolved.contextEntries,
+              error: null as string | null,
+            };
           } catch (err) {
-            return { spec, resolved: null, error: safeErrorMessage(err) };
+            return {
+              spec,
+              dockerfileName: null as string | null,
+              contextEntries: null as string[] | null,
+              error: safeErrorMessage(err),
+            };
           }
         }),
       );
 
-      try {
-        const sizeBytes = await this.estimateContextSize(tree.contextDir);
-        prepareLogger.step(
-          "clone",
-          "completed",
-          `Shared build context ready (${(sizeBytes / 1024 / 1024).toFixed(1)} MB)`,
-        );
-      } catch {
-        prepareLogger.step("clone", "completed", "Shared build context ready");
-      }
-
-      // Transfer the shared context to the remote ONCE — not once per service.
-      if (isSsh) {
-        await this.transferBuildContext(tree.contextDir, remoteContextDir, prepareLogger);
+      // Local-clone path: report context size + transfer the shared tree ONCE.
+      // (clone-on-server already put the tree on the remote — nothing to transfer.)
+      if (!cloneOnServer && tree) {
+        try {
+          const sizeBytes = await this.estimateContextSize(tree.contextDir);
+          prepareLogger.step(
+            "clone",
+            "completed",
+            `Shared build context ready (${(sizeBytes / 1024 / 1024).toFixed(1)} MB)`,
+          );
+        } catch {
+          prepareLogger.step("clone", "completed", "Shared build context ready");
+        }
+        if (isSsh) {
+          await this.transferBuildContext(tree.contextDir, remoteContextDir, prepareLogger);
+        }
       }
 
       // Build each image against the shared tree ONE AT A TIME. Sequential is
@@ -940,11 +1123,11 @@ export class DockerRuntime implements RuntimeAdapter {
       // service that's actually streaming. The expensive part (clone + transfer)
       // is already shared above; only the per-image build is serialized here.
       const results: Array<{ serviceName: string; result: BuildResult }> = [];
-      for (const { spec, resolved, error } of resolvedList) {
+      for (const { spec, dockerfileName, contextEntries, error } of resolvedList) {
         const startedAt = Date.now();
         const tag = this.imageTag(spec.config.slug, spec.config.sessionId);
 
-        if (error || !resolved) {
+        if (error || !dockerfileName) {
           const result: BuildResult = {
             sessionId: spec.config.sessionId,
             status: "failed",
@@ -964,16 +1147,16 @@ export class DockerRuntime implements RuntimeAdapter {
             await this.buildImageOnRemote(
               spec.config,
               remoteContextDir,
-              resolved.dockerfileName,
+              dockerfileName,
               tag,
               spec.logger,
             );
           } else {
             const stream = await this.docker.buildImage(
-              { context: tree.contextDir, src: resolved.contextEntries },
+              { context: tree!.contextDir, src: contextEntries ?? [] },
               {
                 t: tag,
-                dockerfile: resolved.dockerfileName,
+                dockerfile: dockerfileName,
                 labels: this.labels({
                   projectId: spec.config.projectId,
                   sessionId: spec.config.sessionId,
@@ -1020,7 +1203,7 @@ export class DockerRuntime implements RuntimeAdapter {
           ?.exec(`rm -rf ${sq(remoteContextDir)}`)
           .catch(() => { /* best effort */ });
       }
-      await tree.cleanup();
+      if (tree) await tree.cleanup();
     }
   }
 
@@ -1575,20 +1758,26 @@ export class DockerRuntime implements RuntimeAdapter {
    */
   async ensureNetwork(slug: string): Promise<string> {
     const networkName = `openship-${slug}`;
-    const networks = await this.docker.listNetworks({
-      filters: { name: [networkName] },
-    });
+    // list-then-create is check-then-act: two concurrent deploys for the same
+    // slug would both miss and both create, yielding two networks with the same
+    // name (Docker allows it) and ambiguous name lookups. Serialize per server.
+    const critical = async () => {
+      const networks = await this.docker.listNetworks({
+        filters: { name: [networkName] },
+      });
 
-    // listNetworks does substring matching, verify exact name
-    const existing = networks.find((n) => n.Name === networkName);
-    if (existing) return existing.Id;
+      // listNetworks does substring matching, verify exact name
+      const existing = networks.find((n) => n.Name === networkName);
+      if (existing) return existing.Id;
 
-    const network = await this.docker.createNetwork({
-      Name: networkName,
-      Driver: "bridge",
-      Labels: { "openship.network": slug },
-    });
-    return network.id;
+      const network = await this.docker.createNetwork({
+        Name: networkName,
+        Driver: "bridge",
+        Labels: { "openship.network": slug },
+      });
+      return network.id;
+    };
+    return this.provisionLock ? this.provisionLock.run(critical) : critical();
   }
 
   async ensureServiceGroup(config: {
@@ -1597,8 +1786,123 @@ export class DockerRuntime implements RuntimeAdapter {
     slug: string;
   }): Promise<MultiServiceGroupHandle> {
     void config.deploymentId;
-    void config.projectId;
-    return { id: await this.ensureNetwork(config.slug) };
+    const networkId = await this.ensureNetwork(config.slug);
+    // Self-heal network membership. A container joins the network only at
+    // CREATE time (see deployServiceWorkload). Normal/partial/smart redeploys
+    // are fine — the network is reused by name so its id is stable and
+    // survivors stay attached. This covers the narrow case where the network's
+    // identity changed out-of-band (docker network prune/rm, daemon/host
+    // rebuild): survivors fall off it and become unreachable by name
+    // (ESERVFAIL). Reconnecting every project container here, once per deploy,
+    // makes membership independent of that.
+    await this.reconcileNetworkMembership(networkId, config.projectId);
+    return { id: networkId };
+  }
+
+  /**
+   * Guard for GRANDFATHERED (non-namespaced) services: a bare named volume that
+   * another project's container already mounts is a cross-project collision —
+   * the exact bug (two projects sharing one postgres volume) this change
+   * prevents for new services. New namespaced services can't hit this (their
+   * volume name is project-unique by construction).
+   *
+   * Only a FRESH claim is blocked: if THIS project already mounts the name
+   * (it's the incumbent) a redeploy is never blocked — otherwise, during an
+   * active collision, whichever owner redeployed first would be locked out of
+   * its own release. Best-effort on the list call; throws ONLY on a real
+   * newcomer collision so the operator renames it.
+   */
+  private async assertNoForeignNamedVolumeCollision(
+    config: MultiServiceDeployConfig,
+  ): Promise<void> {
+    const named = new Set<string>();
+    for (const spec of config.volumes) {
+      const body = spec.replace(/:(ro|rw|z|Z|nocopy)$/, "");
+      const parts = body.split(":");
+      if (parts.length < 2) continue; // anonymous / bare container path
+      const source = parts[0];
+      if (isHostPathSource(source)) continue; // bind mount
+      named.add(source);
+    }
+    if (named.size === 0) return;
+
+    let containers: Awaited<ReturnType<typeof this.docker.listContainers>>;
+    try {
+      containers = await this.docker.listContainers({ all: true });
+    } catch {
+      return; // never block a deploy on a docker list hiccup
+    }
+
+    // Names THIS project already mounts → it's the incumbent, never blocked.
+    // Only a name held solely by ANOTHER project is a collision.
+    const ownNames = new Set<string>();
+    const foreign = new Map<string, string>(); // volume name → other container name
+    for (const c of containers) {
+      const owner = c.Labels?.["openship.project"];
+      if (!owner) continue;
+      for (const m of c.Mounts ?? []) {
+        if (m.Type !== "volume" || !m.Name || !named.has(m.Name)) continue;
+        if (owner === config.projectId) ownNames.add(m.Name);
+        else if (!foreign.has(m.Name)) foreign.set(m.Name, c.Names?.[0]?.replace(/^\//, "") ?? owner);
+      }
+    }
+    for (const [name, other] of foreign) {
+      if (ownNames.has(name)) continue; // incumbent — allow the owner's redeploy
+      throw new Error(
+        `Volume "${name}" is already used by another project's container "${other}". ` +
+          `Rename this service's volume to a project-unique name before deploying, ` +
+          `to avoid overwriting the other project's data.`,
+      );
+    }
+  }
+
+  /**
+   * Ensure every container belonging to this project is attached to
+   * `networkId` with its service-name alias. Idempotent (already-connected is a
+   * no-op) and best-effort (never throws). Normal/partial/smart redeploys don't
+   * strand containers (the network is reused by name → stable id); this heals
+   * the narrow case where the network's identity changed out-of-band (docker
+   * network prune/rm, daemon/host rebuild) and surviving containers fell off it.
+   */
+
+  private async reconcileNetworkMembership(
+    networkId: string,
+    projectId: string,
+  ): Promise<void> {
+    let containers: Awaited<ReturnType<typeof this.docker.listContainers>>;
+    try {
+      containers = await this.docker.listContainers({
+        all: true,
+        filters: { label: [`openship.project=${projectId}`] },
+      });
+    } catch {
+      return;
+    }
+    const network = this.docker.getNetwork(networkId);
+    for (const c of containers) {
+      // Skip containers already on this exact network object.
+      const onNetwork = Object.values(c.NetworkSettings?.Networks ?? {}).some(
+        (n) => n?.NetworkID === networkId,
+      );
+      if (onNetwork) continue;
+      const service = c.Labels?.["openship.service"];
+      try {
+        await network.connect({
+          Container: c.Id,
+          EndpointConfig: service ? { Aliases: [service] } : {},
+        });
+      } catch (err) {
+        // "already exists in network" races are fine; anything else is
+        // swallowed — reconcile is best-effort and must not block deploy.
+        const msg = (err as { message?: string })?.message ?? "";
+        if (!/already exists|already connected/i.test(msg)) {
+          // best-effort: leave a breadcrumb, don't throw
+          console.warn(
+            `[docker] reconcile connect failed for ${c.Id.slice(0, 12)} → ${networkId.slice(0, 12)}: ${msg}`,
+          );
+        }
+      }
+    }
   }
 
   /** Remove a project network (best-effort). */
@@ -1645,8 +1949,16 @@ export class DockerRuntime implements RuntimeAdapter {
     // Port bindings
     const { exposedPorts, portBindings } = parsePortBindings(config.ports);
 
-    // Parse volumes: pass through directly - Docker handles named volumes and bind mounts
-    const binds = config.volumes.length > 0 ? config.volumes : undefined;
+    // Project-scope NAMED volumes (openship-<slug>-<name>) so two projects can
+    // never share one docker volume; bind mounts / anonymous volumes pass
+    // through. Grandfathered services (namespaceVolumes=false) keep their bare
+    // names — for those, fail fast if a bare name already belongs to another
+    // project (the exact class of bug this change prevents going forward).
+    if (!config.namespaceVolumes) {
+      await this.assertNoForeignNamedVolumeCollision(config);
+    }
+    const scopedBinds = scopeVolumeBinds(config.slug, config.volumes, config.namespaceVolumes);
+    const binds = scopedBinds.length > 0 ? scopedBinds : undefined;
 
     const restartPolicy = resolveRestartPolicy(config.restart);
     const healthcheck = toDockerHealthcheck(config.advanced?.healthcheck);

@@ -31,6 +31,7 @@ export type {
   CommandExecutor,
   ShellOptions,
   ShellSession,
+  ProvisionLock,
 } from "./types";
 
 export { BUILD_STEPS } from "./types";
@@ -52,7 +53,7 @@ export type {
 export { assertCapability, isMultiServiceRuntime } from "./runtime/types";
 export { DockerRuntime, type DockerConnectionOptions } from "./runtime/docker";
 export { BareRuntime, type BareRuntimeOptions } from "./runtime/bare";
-export { CloudRuntime, type CloudAdminProxy } from "./runtime/cloud";
+export { CloudRuntime, type CloudAdminProxy, PAGE_CONTAINER_PREFIX } from "./runtime/cloud";
 export { BuildLogger } from "./runtime/build-pipeline";
 export {
   type DeployEnvironment,

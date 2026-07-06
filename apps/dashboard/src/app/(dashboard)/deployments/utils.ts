@@ -129,6 +129,17 @@ export const getStatusConfig = (status: string) => {
         borderColor: "border-amber-500/20",
         label: "Partial",
       };
+    case "rejected":
+      // User rejected a partial/completed deploy: its runtime was torn down and,
+      // if it had replaced a previous deployment, that predecessor was restored
+      // (otherwise the project falls back to draft). Record + logs are kept.
+      return {
+        icon: 'close%20circle-73-1658234612.png',
+        color: "var(--color-gray-500)",
+        bgColor: "bg-muted/60",
+        borderColor: "border-border/50",
+        label: "Rejected",
+      };
     default:
       return {
         icon: 'circle%20clock-39-1658435834.png',

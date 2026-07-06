@@ -469,7 +469,10 @@ export async function getDnsScanHandler(c: Context) {
     return c.json({ error: "Server not found" }, 404);
   }
   try {
-    const result = await scanDns(serverId);
+    // Optional ?domain= scopes the scan to an additional domain; omitted
+    // falls back to the primary install domain inside scanDns.
+    const domain = c.req.query("domain");
+    const result = await scanDns(serverId, domain);
     return c.json(result);
   } catch (err) {
     return errorJson(c, err);

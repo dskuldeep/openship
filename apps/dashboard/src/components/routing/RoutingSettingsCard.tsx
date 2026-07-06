@@ -1,6 +1,6 @@
 "use client";
 
-import React, { useCallback, useEffect, useMemo, useState } from "react";
+import React, { useCallback, useEffect, useId, useMemo, useState } from "react";
 import { Globe, Shield, Server, X, Copy, Check, Info, Eye, EyeOff, Link2, Hash } from "lucide-react";
 import { domainsApi } from "@/lib/api";
 import { usePlatform } from "@/context/PlatformContext";
@@ -65,6 +65,7 @@ export function RoutingSettingsCard({
   saveMode = "change",
 }: RoutingSettingsCardProps) {
   const { baseDomain } = usePlatform();
+  const portListId = useId();
   const [showDnsModal, setShowDnsModal] = useState(false);
   const [dnsRecords, setDnsRecords] = useState<DnsRecord[]>([]);
   const [dnsMode, setDnsMode] = useState<"cloud" | "selfhosted">("cloud");
@@ -222,6 +223,11 @@ export function RoutingSettingsCard({
                         void onDomainChange(next);
                       }
                     }}
+                    onBlur={() => {
+                      // Commit on blur so a typed change isn't silently lost if the
+                      // modal is closed without clicking the inline Save pill.
+                      if (saveMode === "explicit" && draftDomain !== domain) commitFreeDomain();
+                    }}
                     placeholder={projectName || "my-project"}
                     className="flex-1 px-3.5 py-3 text-sm bg-transparent outline-none text-foreground placeholder:text-muted-foreground/40"
                   />
@@ -252,6 +258,9 @@ export function RoutingSettingsCard({
                       } else {
                         void onCustomDomainChange(next);
                       }
+                    }}
+                    onBlur={() => {
+                      if (saveMode === "explicit" && draftCustomDomain !== customDomain) commitCustomDomain();
                     }}
                     placeholder="app.example.com"
                     className="flex-1 px-3.5 py-3 text-sm bg-transparent outline-none text-foreground placeholder:text-muted-foreground/40"
@@ -304,38 +313,31 @@ export function RoutingSettingsCard({
                 <Hash className="size-3.5 text-muted-foreground" />
                 <span className="text-[13px] text-muted-foreground font-medium">Exposed port</span>
               </div>
-              {hasPortOptions ? (
-                <select
-                  value={saveMode === "explicit" ? draftPort : exposedPort}
-                  onChange={(event) => {
-                    if (saveMode === "explicit") {
-                      setDraftPort(event.target.value);
-                    } else {
-                      void onExposedPortChange(event.target.value);
-                    }
-                  }}
-                  disabled={disabled}
-                  className="px-3 py-2 rounded-xl text-sm bg-muted/30 border border-border/40 text-foreground outline-none"
-                >
-                  <option value="">Auto</option>
+              <input
+                type="text"
+                inputMode="numeric"
+                value={saveMode === "explicit" ? draftPort : exposedPort}
+                onChange={(event) => {
+                  if (saveMode === "explicit") {
+                    setDraftPort(event.target.value);
+                  } else {
+                    void onExposedPortChange(event.target.value);
+                  }
+                }}
+                onBlur={() => {
+                  if (saveMode === "explicit" && draftPort !== (exposedPort ?? "")) commitPort();
+                }}
+                placeholder="3000"
+                disabled={disabled}
+                list={hasPortOptions ? portListId : undefined}
+                className="w-24 px-3 py-2 rounded-xl text-sm bg-muted/30 border border-border/40 text-foreground outline-none"
+              />
+              {hasPortOptions && (
+                <datalist id={portListId}>
                   {portOptions.map((port) => (
-                    <option key={port} value={port}>{port}</option>
+                    <option key={port} value={port} />
                   ))}
-                </select>
-              ) : (
-                <input
-                  value={saveMode === "explicit" ? draftPort : exposedPort}
-                  onChange={(event) => {
-                    if (saveMode === "explicit") {
-                      setDraftPort(event.target.value);
-                    } else {
-                      void onExposedPortChange(event.target.value);
-                    }
-                  }}
-                  placeholder="3000"
-                  disabled={disabled}
-                  className="w-24 px-3 py-2 rounded-xl text-sm bg-muted/30 border border-border/40 text-foreground outline-none"
-                />
+                </datalist>
               )}
               {saveMode === "explicit" && draftPort !== (exposedPort ?? "") && (
                 <button

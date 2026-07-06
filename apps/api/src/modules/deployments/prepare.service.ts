@@ -13,7 +13,6 @@ import {
   applyWorkspaceContext,
   discoverMonorepoApps,
   discoverProjectRootHints,
-  isIgnoredRepoPath,
   normalizeProjectRootDirectory,
   selectPreferredProjectRoot,
   type MonorepoApp,
@@ -23,9 +22,8 @@ import {
   type RepoTreeEntry,
 } from "../../lib/project-root-detector";
 import type { ProjectType } from "@repo/core";
-import { readdir, readFile, stat } from "node:fs/promises";
-import { basename, join } from "node:path";
 import { env } from "../../config";
+import { createGitHubReader, type ProjectReader } from "./project-reader";
 
 const PREPARE_FILE_CONTENTS = [
   ...MANIFEST_FILES,
@@ -37,14 +35,6 @@ const PREPARE_FILE_CONTENTS = [
 ] as const;
 const COMPOSE_FILES = ["docker-compose.yml", "docker-compose.yaml", "compose.yml", "compose.yaml"] as const;
 
-interface ProjectReader {
-  listDirectory: (path: string) => Promise<RepoFile[]>;
-  readText: (path: string) => Promise<string | undefined>;
-  readJson: (path: string) => Promise<Record<string, unknown> | undefined>;
-  listTree: () => Promise<RepoTreeEntry[]>;
-}
-
-// ─── Types ───────────────────────────────────────────────────────────────────
 
 export type Source =
   | {
@@ -184,122 +174,6 @@ async function selectProjectSnapshot(
   return { selected, monorepo };
 }
 
-function createGitHubReader(
-  ctx: RequestContext,
-  owner: string,
-  repo: string,
-  branch: string,
-): ProjectReader {
-  let treePromise: Promise<RepoTreeEntry[]> | null = null;
-
-  const readText = async (path: string) => {
-    try {
-      const file = await githubService.getFileContent(ctx, owner, repo, path, { branch });
-      return file?.content;
-    } catch {
-      return undefined;
-    }
-  };
-
-  return {
-    listDirectory: async (path: string) => {
-      try {
-        const contents = await githubService.listFiles(ctx, owner, repo, {
-          branch,
-          ...(path ? { path } : {}),
-        });
-
-        return Array.isArray(contents)
-          ? contents.map((file) => ({
-              name: file.name,
-              type: file.type === "dir" ? "dir" : "file",
-            }))
-          : [];
-      } catch {
-        return [];
-      }
-    },
-    readText,
-    readJson: async (path: string) => {
-      const content = await readText(path);
-      if (!content) return undefined;
-      try {
-        return JSON.parse(content);
-      } catch {
-        return undefined;
-      }
-    },
-    listTree: async () => {
-      if (!treePromise) {
-        treePromise = githubService.listRepositoryTree(ctx, owner, repo, { branch });
-      }
-      return treePromise;
-    },
-  };
-}
-
-async function listLocalTree(dirPath: string): Promise<RepoTreeEntry[]> {
-  const tree: RepoTreeEntry[] = [];
-
-  const visit = async (absolutePath: string, relativePath = "") => {
-    const entries = await readdir(absolutePath, { withFileTypes: true });
-
-    for (const entry of entries) {
-      const nextRelativePath = relativePath ? `${relativePath}/${entry.name}` : entry.name;
-      if (entry.isDirectory() && isIgnoredRepoPath(nextRelativePath)) {
-        continue;
-      }
-
-      tree.push({ path: nextRelativePath, type: entry.isDirectory() ? "dir" : "file" });
-      if (entry.isDirectory()) {
-        await visit(join(absolutePath, entry.name), nextRelativePath);
-      }
-    }
-  };
-
-  await visit(dirPath);
-  return tree;
-}
-
-function createLocalReader(dirPath: string): ProjectReader {
-  let treePromise: Promise<RepoTreeEntry[]> | null = null;
-
-  const absolutePathFor = (path: string) => path ? join(dirPath, path) : dirPath;
-
-  return {
-    listDirectory: async (path: string) => {
-      try {
-        const entries = await readdir(absolutePathFor(path), { withFileTypes: true });
-        return entries.map((entry) => ({
-          name: entry.name,
-          type: entry.isDirectory() ? "dir" : "file",
-        }));
-      } catch {
-        return [];
-      }
-    },
-    readText: async (path: string) => {
-      try {
-        return await readFile(absolutePathFor(path), "utf-8");
-      } catch {
-        return undefined;
-      }
-    },
-    readJson: async (path: string) => {
-      try {
-        return JSON.parse(await readFile(absolutePathFor(path), "utf-8"));
-      } catch {
-        return undefined;
-      }
-    },
-    listTree: async () => {
-      if (!treePromise) {
-        treePromise = listLocalTree(dirPath);
-      }
-      return treePromise;
-    },
-  };
-}
 
 async function readProjectText(
   reader: ProjectReader,
@@ -328,8 +202,6 @@ async function readComposeText(
   return undefined;
 }
 
-// ─── Public API ──────────────────────────────────────────────────────────────
-
 /**
  * Resolve project info from either a GitHub repo or a local filesystem path.
  * Both paths converge on detectStack and return the same ProjectInfo shape.
@@ -346,10 +218,10 @@ export async function resolveProjectInfo(input: Source): Promise<ProjectInfo> {
     throw new Error("Local project resolution is not available in cloud mode");
   }
 
+  // Dynamic import keeps local-source (node:fs) out of the cloud module graph.
+  const { resolveFromLocal } = await import("./local-source");
   return resolveFromLocal(input.path);
 }
-
-// ─── Shared resolver ─────────────────────────────────────────────────────────
 
 type RepoMeta = Parameters<typeof toProjectInfo>[0];
 
@@ -357,7 +229,7 @@ type RepoMeta = Parameters<typeof toProjectInfo>[0];
  * Shared resolution pipeline: snapshot → select root → read compose/.env → map.
  * Source-specific work (auth, branch validation, fs stat) lives in the callers.
  */
-async function resolveFromReader(
+export async function resolveFromReader(
   reader: ProjectReader,
   repoMeta: RepoMeta,
   selectedBranch: string,
@@ -371,8 +243,6 @@ async function resolveFromReader(
 
   return toProjectInfo(repoMeta, selected, composeContent, selectedBranch, composeEnvContent, monorepo);
 }
-
-// ─── GitHub ──────────────────────────────────────────────────────────────────
 
 async function resolveFromGitHub(
   ctx: RequestContext,
@@ -399,33 +269,6 @@ async function resolveFromGitHub(
     selectedBranch,
   );
 }
-
-// ─── Local filesystem ────────────────────────────────────────────────────────
-
-async function resolveFromLocal(dirPath: string): Promise<ProjectInfo> {
-  const st = await stat(dirPath);
-  if (!st.isDirectory()) {
-    throw new Error("Path is not a directory");
-  }
-
-  const reader = createLocalReader(dirPath);
-  const rootPackageJson = await reader.readJson("package.json");
-  const name = (rootPackageJson?.name as string) ?? basename(dirPath);
-
-  return resolveFromReader(
-    reader,
-    {
-      name,
-      full_name: dirPath,
-      owner: "local",
-      private: true,
-      default_branch: "main",
-    },
-    "main",
-  );
-}
-
-// ─── Shared mapper ───────────────────────────────────────────────────────────
 
 function toProjectInfo(
   repo: {

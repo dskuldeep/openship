@@ -347,13 +347,17 @@ export async function getAnalyticsOverview(
   projectId: string,
   from?: string,
   to?: string,
+  domain?: string,
 ): Promise<{ summary: AnalyticsSummary; periods: AnalyticsPeriod[] }> {
   const project = await repos.project.findById(projectId);
   if (!project || project.organizationId !== ctx.organizationId) {
     throw new NotFoundError("Project", projectId);
   }
 
-  const sources = await resolveProjectTrafficSources(projectId);
+  // `domain` scopes to one tracked domain (validated; falls back to the primary
+  // when untracked — never fetches an arbitrary cross-tenant host). Without it,
+  // aggregate every tracked domain. Both handled by the one resolver.
+  const sources = await resolveProjectTrafficSources(projectId, { domain });
   if (sources.length === 0) return { summary: EMPTY_SUMMARY, periods: [] };
 
   if (sources.every((source) => source.kind === "cloud")) {
@@ -396,39 +400,6 @@ export async function getAnalyticsOverview(
     summary: summariseBuckets(allBuckets, new Date().toISOString()),
     periods: buildHourlyPeriods(allBuckets, fromMinute, toMinute),
   };
-}
-
-/**
- * Cumulative summary for a project (last 24h). Thin wrapper over
- * getAnalyticsOverview so there's a single fetch+compute implementation.
- */
-export async function getAnalyticsSummary(
-  ctx: RequestContext,
-  projectId: string,
-): Promise<AnalyticsSummary> {
-  return (await getAnalyticsOverview(ctx, projectId)).summary;
-}
-
-// ─── Analytics periods ───────────────────────────────────────────────────────
-
-/**
- * Get aggregated analytics periods for a date range.
- *
- * SaaS/OpenShip Cloud projects read from Oblien only.
- * Self-hosted projects combine DB history with the live OpenResty tail,
- * grouped into hourly periods for charting.
- */
-/**
- * Hourly periods for a project over [from,to] (default last 24h). Thin wrapper
- * over getAnalyticsOverview so there's a single fetch+compute implementation.
- */
-export async function getAnalyticsPeriods(
-  ctx: RequestContext,
-  projectId: string,
-  from?: string,
-  to?: string,
-): Promise<AnalyticsPeriod[]> {
-  return (await getAnalyticsOverview(ctx, projectId, from, to)).periods;
 }
 
 // ─── Deployment stats ────────────────────────────────────────────────────────

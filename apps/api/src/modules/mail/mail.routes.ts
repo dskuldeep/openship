@@ -25,6 +25,9 @@ r.get("/status", { tag: "mail_server:read" }, mail.getStatus);
 // Cross-server mail-install summary - lets the /emails page auto-select
 // the only mail server when there's exactly one.
 r.get("/servers", { tag: "mail_server:list" }, mail.listMailServers);
+// Stop managing a mail server: drop the DB row only, leave the stack + state
+// file intact so it can be re-adopted. Non-destructive; see forgetMailServer.
+r.delete("/servers/:serverId", { tag: "mail_server:admin" }, mail.forgetMailServer);
 // Re-adopt an existing mail install whose orchestrator state was lost (lost PC):
 // scan a server for iRedMail + its on-server state, then adopt it back.
 r.post("/scan", { tag: "mail_server:write" }, mail.scanMailInstall);
@@ -122,6 +125,23 @@ r.get(
   "/admin/:serverId/stats",
   { tag: "mail_server:read" },
   admin.getStatsHandler,
+);
+
+/* ── Admin panel - backup (plugs into the general backup system) ──── */
+r.get(
+  "/admin/:serverId/backup-policy",
+  { tag: "mail_server:read" },
+  mail.getMailBackupPolicy,
+);
+r.post(
+  "/admin/:serverId/backup-policy",
+  { tag: "mail_server:admin" },
+  mail.saveMailBackupPolicy,
+);
+r.get(
+  "/admin/:serverId/backup-runs",
+  { tag: "mail_server:read" },
+  mail.listMailBackupRuns,
 );
 
 /* ── Admin panel - DNS scan ───────────────────────────────────────── */

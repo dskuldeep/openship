@@ -97,6 +97,7 @@ export interface BackupRestore {
     | "cancelled"
     | "server_error";
   mode: "in_place" | "to_fork";
+  forkMailServerId: string | null;
   startedAt: string;
   finishedAt: string | null;
   bytesRestored: number | null;
@@ -201,9 +202,13 @@ export const backupsApi = {
 
   // ── Restore ───────────────────────────────────────────────────────────────
 
-  prepareRestore: (runId: string) =>
+  prepareRestore: (
+    runId: string,
+    opts?: { mode?: "in_place" | "to_fork"; forkMailServerId?: string | null },
+  ) =>
     api.post<{ data: { restoreId: string; confirmationToken: string } }>(
       endpoints.backups.prepareRestore(runId),
+      opts ?? {},
     ),
 
   applyRestore: (restoreId: string, confirmationToken: string) =>

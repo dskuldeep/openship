@@ -73,35 +73,67 @@ export interface DnsScanResult {
 }
 
 /**
- * Run the full scan for a server. Pulls expected records from the
- * on-server state file, then resolves each against public DNS in
- * parallel. Returns a flat list of checks + the timestamp for the
- * "scanned at X" UI hint.
+ * Run the scan for a server, optionally scoped to a specific domain.
+ *
+ * Pulls expected records from the on-server state file, then resolves each
+ * against public DNS in parallel. Returns a flat list of checks + the
+ * timestamp for the "scanned at X" UI hint.
+ *
+ * Domain scoping:
+ *   - omitted / primary install domain → the full record set (A/AAAA/MX/
+ *     SPF/DKIM/DMARC/PTR) from `state.dnsRecords`.
+ *   - an additional domain → only MX/SPF/DKIM?/DMARC from
+ *     `state.additionalDomains[domain].records`. A/AAAA/PTR are skipped:
+ *     those test the shared `mail.<installDomain>` host, which the primary
+ *     scan already covers, and additional domains never carry them.
  */
-export async function scanDns(serverId: string): Promise<DnsScanResult> {
+export async function scanDns(
+  serverId: string,
+  domain?: string,
+): Promise<DnsScanResult> {
   const state = await sshManager.withExecutor(serverId, (exec) => readState(exec));
-  if (!state || !state.dnsRecords || !state.domain) {
+  if (!state || !state.domain) {
+    return { domain: "", scannedAt: Date.now(), checks: [] };
+  }
+
+  const target = domain?.trim().toLowerCase() || state.domain;
+  const isPrimary = target === state.domain;
+
+  if (isPrimary) {
+    if (!state.dnsRecords) {
+      return { domain: "", scannedAt: Date.now(), checks: [] };
+    }
+    const expected = state.dnsRecords as unknown as ExpectedRecords;
+    const checks = await Promise.all([
+      checkA(target, expected.a),
+      checkAaaa(target, expected.aaaa),
+      checkMx(target, expected.mx),
+      checkSpf(target, expected.spf),
+      checkDkim(target, expected.dkim),
+      checkDmarc(target, expected.dmarc),
+      checkPtr(expected.a, target),
+    ]);
     return {
-      domain: "",
+      domain: target,
       scannedAt: Date.now(),
-      checks: [],
+      checks: checks.filter((c): c is DnsCheck => c !== null),
     };
   }
-  const expected = state.dnsRecords as unknown as ExpectedRecords;
-  const domain = state.domain;
 
+  // Additional domain: MX/SPF/DKIM?/DMARC only.
+  const additional = state.additionalDomains?.[target]?.records;
+  if (!additional) {
+    return { domain: target, scannedAt: Date.now(), checks: [] };
+  }
+  const expected = additional as unknown as ExpectedRecords;
   const checks = await Promise.all([
-    checkA(domain, expected.a),
-    checkAaaa(domain, expected.aaaa),
-    checkMx(domain, expected.mx),
-    checkSpf(domain, expected.spf),
-    checkDkim(domain, expected.dkim),
-    checkDmarc(domain, expected.dmarc),
-    checkPtr(expected.a, domain),
+    checkMx(target, expected.mx),
+    checkSpf(target, expected.spf),
+    checkDkim(target, expected.dkim),
+    checkDmarc(target, expected.dmarc),
   ]);
-
   return {
-    domain,
+    domain: target,
     scannedAt: Date.now(),
     checks: checks.filter((c): c is DnsCheck => c !== null),
   };

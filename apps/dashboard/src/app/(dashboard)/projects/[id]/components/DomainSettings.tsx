@@ -3,17 +3,16 @@
 import React, { useEffect, useMemo, useState } from "react";
 import {
   CheckCircle2,
-  Container,
   Copy,
   ExternalLink,
   Globe,
   Link2,
   Loader2,
   Pencil,
-  Power,
   Plus,
   RefreshCw,
   ShieldAlert,
+  Star,
   X,
 } from "lucide-react";
 import { useProjectSettings } from "@/context/ProjectSettingsContext";
@@ -24,6 +23,7 @@ import { usePlatform } from "@/context/PlatformContext";
 import { resolveServiceHostnameLabel } from "@repo/core";
 import PublicEndpointsCard from "@/components/routing/PublicEndpointsCard";
 import { RoutingSettingsCard } from "@/components/routing/RoutingSettingsCard";
+import DropdownMenu, { type MenuAction } from "@/components/ui/DropdownMenu";
 import {
   createPublicEndpoint,
   ensurePublicEndpoints,
@@ -236,6 +236,16 @@ export const DomainSettings = () => {
   } | null>(null);
   const [editingRouteServiceId, setEditingRouteServiceId] = useState<string | null>(null);
   const [routeSavingServiceId, setRouteSavingServiceId] = useState<string | null>(null);
+  // "Add route" form (services projects): a generic domain → port entry. The
+  // port is matched to the service that owns it; that service is then exposed.
+  const [showAddRoute, setShowAddRoute] = useState(false);
+  const [addRouteDraft, setAddRouteDraft] = useState<{
+    domainType: "free" | "custom";
+    domain: string;
+    port: string;
+  }>({ domainType: "free", domain: "", port: "" });
+  const [addRouteError, setAddRouteError] = useState<string | null>(null);
+  const [addRouteSaving, setAddRouteSaving] = useState(false);
   const [isSavingPublicEndpoints, setIsSavingPublicEndpoints] = useState(false);
   const [isEditingDomains, setIsEditingDomains] = useState(false);
   // Tracks the per-domain Verify button state. Holds the domainId of the
@@ -259,6 +269,7 @@ export const DomainSettings = () => {
     [projectData, hasProjectServer, projectRuntimePort],
   );
   const [publicEndpoints, setPublicEndpoints] = useState<PublicEndpoint[]>(draftPublicEndpoints);
+  const [settingPrimaryId, setSettingPrimaryId] = useState<string | null>(null);
 
   const domainSummaries = useMemo<DomainSummaryItem[]>(() => {
     const endpointSource = Array.isArray(projectData.publicEndpoints) && projectData.publicEndpoints.length > 0
@@ -649,12 +660,20 @@ export const DomainSettings = () => {
     setIsEditingDomains(false);
   };
 
-  const handleSavePublicEndpoints = async () => {
-    const payload = publicEndpoints
+  // Persist a specific ordering of the project's public endpoints. Endpoint
+  // ORDER is the source of truth for the primary domain (index 0 → primary),
+  // so both "Save changes" (edit) and "Set as primary" (reorder) route through
+  // here — keeping the index-based badge and the persisted isPrimary flag in
+  // lockstep. Returns false (with a toast) if any endpoint is incomplete.
+  const persistPublicEndpoints = async (
+    endpoints: PublicEndpoint[],
+    successMessage = "Domain routing updated",
+  ): Promise<boolean> => {
+    const payload = endpoints
       .map((endpoint) => buildPublicEndpointPayload(endpoint, hasProjectServer))
       .filter((endpoint): endpoint is NonNullable<ReturnType<typeof buildPublicEndpointPayload>> => endpoint !== null);
 
-    if (payload.length !== publicEndpoints.length || payload.length === 0) {
+    if (payload.length !== endpoints.length || payload.length === 0) {
       showToast("Complete every domain and mapped port before saving", "error", "Domains");
       return false;
     }
@@ -686,13 +705,13 @@ export const DomainSettings = () => {
           ? endpoint.customDomain || ""
           : `${endpoint.domain}.${baseDomain}`;
         const existing = domainsData.domains.find((domain) => (
-          (typeof domain?.id === "string" && domain.id === publicEndpoints[index]?.id) ||
+          (typeof domain?.id === "string" && domain.id === endpoints[index]?.id) ||
           domain?.hostname === hostname
         ));
 
         return {
           ...existing,
-          id: existing?.id || publicEndpoints[index]?.id || hostname,
+          id: existing?.id || endpoints[index]?.id || hostname,
           hostname,
           domain: hostname,
           primary: index === 0,
@@ -709,7 +728,7 @@ export const DomainSettings = () => {
       // Drop the cached project info so the next mount of Overview /
       // any hook consumer refetches with the new domain state.
       if (id) invalidateProjectCaches(id);
-      showToast("Domain routing updated", "success", "Domains");
+      showToast(successMessage, "success", "Domains");
       setIsEditingDomains(false);
       return true;
     } catch (error) {
@@ -717,6 +736,57 @@ export const DomainSettings = () => {
       return false;
     } finally {
       setIsSavingPublicEndpoints(false);
+    }
+  };
+
+  const handleSavePublicEndpoints = () => persistPublicEndpoints(publicEndpoints);
+
+  // Make a project domain the primary one by moving its endpoint to index 0 and
+  // persisting the new order (primary = first endpoint). Matches by domain-row
+  // id, endpoint id, or resolved hostname so it works regardless of draft order.
+  const handleSetPrimaryDomain = async (summary: DomainSummaryItem) => {
+    if (summary.isPrimary) return;
+    const idx = publicEndpoints.findIndex((ep) =>
+      (!!summary.domainId && ep.id === summary.domainId) ||
+      ep.id === summary.id ||
+      resolveProjectEndpointHostname(ep, baseDomain)?.toLowerCase() === summary.hostname.toLowerCase(),
+    );
+    if (idx <= 0) return; // -1 = not found, 0 = already primary
+    const reordered = [...publicEndpoints];
+    const [chosen] = reordered.splice(idx, 1);
+    reordered.unshift(chosen);
+    setSettingPrimaryId(summary.id);
+    try {
+      setPublicEndpoints(reordered);
+      await persistPublicEndpoints(reordered, "Primary domain updated");
+    } finally {
+      setSettingPrimaryId(null);
+    }
+  };
+
+  // Per-service domains have no endpoint order to reorder — primary is the
+  // domain row's isPrimary flag. Flip it via the API, then reflect locally
+  // (exactly one primary per project). getPrimaryByProject picks this up for
+  // the project's canonical URL / favicon / analytics, and it survives
+  // redeploys (service route registration preserves an existing isPrimary).
+  const handleSetPrimaryServiceDomain = async (summary: DomainSummaryItem) => {
+    if (!summary.domainId || summary.isPrimary) return;
+    setSettingPrimaryId(summary.id);
+    try {
+      await domainsApi.setPrimary(summary.domainId);
+      updateDomains(
+        (Array.isArray(domainsData.domains) ? domainsData.domains : []).map((d: any) =>
+          typeof d?.id === "string"
+            ? { ...d, isPrimary: d.id === summary.domainId, primary: d.id === summary.domainId }
+            : d,
+        ),
+      );
+      if (id) invalidateProjectCaches(id);
+      showToast("Primary domain updated", "success", "Domains");
+    } catch (error) {
+      showToast(getApiErrorMessage(error, "Failed to set primary domain"), "error", "Domains");
+    } finally {
+      setSettingPrimaryId(null);
     }
   };
 
@@ -775,6 +845,151 @@ export const DomainSettings = () => {
     } finally {
       setRouteSavingServiceId(null);
     }
+  };
+
+  // Match a free-form port to the enabled service that publishes it. Services
+  // route per-service, so a "domain → port" route card attaches to whichever
+  // service owns that port.
+  const findServiceByPort = (port: string): Service | null => {
+    const p = port.trim();
+    if (!p) return null;
+    return (
+      services.find(
+        (s) =>
+          s.enabled &&
+          (String(s.exposedPort ?? "") === p ||
+            (s.ports ?? []).some((spec) => {
+              const parts = spec.split(":");
+              const container = (parts[parts.length - 1] ?? "").split("/")[0];
+              const host = (parts[parts.length - 2] ?? "").split("/")[0];
+              return container === p || host === p;
+            })),
+      ) ?? null
+    );
+  };
+
+  const handleAddRoute = async () => {
+    setAddRouteError(null);
+    const { domainType, domain, port } = addRouteDraft;
+    const cleanPort = port.trim();
+    if (!cleanPort) {
+      setAddRouteError("Enter the port this domain should route to.");
+      return;
+    }
+    const target = findServiceByPort(cleanPort);
+    if (!target) {
+      setAddRouteError(`No service publishes port ${cleanPort}. Add that port to a service first.`);
+      return;
+    }
+    const domainValue = domain.trim();
+    if (!domainValue) {
+      setAddRouteError(domainType === "custom" ? "Enter a custom domain." : "Enter a subdomain.");
+      return;
+    }
+    setAddRouteSaving(true);
+    try {
+      await handleServiceRouteUpdate(target.id, {
+        exposed: true,
+        exposedPort: cleanPort,
+        domainType,
+        ...(domainType === "custom"
+          ? { customDomain: domainValue.toLowerCase() }
+          : { domain: domainValue.toLowerCase() }),
+      });
+      setShowAddRoute(false);
+      setAddRouteDraft({ domainType: "free", domain: "", port: "" });
+    } finally {
+      setAddRouteSaving(false);
+    }
+  };
+
+  // Every enabled + exposed service is a generic domain → port route card —
+  // the SAME card a single-app project's endpoints render as. No project-vs-
+  // service split in the UI; internal (non-exposed) services produce no card.
+  const serviceRouteCards: Array<{ service: Service; summary: DomainSummaryItem }> = (() => {
+    const domains = Array.isArray(domainsData.domains) ? domainsData.domains : [];
+    const domainByHostname = new Map(
+      domains
+        .filter((d: any) => typeof d?.hostname === "string")
+        .map((d: any) => [d.hostname.toLowerCase(), d]),
+    );
+    return services
+      .filter((s) => s.enabled && s.exposed)
+      .map((service) => {
+        const hostname = resolveServiceHostname(service);
+        const domain = domainByHostname.get(hostname.toLowerCase()) ?? null;
+        return {
+          service,
+          summary: {
+            id: service.id,
+            domainId: typeof domain?.id === "string" ? domain.id : undefined,
+            title: service.name,
+            hostname,
+            typeLabel: service.domainType === "custom" ? "Custom domain" : "Free subdomain",
+            mappedLabel: `Port ${service.exposedPort || firstContainerPort(service.ports) || "auto"}`,
+            liveUrl: `https://${hostname}`,
+            isPrimary: domain?.isPrimary ?? false,
+            needsVerify: !!domain && domain.verified === false,
+            status: resolveDomainStatus(domain),
+            ssl: resolveDomainSsl(hostname, domain, baseDomain),
+          },
+        };
+      });
+  })();
+
+  // Build the ⋯ menu items for a domain card. Shared by the single-app and
+  // service route cards so both collapse the same way. Visit is NOT here — it's
+  // the card's header icon. `onEditRoute` adds the per-service "Edit route" item.
+  const buildDomainMenuActions = (opts: {
+    domain: DomainSummaryItem;
+    isVerifying: boolean;
+    isManagedRow: boolean;
+    isRenewing: boolean;
+    isRechecking: boolean;
+    onEditRoute?: () => void;
+    onSetPrimary?: () => void;
+    isSettingPrimary?: boolean;
+  }): MenuAction[] => {
+    const { domain, isVerifying, isManagedRow, isRenewing, isRechecking, onEditRoute, onSetPrimary, isSettingPrimary } = opts;
+    const items: MenuAction[] = [];
+    if (onEditRoute) {
+      items.push({ id: "edit", label: "Edit route", icon: <Pencil className="size-4" />, onClick: onEditRoute });
+    }
+    if (onSetPrimary) {
+      items.push({
+        id: "set-primary",
+        label: isSettingPrimary ? "Setting primary..." : "Set as primary",
+        icon: <Star className={isSettingPrimary ? "size-4 animate-pulse" : "size-4"} />,
+        onClick: onSetPrimary,
+        disabled: isSettingPrimary,
+      });
+    }
+    if (domain.needsVerify && domain.domainId) {
+      items.push({
+        id: "verify",
+        label: isVerifying ? "Verifying..." : "Verify",
+        icon: <RefreshCw className={isVerifying ? "size-4 animate-spin" : "size-4"} />,
+        onClick: () => void handleVerifyDomain(domain.domainId!, domain.hostname),
+        disabled: isVerifying,
+      });
+    }
+    if (!isManagedRow && !domain.needsVerify && domain.domainId) {
+      items.push({
+        id: "renew",
+        label: isRenewing ? "Renewing..." : "Renew SSL",
+        icon: <ShieldAlert className={isRenewing ? "size-4 animate-spin" : "size-4"} />,
+        onClick: () => void handleRenewDomainSsl(domain.hostname),
+        disabled: isRenewing,
+      });
+      items.push({
+        id: "recheck",
+        label: isRechecking ? "Rechecking..." : "Recheck SSL",
+        icon: <RefreshCw className={isRechecking ? "size-4 animate-spin" : "size-4"} />,
+        onClick: () => void handleRecheckSsl(domain.domainId!, domain.hostname),
+        disabled: isRechecking,
+      });
+    }
+    return items;
   };
 
   const editingRouteService =
@@ -965,13 +1180,11 @@ export const DomainSettings = () => {
         </SectionCard>
       ) : null}
 
-      {!isEditingDomains && hasDomain ? (
-        // Always render the unified list — every domain attached to the
-        // project, free OR custom, gets a row, just like the Service
-        // Routing section below. The primary domain carries the "Primary"
-        // badge inside its card; SSL state for the primary lives in the
-        // dedicated card just below this list so renew / status info is
-        // discoverable without expanding rows.
+      {!isEditingDomains && hasDomain && hasProjectLevelRouting ? (
+        // Project-level routing (single app / project endpoints): every domain
+        // attached to the project, free OR custom, gets a route card. Services
+        // projects route per-service and render their own cards below instead —
+        // no auto project "primary" domain for them.
         <div className="space-y-3">
           <div className="flex flex-wrap items-center justify-end gap-2">
             {hasMultipleProjectDomains ? multiDomainActions : singleDomainActions}
@@ -984,64 +1197,31 @@ export const DomainSettings = () => {
               // get the Visit action. We never render Verify without a
               // domainId — without it the API call has no row to verify
               // (e.g. pre-save endpoint drafts).
+              // Secondary actions collapse into the card's ⋯ menu (Visit is the
+              // header icon). Verify shows on pending rows; Renew/Recheck SSL on
+              // verified custom rows only (free .opsh.io is host-managed).
               const isVerifying = !!verifyingDomainId && verifyingDomainId === domain.domainId;
-              const verifyAction =
-                domain.needsVerify && domain.domainId ? (
-                  <ActionButton
-                    label={isVerifying ? "Verifying..." : "Verify"}
-                    icon={isVerifying ? Loader2 : RefreshCw}
-                    onClick={() => void handleVerifyDomain(domain.domainId!, domain.hostname)}
-                    disabled={isVerifying}
-                  />
-                ) : null;
-              // Renew shows on verified custom rows only. Free .opsh.io
-              // is host-managed (no Let's Encrypt cert to renew), and
-              // pending rows don't have a cert yet — Verify kicks off
-              // the initial provisioning. We surface Renew across every
-              // multi-domain row so each cert can be poked independently;
-              // single-domain projects get the same affordance inline,
-              // replacing the old bottom-of-page SSL card.
               const isManagedRow = domain.hostname.toLowerCase().endsWith(`.${baseDomain}`);
               const isRenewing = renewingHostname === domain.hostname;
-              const renewAction =
-                !isManagedRow && !domain.needsVerify && domain.domainId ? (
-                  <ActionButton
-                    label={isRenewing ? "Renewing..." : "Renew SSL"}
-                    icon={isRenewing ? Loader2 : ShieldAlert}
-                    spinning={isRenewing}
-                    onClick={() => void handleRenewDomainSsl(domain.hostname)}
-                    disabled={isRenewing}
-                  />
-                ) : null;
-              // Read-only "Recheck SSL" — confirms/recovers the cert state on the
-              // server without burning a Let's Encrypt issuance. Same rows as Renew.
               const isRechecking = recheckingDomainId === domain.domainId;
-              const recheckAction =
-                !isManagedRow && !domain.needsVerify && domain.domainId ? (
-                  <ActionButton
-                    label={isRechecking ? "Rechecking..." : "Recheck SSL"}
-                    icon={isRechecking ? Loader2 : RefreshCw}
-                    spinning={isRechecking}
-                    onClick={() => void handleRecheckSsl(domain.domainId!, domain.hostname)}
-                    disabled={isRechecking}
-                  />
-                ) : null;
-              const visitAction = domain.liveUrl ? (
-                <ActionButton href={domain.liveUrl} label="Visit" icon={ExternalLink} />
-              ) : null;
-              const actions = verifyAction || renewAction || recheckAction || visitAction ? (
-                <>
-                  {verifyAction}
-                  {renewAction}
-                  {recheckAction}
-                  {visitAction}
-                </>
-              ) : null;
+              const menuActions = buildDomainMenuActions({
+                domain,
+                isVerifying,
+                isManagedRow,
+                isRenewing,
+                isRechecking,
+                // Reassigning primary only makes sense with >1 project domain.
+                onSetPrimary:
+                  hasMultipleProjectDomains && !domain.isPrimary
+                    ? () => void handleSetPrimaryDomain(domain)
+                    : undefined,
+                isSettingPrimary: settingPrimaryId === domain.id,
+              });
               return (
                 <DomainOverviewCard
                   key={domain.id}
                   domain={domain}
-                  actions={actions}
+                  menuActions={menuActions}
                 />
               );
             })}
@@ -1096,124 +1276,101 @@ export const DomainSettings = () => {
         </div>
       ) : null}
 
-      {!hasProjectLevelRouting && (servicesLoading || services.length > 0) && (() => {
-        // Only show ENABLED services (and their associated domains). When
-        // the operator disables a sub-app from the Services tab, its
-        // routing row hides from this Domains view automatically - the
-        // domain isn't being routed to anything, so showing it as if it
-        // were "available" would mislead. The disabled service is still
-        // editable from the Services tab; if it's re-enabled it reappears
-        // here on the next render.
-        const visibleServices = services.filter((s) => s.enabled);
-        const visibleExposedCount = visibleServices.filter((s) => s.exposed).length;
-        return (
-        <SectionCard
-          title="Service Routing"
-          description={`${visibleExposedCount} of ${visibleServices.length} services exposed publicly`}
-          icon={Container}
-          iconTone="primary"
-        >
-          {servicesLoading ? (
-            <div className="py-8 text-center text-sm text-muted-foreground">
-              Loading services...
+      {!hasProjectLevelRouting && (servicesLoading || services.length > 0) && (
+        <div className="space-y-3">
+          <div className="flex flex-wrap items-center justify-end gap-2">
+            <ActionButton
+              label={showAddRoute ? "Cancel" : "Add route"}
+              icon={Plus}
+              onClick={() => {
+                setAddRouteError(null);
+                setShowAddRoute((v) => !v);
+              }}
+            />
+          </div>
+          {showAddRoute && (
+            <div className="mb-4 space-y-3 rounded-xl border border-border/50 bg-muted/20 p-4">
+              <div className="flex items-center gap-2">
+                {(["free", "custom"] as const).map((type) => (
+                  <button
+                    key={type}
+                    type="button"
+                    onClick={() => setAddRouteDraft((d) => ({ ...d, domainType: type }))}
+                    className={`rounded-lg px-3 py-1.5 text-[12px] font-medium transition-colors ${
+                      addRouteDraft.domainType === type
+                        ? "bg-primary/10 text-primary ring-1 ring-primary/15"
+                        : "bg-muted/40 text-muted-foreground hover:bg-muted/60"
+                    }`}
+                  >
+                    {type === "free" ? "Free subdomain" : "Custom domain"}
+                  </button>
+                ))}
+              </div>
+              <div className="flex flex-col gap-3 sm:flex-row sm:items-center">
+                <div className="flex flex-1 items-center overflow-hidden rounded-xl border border-border/50 bg-background">
+                  <input
+                    value={addRouteDraft.domain}
+                    onChange={(e) => setAddRouteDraft((d) => ({ ...d, domain: e.target.value }))}
+                    placeholder={addRouteDraft.domainType === "custom" ? "app.example.com" : projectLabel || "my-service"}
+                    className="flex-1 bg-transparent px-3 py-2.5 text-sm text-foreground outline-none placeholder:text-muted-foreground/50"
+                  />
+                  {addRouteDraft.domainType === "free" && (
+                    <span className="shrink-0 pr-3 text-sm text-muted-foreground">.{baseDomain}</span>
+                  )}
+                </div>
+                <div className="flex items-center gap-2">
+                  <span className="text-[13px] text-muted-foreground">Port</span>
+                  <input
+                    value={addRouteDraft.port}
+                    onChange={(e) => setAddRouteDraft((d) => ({ ...d, port: e.target.value }))}
+                    placeholder="8080"
+                    inputMode="numeric"
+                    className="w-24 rounded-xl border border-border/50 bg-background px-3 py-2.5 text-sm text-foreground outline-none"
+                  />
+                  <button
+                    type="button"
+                    onClick={() => void handleAddRoute()}
+                    disabled={addRouteSaving}
+                    className="inline-flex items-center gap-1.5 rounded-xl bg-foreground px-4 py-2.5 text-[13px] font-medium text-background transition-colors hover:bg-foreground/90 disabled:opacity-50"
+                  >
+                    {addRouteSaving ? <Loader2 className="size-4 animate-spin" /> : <Plus className="size-4" />}
+                    Add
+                  </button>
+                </div>
+              </div>
+              {addRouteError && <p className="text-[12px] text-destructive">{addRouteError}</p>}
             </div>
-          ) : visibleServices.length === 0 ? (
+          )}
+
+          {servicesLoading ? (
+            <div className="py-8 text-center text-sm text-muted-foreground">Loading routes...</div>
+          ) : serviceRouteCards.length === 0 ? (
             <div className="py-8 text-center text-sm text-muted-foreground">
-              {services.length === 0
-                ? "No services found for this project."
-                : "All services are disabled - enable one from the Services tab to see its routing."}
+              No domains yet. Click <span className="font-medium text-foreground">Add route</span> to point a domain at a service&apos;s port.
             </div>
           ) : (
-            <div className="overflow-hidden rounded-xl border border-border/40 divide-y divide-border/30">
-              {visibleServices.map((service) => {
-                const route = getServiceRouteSummary(service);
-                const isServiceSaving = routeSavingServiceId === service.id;
-                const routeLabel = route.liveUrl
-                  ? route.liveUrl.replace("https://", "")
-                  : "Internal only";
-
-                return (
-                  <div key={service.id} className="bg-card">
-                    <div className="flex w-full items-center gap-4 px-4 py-4">
-                      <div className="flex-1 min-w-0">
-                        <div className="flex items-center gap-2 flex-wrap">
-                          <span className="text-sm font-semibold text-foreground">
-                            {service.name}
-                          </span>
-                          <span
-                            className={`inline-flex items-center gap-1.5 rounded-full px-2.5 py-0.5 text-[11px] font-semibold ${route.statusClass}`}
-                          >
-                            <span
-                              className={`h-1.5 w-1.5 rounded-full ${route.connected ? "bg-emerald-500" : "bg-muted-foreground/40"}`}
-                            />
-                            {route.statusLabel}
-                          </span>
-                        </div>
-
-                        <div className="mt-3 rounded-xl border border-border/50 bg-muted/25 px-3.5 py-3">
-                          <div className="text-[10px] font-medium uppercase tracking-[0.14em] text-muted-foreground/70">
-                            Route
-                          </div>
-                          <div className="mt-1.5 truncate text-[13px] font-semibold text-foreground">
-                            {routeLabel}
-                          </div>
-                        </div>
-                        <div className="mt-2 flex items-center gap-1.5 text-[12px] text-muted-foreground">
-                          <Link2 className="size-3" />
-                          <span>Port {service.exposedPort || "Auto"}</span>
-                          <span className="text-muted-foreground/50">·</span>
-                          <span>{route.detail}</span>
-                        </div>
-                      </div>
-
-                      <div className="flex items-center gap-2 shrink-0">
-                        {route.connected && route.liveUrl && (
-                          <a
-                            href={route.liveUrl}
-                            target="_blank"
-                            rel="noopener noreferrer"
-                            className="inline-flex items-center gap-1 px-2.5 py-1.5 rounded-lg text-[11px] font-medium text-primary hover:bg-primary/10 transition-colors"
-                          >
-                            <ExternalLink className="size-3" />
-                            Open
-                          </a>
-                        )}
-                        <button
-                          type="button"
-                          onClick={() =>
-                            handleServiceRouteUpdate(service.id, { enabled: !service.enabled })
-                          }
-                          disabled={isServiceSaving}
-                          className={`inline-flex items-center gap-1 px-2.5 py-1.5 rounded-lg text-[11px] font-medium transition-colors disabled:cursor-not-allowed disabled:opacity-50 ${
-                            service.enabled
-                              ? "bg-red-500/10 text-red-600 dark:text-red-400 hover:bg-red-500/15"
-                              : "bg-emerald-500/10 text-emerald-600 dark:text-emerald-400 hover:bg-emerald-500/15"
-                          }`}
-                        >
-                          {isServiceSaving ? (
-                            <Loader2 className="size-3 animate-spin" />
-                          ) : (
-                            <Power className="size-3" />
-                          )}
-                          {service.enabled ? "Disable" : "Enable"}
-                        </button>
-                        <button
-                          type="button"
-                          onClick={() => setEditingRouteServiceId(service.id)}
-                          className="inline-flex items-center gap-1 px-2.5 py-1.5 rounded-lg bg-foreground/[0.06] text-[11px] font-medium text-foreground transition-colors hover:bg-foreground/[0.1]"
-                        >
-                          Edit route
-                        </button>
-                      </div>
-                    </div>
-                  </div>
-                );
+            <div className="grid grid-cols-1 gap-4 xl:grid-cols-2">
+              {serviceRouteCards.map(({ service, summary }) => {
+                const menuActions = buildDomainMenuActions({
+                  domain: summary,
+                  isVerifying: !!verifyingDomainId && verifyingDomainId === summary.domainId,
+                  isManagedRow: summary.hostname.toLowerCase().endsWith(`.${baseDomain}`),
+                  isRenewing: renewingHostname === summary.hostname,
+                  isRechecking: recheckingDomainId === summary.domainId,
+                  onEditRoute: () => setEditingRouteServiceId(service.id),
+                  // Choosing a canonical domain only makes sense with >1 route.
+                  onSetPrimary:
+                    serviceRouteCards.length > 1 && summary.domainId && !summary.isPrimary
+                      ? () => void handleSetPrimaryServiceDomain(summary)
+                      : undefined,
+                  isSettingPrimary: settingPrimaryId === summary.id,
+                });
+                return <DomainOverviewCard key={summary.id} domain={summary} menuActions={menuActions} />;
               })}
             </div>
           )}
-        </SectionCard>
-        );
-      })()}
+        </div>
+      )}
 
       {editingRouteService && editingRoute && (
         <div
@@ -1251,7 +1408,11 @@ export const DomainSettings = () => {
                 domainType={editingRouteService.domainType === "custom" ? "custom" : "free"}
                 exposed={editingRouteService.exposed}
                 ports={editingRouteService.ports}
-                exposedPort={editingRouteService.exposedPort ?? ""}
+                // Pre-fill the current route port. exposedPort is only set on an
+                // explicit choice; when unset the effective port is the service's
+                // container port from its compose `ports` mapping (e.g. "8080:80"
+                // → "80"), so fall back to that instead of showing an empty field.
+                exposedPort={editingRouteService.exposedPort || firstContainerPort(editingRouteService.ports)}
                 disabled={routeSavingServiceId === editingRouteService.id}
                 liveUrl={editingRoute.connected ? editingRoute.liveUrl : null}
                 onExposedChange={(value) =>
@@ -1418,16 +1579,28 @@ function ActionButton({
   );
 }
 
+/** Container port from the first compose `ports` mapping: "8080:80" → "80",
+ *  "80" → "80", "80/tcp" → "80". Mirrors RoutingSettingsCard's portOptions so
+ *  the edit-route field pre-fills the same value the datalist suggests. */
+function firstContainerPort(ports?: string[] | null): string {
+  const first = (ports ?? [])[0];
+  if (!first) return "";
+  const parts = first.split(":");
+  return (parts.length === 2 ? parts[1] : parts[0]).split("/")[0];
+}
+
 function DomainOverviewCard({
   domain,
-  actions,
+  menuActions = [],
 }: {
   domain: DomainSummaryItem;
-  actions?: React.ReactNode;
+  /** Secondary actions (edit, verify, renew, …) collapsed into a ⋯ menu. Visit
+   *  is a plain icon, not a menu item — it's the one everyday action. */
+  menuActions?: MenuAction[];
 }) {
   return (
     <div className="rounded-2xl border border-border/50 bg-card overflow-hidden">
-      <div className="border-b border-border/40 px-5 py-4">
+      <div className="flex items-start justify-between gap-2 border-b border-border/40 px-5 py-4">
         <div className="min-w-0">
           <div className="flex items-center gap-2 flex-wrap">
             <h3 className="text-[15px] font-semibold text-foreground">{domain.title}</h3>
@@ -1439,20 +1612,29 @@ function DomainOverviewCard({
           </div>
           <p className="mt-1 text-[12px] text-muted-foreground">{domain.typeLabel}</p>
         </div>
+        <div className="flex shrink-0 items-center gap-0.5">
+          {domain.liveUrl ? (
+            <a
+              href={domain.liveUrl}
+              target="_blank"
+              rel="noopener noreferrer"
+              title="Visit"
+              aria-label="Visit"
+              className="rounded-lg p-2 text-muted-foreground transition-colors hover:bg-muted hover:text-foreground"
+            >
+              <ExternalLink className="size-4" />
+            </a>
+          ) : null}
+          {menuActions.length > 0 ? <DropdownMenu actions={menuActions} align="right" /> : null}
+        </div>
       </div>
 
       <div className="space-y-4 px-5 py-4">
-        <ValueBlock label="Domain" value={domain.hostname} />
+        <div className="break-all text-[15px] font-semibold text-foreground">{domain.hostname}</div>
         <InfoRow label="Mapped to" value={domain.mappedLabel} />
         <InfoRow label="Status" value={<StatusPill tone={domain.status.tone}>{domain.status.label}</StatusPill>} />
         <InfoRow label="SSL" value={<StatusPill tone={domain.ssl.tone}>{domain.ssl.label}</StatusPill>} />
       </div>
-
-      {actions ? (
-        <div className="border-t border-border/40 bg-muted/[0.14] px-5 py-3">
-          <div className="flex flex-wrap items-center justify-end gap-2">{actions}</div>
-        </div>
-      ) : null}
     </div>
   );
 }

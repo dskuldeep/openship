@@ -26,6 +26,7 @@ import {
   type RouteRegistrationOptions,
   type RoutingProvider,
   type SslProvider,
+  type SystemManager,
 } from "@repo/adapters";
 import { decryptEnvMap } from "../../../lib/encryption";
 import {
@@ -39,8 +40,6 @@ import { ensureManagedEdgeProxy } from "../../../lib/managed-edge-proxy";
 import * as sessionManager from "../session-manager";
 import { resolveServicePort } from "./domain-helpers";
 import { serviceKind } from "./project-services";
-
-// ─── Types ───────────────────────────────────────────────────────────────────
 
 export interface ComposeDeployResult {
   status: "ready" | "failed";
@@ -64,9 +63,6 @@ export interface ComposeDeployResult {
   publicUrl?: string;
 }
 
-// ─── Helpers ─────────────────────────────────────────────────────────────────
-
-/** Topological sort of services by dependsOn - respects dependency order. */
 function topoSort(services: Service[]): Service[] {
   const byName = new Map(services.map((s) => [s.name, s]));
   const sorted: Service[] = [];
@@ -172,6 +168,7 @@ function createServiceRuntimeConfig(opts: {
     ports: (service.ports as string[]) ?? [],
     environment,
     volumes: (service.volumes as string[]) ?? [],
+    namespaceVolumes: service.namespaceVolumes,
     command: runtimeCommand,
     restart: service.restart ?? "unless-stopped",
     advanced: service.advanced ?? undefined,
@@ -272,8 +269,6 @@ async function prepareServiceRoute(opts: {
   return route;
 }
 
-// ─── Main compose deploy function ────────────────────────────────────────────
-
 /**
  * Deploy all services for a compose project.
  * Called from the compose pipeline after the build phase.
@@ -290,8 +285,13 @@ export async function deployComposeServices(
     buildSessionId?: string;
     routing?: RoutingProvider;
     ssl?: SslProvider;
+    system?: SystemManager | null;
     usesManagedRouting?: boolean;
     serverId?: string;
+    /** Smart (partial) redeploy: recreate ONLY these services; leave the
+     *  rest running and carry their previous runtime row forward. Undefined
+     *  = full deploy (recreate every enabled service). */
+    targetServiceIds?: Set<string>;
     routeOptions?: RouteRegistrationOptions;
   },
 ): Promise<ComposeDeployResult> {
@@ -315,13 +315,11 @@ export async function deployComposeServices(
     };
   }
 
-  // Sort by dependency order
   const ordered = topoSort(enabled);
 
   logger.step("deploy", "running", `Deploying ${ordered.length} services...`);
   logger.log("Preparing shared service group for project services...\n");
 
-  // 1. Ensure shared runtime group (Docker network or cloud service group)
   const group = await runtime.ensureServiceGroup({
     deploymentId: dep.id,
     projectId: project.id,
@@ -330,13 +328,43 @@ export async function deployComposeServices(
   });
   logger.log(`Service group ready for ${project.slug}.\n`);
 
-  // 2. Load project-level env vars (shared across services)
+  // Ensure the server has the components this deploy needs — ONCE, before the
+  // fan-out — mirroring the single-app deploy preflight (build-pipeline.ts
+  // buildDeployEnvironment). Compose previously ensured nothing here, so on a
+  // fresh box the first exposed service would register routes / provision certs
+  // against an openresty/certbot that were never installed. Each ensureFeature
+  // is serialized per server by the injected provision lock. (No per-service
+  // host-port check: compose services are reached through openresty by hostname,
+  // not by binding host ports the way a bare process does.)
+  if (opts?.system) {
+    const systemLog = (entry: { message: string; level: "info" | "warn" | "error" }) => {
+      logger.log(`${entry.message}\n`, entry.level);
+    };
+    const plannedRoutes = enabled
+      .map((svc) =>
+        buildServiceRouteDomain({
+          project,
+          service: svc,
+          runtimeName: runtime.name,
+          usesManagedRouting: opts.usesManagedRouting ?? false,
+        }),
+      )
+      .filter((route): route is PlannedRouteDomain => route !== null);
+
+    await opts.system.ensureFeature("deploy", systemLog);
+    if (plannedRoutes.length > 0) {
+      await opts.system.ensureFeature("routing", systemLog);
+    }
+    if (plannedRoutes.some((route) => route.provisionSsl)) {
+      await opts.system.ensureFeature("ssl", systemLog);
+    }
+  }
+
   const projectEnvMap = await repos.project.getEnvMap(project.id, dep.environment);
   const decryptedProjectEnv = decryptEnvMap(projectEnvMap, (key) => {
     logger.log(`Warning: failed to decrypt project env var "${key}", skipping.\n`, "warn");
   });
 
-  // 3. Decrypt deployment-level env var overrides
   const depEnvVars = dep.envVars as Record<string, string> | null;
   const depEnv = depEnvVars
     ? decryptEnvMap(depEnvVars, (key) => {
@@ -351,6 +379,41 @@ export async function deployComposeServices(
     : [];
   const previousByServiceId = new Map(previousServiceDeps.map((row) => [row.serviceId, row]));
   const enabledServiceIds = new Set(enabled.map((svc) => svc.id));
+
+  // Full/forceAll deploy (no explicit target subset) churn-avoidance: an
+  // image-only (external) service that hasn't changed since the active
+  // deployment has nothing to rebuild — recreating it just bounces a DB (brief
+  // downtime + re-pull) for no reason. Carry those forward too, using the SAME
+  // "changed since the active deployment" anchor as the smart-route env-dirty
+  // check (active.createdAt): a changed image/config (svc.updatedAt) or env
+  // (env_var updatedAt) after the anchor → recreate; otherwise keep it running.
+  const carryAnchorDep = project.activeDeploymentId
+    ? await repos.deployment.findById(project.activeDeploymentId).catch(() => null)
+    : null;
+  const carryAnchor = carryAnchorDep?.createdAt ?? null;
+  const carryEnvMeta = carryAnchor
+    ? await repos.project.listEnvVarChangeMeta(project.id, dep.environment).catch(() => [])
+    : [];
+  const carryProjectEnvChanged = carryEnvMeta.some(
+    (m) => m.serviceId === null && carryAnchor !== null && m.updatedAt > carryAnchor,
+  );
+  const carryEnvChangedServiceIds = new Set(
+    carryEnvMeta
+      .filter((m) => m.serviceId !== null && carryAnchor !== null && m.updatedAt > carryAnchor)
+      .map((m) => m.serviceId as string),
+  );
+  const isExternalUnchanged = (svc: Service): boolean => {
+    if (opts?.targetServiceIds) return false; // smart subset already carries non-targets forward
+    if (!carryAnchor) return false; // never deployed → deploy it
+    if (svc.build || !svc.image) return false; // must be image-only (external); buildables always rebuild
+    if (svc.updatedAt > carryAnchor) return false; // image/command/ports/volumes/… changed
+    if (carryProjectEnvChanged || carryEnvChangedServiceIds.has(svc.id)) return false; // env changed
+    const prev = previousByServiceId.get(svc.id);
+    if (!prev?.containerId) return false; // nothing running to carry
+    if (prev.imageRef && prev.imageRef !== svc.image) return false; // image tag changed
+    return true;
+  };
+
   let routeContext: ServiceRouteContext | undefined;
   if (opts?.routing && opts.ssl && typeof opts.usesManagedRouting === "boolean") {
     const projectDomains = await repos.domain.listByProject(project.id);
@@ -368,7 +431,6 @@ export async function deployComposeServices(
     };
   }
 
-  // 5. Deploy each service
   const results: ComposeDeployResult["services"] = [];
   let successful = 0;
   let firstPublicUrl: string | undefined;
@@ -378,6 +440,75 @@ export async function deployComposeServices(
   for (const svc of ordered) {
     // Ownership guard - ensure this service actually belongs to the project
     if (svc.projectId !== project.id) continue;
+
+    // Leave a service running exactly as-is (carry its previous runtime row
+    // forward under THIS deployment id) instead of recreating it, in two cases:
+    //   1. Smart (partial) redeploy — it's not in the target subset.
+    //   2. Full/forceAll deploy — it's an unchanged image-only external (isExternalUnchanged).
+    // Either way we don't rebuild, recreate, or re-register its route (register
+    // is additive; nothing tears it down); it stays in `enabledServiceIds` (so
+    // the de-listed reaper won't kill it) and out of `unavailableServiceNames`
+    // (so dependents aren't blocked). The liveness check below still redeploys
+    // it if its container turns out to be gone.
+    const carried =
+      (opts?.targetServiceIds && !opts.targetServiceIds.has(svc.id)) || isExternalUnchanged(svc)
+        ? previousByServiceId.get(svc.id)
+        : undefined;
+    if (carried?.containerId) {
+      // Only carry a service forward if its container is ACTUALLY running.
+      // A prior rollback / partial deploy / external `docker rm` could have
+      // left the row pointing at a gone or stopped container — carrying that
+      // forward would advertise a dead upstream (502) and show it "running".
+      // Verify liveness; if it's not up, fall through and redeploy it (from
+      // its previous image via the fallback below). When the runtime can't
+      // report container status, trust the row (best-effort, prior behavior).
+      const live = runtime.supports("containerInfo")
+        ? await runtime.getContainerInfo(carried.containerId).catch(() => null)
+        : undefined;
+      const alive = live === undefined || live?.status === "running";
+      if (alive) {
+        // A network reconnect may have re-assigned the container's IP, so
+        // prefer the live values over the stored row when we have them.
+        const carriedIp = live?.ip ?? carried.ip ?? null;
+        const carriedHostPort = live?.hostPort ?? carried.hostPort ?? null;
+        await repos.service.upsertServiceDeployment({
+          deploymentId: dep.id,
+          serviceId: svc.id,
+          serviceName: svc.name,
+          containerId: carried.containerId,
+          status: carried.status,
+          imageRef: carried.imageRef ?? null,
+          hostPort: carriedHostPort,
+          ip: carriedIp,
+        });
+        results.push({
+          serviceId: svc.id,
+          serviceName: svc.name,
+          containerId: carried.containerId,
+          status: carried.status,
+          ip: carriedIp ?? undefined,
+          hostPort: carriedHostPort ?? undefined,
+        });
+        successful += 1;
+        sessionManager.broadcastServiceStatus(dep.id, {
+          serviceName: svc.name,
+          serviceId: svc.id,
+          status: "running",
+          containerId: carried.containerId,
+          hostPort: carriedHostPort ?? undefined,
+        });
+        logger.log(`Service "${svc.name}" unchanged - kept running (carried forward).\n`, "info", {
+          serviceName: svc.name,
+        });
+        continue;
+      }
+      logger.log(
+        `Service "${svc.name}" was expected running but its container is gone - redeploying it.\n`,
+        "warn",
+        { serviceName: svc.name },
+      );
+      // fall through → normal deploy (recreates from the previous image)
+    }
 
     const blockedDependencies = ((svc.dependsOn as string[]) ?? []).filter((dependency) =>
       unavailableServiceNames.has(dependency),
@@ -409,7 +540,6 @@ export async function deployComposeServices(
       continue;
     }
 
-    // Load service-specific env vars
     const serviceEnvMap = await repos.project.getEnvMap(project.id, dep.environment, svc.id);
     const decryptedServiceEnv = decryptEnvMap(serviceEnvMap, (key) => {
       logger.log(
@@ -457,7 +587,15 @@ export async function deployComposeServices(
       continue;
     }
 
-    const image = opts?.builtImages?.get(svc.id) ?? svc.image ?? "";
+    // Prefer a freshly-built image; else the service's configured image
+    // (pulled/external); else — for an env-only REFRESH (recreated but not
+    // rebuilt) — reuse the previous deployment's image so the container comes
+    // back with fresh env and no build.
+    const image =
+      opts?.builtImages?.get(svc.id) ??
+      svc.image ??
+      previousByServiceId.get(svc.id)?.imageRef ??
+      "";
     if (!image) {
       const message = `No image available for service "${svc.name}"`;
       logger.log(`${message}\n`, "error", { serviceName: svc.name });
@@ -627,7 +765,6 @@ export async function deployComposeServices(
         status: "running",
       };
 
-      // Record service deployment
       await repos.service.createServiceDeployment({
         deploymentId: dep.id,
         serviceId: svc.id,

@@ -1,103 +1,264 @@
 "use client";
 
 /**
- * DNS tab - reference of the records this mail server expects.
+ * DNS tab - per-domain reference of the records this mail server expects,
+ * plus a live "are they published?" check.
  *
- * Read-only. The install wizard's banner is the right place to *set*
- * records; this tab is for audits and re-checks. The Health tab has the
- * live "are these actually published?" scan.
- *
- * Layout:
- *   - Page header (h2 + sub) - matches Domains/Mailboxes tab style.
- *   - Card with the records list, rendered via the shared
- *     DnsRecordsView in 2-column grid mode so it doesn't push the page
- *     beyond the visible viewport.
+ * A mail server can host multiple domains, so the tab is scoped by a domain
+ * picker:
+ *   - primary install domain → records come from the install-time
+ *     `status.dnsRecords` (A/AAAA/MX/SPF/DKIM/DMARC).
+ *   - additional domains      → records come from
+ *     `mailAdminApi.domains.getDns` (MX/SPF/DKIM?/DMARC).
+ * The verification scan runs on demand against the selected domain.
  */
 
-import Link from "next/link";
-import { FileText, Activity, ArrowRight } from "lucide-react";
-import type { DnsRecords, MailSetupStatus } from "@/lib/api";
+import { useCallback, useEffect, useState } from "react";
+import {
+  FileText,
+  Globe,
+  Loader2,
+  RefreshCcw,
+  ShieldCheck,
+  Check,
+  AlertTriangle,
+  CircleX,
+  CircleDashed,
+} from "lucide-react";
+import {
+  mailAdminApi,
+  getApiErrorMessage,
+  type AdminDomain,
+  type DnsCheck,
+  type DnsCheckStatus,
+  type DnsRecords,
+  type DnsScanResult,
+  type MailSetupStatus,
+} from "@/lib/api";
 import { DnsRecordsView } from "@/components/shared/DnsRecordsView";
 import { SectionCard } from "./_shared/section-card";
 
 interface DnsTabProps {
   status: MailSetupStatus;
+  serverId: string;
+  primaryDomain: string;
+  selectedDomain: string;
+  onSelectDomain: (domain: string) => void;
 }
 
-export function DnsTab({ status }: DnsTabProps) {
-  const domain = status.domain ?? "";
+export function DnsTab({
+  status,
+  serverId,
+  primaryDomain,
+  selectedDomain,
+  onSelectDomain,
+}: DnsTabProps) {
+  const activeDomain = selectedDomain || primaryDomain;
+  const isPrimary = activeDomain === primaryDomain;
 
-  if (!status.dnsRecords || !domain) {
-    return (
-      <div className="space-y-5">
-        <Header />
-        <div className="bg-card rounded-2xl border border-border/50 py-16 px-6 text-center">
-          <div className="mx-auto w-16 h-16 rounded-full bg-muted/60 flex items-center justify-center mb-5">
-            <FileText
-              className="size-7 text-muted-foreground/60"
-              strokeWidth={1.5}
-            />
-          </div>
-          <h3
-            className="text-lg font-medium text-foreground/80 mb-2"
-            style={{ letterSpacing: "-0.2px" }}
-          >
-            No DNS records on file
-          </h3>
-          <p className="text-sm text-muted-foreground max-w-md mx-auto leading-relaxed">
-            The install wizard generates DNS records during the DKIM step. If
-            this server's setup is incomplete, finish the wizard to populate
-            this view.
-          </p>
-        </div>
-      </div>
-    );
-  }
+  const [domains, setDomains] = useState<AdminDomain[]>([]);
+  const [loadingDomains, setLoadingDomains] = useState(true);
+
+  useEffect(() => {
+    let cancelled = false;
+    setLoadingDomains(true);
+    mailAdminApi.domains
+      .list(serverId)
+      .then((res) => {
+        if (cancelled) return;
+        setDomains(res.domains);
+        // URL points at a domain that no longer exists → fall back to primary.
+        if (
+          selectedDomain &&
+          selectedDomain !== primaryDomain &&
+          !res.domains.some((d) => d.domain === selectedDomain)
+        ) {
+          onSelectDomain(primaryDomain);
+        }
+      })
+      .catch(() => {})
+      .finally(() => {
+        if (!cancelled) setLoadingDomains(false);
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [serverId, selectedDomain, primaryDomain, onSelectDomain]);
+
+  // ── Records for the active domain ──
+  const [records, setRecords] = useState<DnsRecords | null>(null);
+  const [recordsLoading, setRecordsLoading] = useState(false);
+  const [recordsMsg, setRecordsMsg] = useState<string | null>(null);
+
+  useEffect(() => {
+    let cancelled = false;
+    setRecordsMsg(null);
+    if (!activeDomain) {
+      setRecords(null);
+      return;
+    }
+    if (isPrimary) {
+      setRecords((status.dnsRecords as unknown as DnsRecords) ?? null);
+      return;
+    }
+    setRecordsLoading(true);
+    mailAdminApi.domains
+      .getDns(serverId, activeDomain)
+      .then((res) => {
+        if (!cancelled) setRecords(res.records as unknown as DnsRecords);
+      })
+      .catch(() => {
+        // 404 = no records generated for this domain → empty, not an error.
+        if (!cancelled) {
+          setRecords(null);
+          setRecordsMsg(`No DNS records on file for ${activeDomain}.`);
+        }
+      })
+      .finally(() => {
+        if (!cancelled) setRecordsLoading(false);
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [serverId, activeDomain, isPrimary, status.dnsRecords]);
+
+  // ── On-demand verification scan ──
+  const [scan, setScan] = useState<DnsScanResult | null>(null);
+  const [scanning, setScanning] = useState(false);
+  const [scanErr, setScanErr] = useState<string | null>(null);
+
+  useEffect(() => {
+    setScan(null);
+    setScanErr(null);
+  }, [activeDomain]);
+
+  const runScan = useCallback(async () => {
+    if (!activeDomain) return;
+    setScanning(true);
+    setScanErr(null);
+    try {
+      setScan(await mailAdminApi.dns.scan(serverId, activeDomain));
+    } catch (err) {
+      setScanErr(getApiErrorMessage(err, "DNS scan failed"));
+    } finally {
+      setScanning(false);
+    }
+  }, [serverId, activeDomain]);
 
   return (
     <div className="space-y-5">
       <Header />
 
+      {/* Domain picker */}
+      <div className="flex items-center gap-2 flex-wrap">
+        <span className="text-sm text-muted-foreground">Domain</span>
+        {loadingDomains ? (
+          <div className="px-3 py-2 rounded-xl border border-border bg-muted/30 flex items-center gap-2">
+            <Loader2 className="size-3.5 animate-spin text-muted-foreground" />
+            <span className="text-sm text-muted-foreground">Loading…</span>
+          </div>
+        ) : (
+          <select
+            value={activeDomain}
+            onChange={(e) => onSelectDomain(e.target.value)}
+            className="px-3 py-2 text-sm rounded-xl border border-border bg-background text-foreground focus:outline-none focus:ring-2 focus:ring-primary/40 transition-colors min-w-[200px]"
+          >
+            {domains.length === 0 && primaryDomain && (
+              <option value={primaryDomain}>{primaryDomain}</option>
+            )}
+            {domains.map((d) => (
+              <option key={d.domain} value={d.domain}>
+                {d.domain}
+              </option>
+            ))}
+          </select>
+        )}
+        {isPrimary && (
+          <span className="text-xs text-muted-foreground/70">primary</span>
+        )}
+      </div>
+
+      {/* Records for publishing */}
       <SectionCard
         title="Records for publishing"
-        description={`Publish these at your DNS provider for ${domain}.`}
+        description={`Publish these at your DNS provider for ${activeDomain}.`}
         icon={FileText}
         density="split"
       >
-        <div className="p-5">
-          <DnsRecordsView
-            records={status.dnsRecords as unknown as DnsRecords}
-            domain={domain}
-            columns={2}
-          />
-        </div>
+        {recordsLoading ? (
+          <div className="p-8 flex items-center justify-center">
+            <Loader2 className="size-5 animate-spin text-muted-foreground" />
+          </div>
+        ) : records ? (
+          <div className="p-5">
+            <DnsRecordsView records={records} domain={activeDomain} columns={2} />
+          </div>
+        ) : (
+          <div className="px-5 py-10 text-center">
+            <Globe
+              className="size-7 text-muted-foreground/60 mx-auto mb-3"
+              strokeWidth={1.5}
+            />
+            <p className="text-sm text-muted-foreground max-w-md mx-auto leading-relaxed">
+              {recordsMsg ??
+                "The install wizard generates records during the DKIM step; additional domains get theirs when added."}
+            </p>
+          </div>
+        )}
       </SectionCard>
 
-      <Link
-        href="?tab=health"
-        replace
-        scroll={false}
-        className="flex items-center justify-between gap-4 p-5 rounded-2xl border border-border/50 bg-card hover:bg-muted/30 hover:border-border transition-colors group"
+      {/* Published-records verification */}
+      <SectionCard
+        title="Published records check"
+        description={`Live public-DNS lookup for ${activeDomain}, compared to the records above.`}
+        icon={ShieldCheck}
+        density="split"
+        action={
+          <button
+            onClick={runScan}
+            disabled={scanning || !activeDomain}
+            className="inline-flex items-center gap-1.5 px-3 py-1.5 text-xs font-medium rounded-lg bg-muted text-foreground hover:bg-muted/80 border border-border transition-colors disabled:opacity-50"
+          >
+            <RefreshCcw className={`size-3 ${scanning ? "animate-spin" : ""}`} />
+            {scan ? "Rescan" : "Verify"}
+          </button>
+        }
       >
-        <div className="flex items-start gap-3 min-w-0">
-          <div className="w-10 h-10 rounded-xl bg-muted flex items-center justify-center shrink-0">
-            <Activity
-              className="size-5 text-muted-foreground"
-              strokeWidth={2}
+        {scanErr && (
+          <div className="px-5 py-3 text-sm text-red-600 dark:text-red-400 border-b border-border/40 bg-red-500/5">
+            {scanErr}
+          </div>
+        )}
+        {scanning && scan === null ? (
+          <div className="px-5 py-10 flex items-center justify-center">
+            <Loader2 className="size-5 animate-spin text-muted-foreground" />
+          </div>
+        ) : scan === null ? (
+          <div className="px-5 py-10 text-center">
+            <p className="text-sm text-muted-foreground">
+              Run a live DNS lookup for{" "}
+              <span className="font-medium text-foreground">{activeDomain}</span>{" "}
+              and compare it to the records above.
+            </p>
+          </div>
+        ) : scan.checks.length === 0 ? (
+          <div className="px-5 py-10 text-center">
+            <Globe
+              className="size-7 text-muted-foreground/60 mx-auto mb-3"
+              strokeWidth={1.5}
             />
-          </div>
-          <div className="min-w-0">
-            <p className="text-sm font-semibold text-foreground">
-              Verify these are actually published
-            </p>
-            <p className="text-sm text-muted-foreground mt-0.5 leading-relaxed">
-              Run a live DNS lookup against your domain and compare it to the
-              records above. Lives in the Health tab.
+            <p className="text-sm text-muted-foreground">
+              No records on file for {activeDomain} to verify.
             </p>
           </div>
-        </div>
-        <ArrowRight className="size-4 text-muted-foreground/50 group-hover:text-muted-foreground transition-colors shrink-0" />
-      </Link>
+        ) : (
+          <div className="divide-y divide-border/40">
+            {scan.checks.map((c) => (
+              <DnsCheckRow key={c.key} check={c} />
+            ))}
+          </div>
+        )}
+      </SectionCard>
     </div>
   );
 }
@@ -107,10 +268,114 @@ function Header() {
     <div>
       <h2 className="text-lg font-semibold text-foreground">DNS records</h2>
       <p className="text-sm text-muted-foreground mt-0.5 max-w-2xl">
-        The records that need to exist at your DNS provider for mail
-        delivery. Reference copy - for "is this actually live?", use the
-        Health tab's DNS scan.
+        The records each domain needs at your DNS provider for mail delivery.
+        Pick a domain to view its records and verify they&apos;re published.
       </p>
     </div>
   );
+}
+
+// ─── Verification row ──────────────────────────────────────────────────────
+
+function DnsCheckRow({ check }: { check: DnsCheck }) {
+  const pres = presentation(check.status);
+  const showExpectedActual =
+    (check.status === "warn" || check.status === "fail") && check.expected;
+  return (
+    <div className="flex items-start gap-4 px-5 py-4">
+      <div
+        className={`w-10 h-10 rounded-xl flex items-center justify-center shrink-0 ${pres.iconBg}`}
+      >
+        <pres.Icon className={`size-5 ${pres.iconColor}`} strokeWidth={2} />
+      </div>
+      <div className="min-w-0 flex-1">
+        <div className="flex items-center gap-2 flex-wrap">
+          <p className="text-sm font-medium text-foreground">{check.label}</p>
+          <span className="font-mono text-[11px] text-muted-foreground/80">
+            {check.recordType} · {check.queriedName}
+          </span>
+        </div>
+        <p className="text-xs text-muted-foreground mt-1 leading-relaxed">
+          {check.message}
+        </p>
+        {showExpectedActual && (
+          <div className="mt-2 grid grid-cols-1 sm:grid-cols-2 gap-2 text-[11.5px]">
+            <KV label="Expected" value={check.expected} />
+            <KV
+              label="Actual"
+              value={check.actual || "(no record)"}
+              muted={!check.actual}
+            />
+          </div>
+        )}
+      </div>
+      <span
+        className={`inline-flex items-center gap-1.5 rounded-full px-2.5 py-1 text-[11px] font-semibold shrink-0 ${pres.pill}`}
+      >
+        {pres.label}
+      </span>
+    </div>
+  );
+}
+
+function KV({
+  label,
+  value,
+  muted,
+}: {
+  label: string;
+  value: string;
+  muted?: boolean;
+}) {
+  return (
+    <div className="rounded-lg border border-border/50 bg-muted/30 px-2.5 py-1.5 min-w-0">
+      <p className="text-[10px] uppercase tracking-wide font-medium text-muted-foreground mb-0.5">
+        {label}
+      </p>
+      <p
+        className={`font-mono break-all ${
+          muted ? "text-muted-foreground/70 italic" : "text-foreground"
+        }`}
+      >
+        {value}
+      </p>
+    </div>
+  );
+}
+
+function presentation(status: DnsCheckStatus) {
+  switch (status) {
+    case "pass":
+      return {
+        Icon: Check,
+        iconBg: "bg-emerald-500/10",
+        iconColor: "text-emerald-600 dark:text-emerald-400",
+        pill: "bg-emerald-500/10 text-emerald-600 dark:text-emerald-400",
+        label: "Pass",
+      };
+    case "warn":
+      return {
+        Icon: AlertTriangle,
+        iconBg: "bg-amber-500/10",
+        iconColor: "text-amber-600 dark:text-amber-400",
+        pill: "bg-amber-500/10 text-amber-600 dark:text-amber-400",
+        label: "Warning",
+      };
+    case "fail":
+      return {
+        Icon: CircleX,
+        iconBg: "bg-red-500/10",
+        iconColor: "text-red-600 dark:text-red-400",
+        pill: "bg-red-500/10 text-red-600 dark:text-red-400",
+        label: "Fail",
+      };
+    default:
+      return {
+        Icon: CircleDashed,
+        iconBg: "bg-muted",
+        iconColor: "text-muted-foreground",
+        pill: "bg-muted text-muted-foreground",
+        label: "Unknown",
+      };
+  }
 }

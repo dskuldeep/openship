@@ -38,7 +38,7 @@ import {
   type ServiceHandle,
 } from "@repo/adapters";
 import { Readable } from "node:stream";
-import { resolveDeploymentPlatform } from "../../lib/deployment-runtime";
+import { resolveDeploymentPlatform, resolveTargetPlatform } from "../../lib/deployment-runtime";
 import { decryptEnvMap } from "../../lib/encryption";
 import { notification } from "../../lib/notification-dispatcher";
 import crypto from "node:crypto";
@@ -54,6 +54,23 @@ export interface RunBackupInput {
    *  the payload kind + hooks. */
   policyId: string;
   trigger: BackupTrigger;
+}
+
+/** Source-agnostic context the shared upload/manifest pipeline needs,
+ *  produced by resolving either a project service or a mail server. */
+interface RunContext {
+  projectSlug: string;
+  projectName: string;
+  serviceName: string;
+  manifest: {
+    projectId: string;
+    serviceId: string;
+    serviceName: string;
+    serviceImage: string | null;
+    ports: string[];
+    command: string | null;
+    environmentKeys: string[];
+  };
 }
 
 export class BackupOrchestrator {
@@ -82,8 +99,11 @@ export class BackupOrchestrator {
     // Derive the org scope from the policy's project first, fall back
     // to the destination's org. Both should agree (ownership-aligned);
     // the explicit fallback keeps cron/webhook triggers working when
-    // a destination has a NULL organizationId.
-    const policyProject = await repos.project.findById(policy.projectId);
+    // a destination has a NULL organizationId. Mail-server policies have
+    // no project, so they always fall through to the destination's org.
+    const policyProject = policy.projectId
+      ? await repos.project.findById(policy.projectId)
+      : null;
     const organizationId =
       policyProject?.organizationId ?? destination.organizationId ?? null;
 
@@ -92,8 +112,10 @@ export class BackupOrchestrator {
       id: runId,
       policyId: policy.id,
       destinationId: destination.id,
+      sourceKind: policy.sourceKind,
       projectId: policy.projectId,
       serviceId: policy.serviceId,
+      mailServerId: policy.mailServerId ?? null,
       organizationId,
       status: "queued",
       triggeredBy: input.trigger.source,
@@ -156,67 +178,83 @@ export class BackupOrchestrator {
       const destinationRow = await repos.backupDestination.findById(policy.destinationId);
       if (!destinationRow) throw new Error(`Destination ${policy.destinationId} disappeared`);
 
-      // serviceId NULL on policy means "project default" — Chunk 1 only
-      // supports per-service backups, so a NULL serviceId on the policy
-      // means: pick the first service in the project (Chunk 2 expands
-      // this to a fan-out across all enabled services).
-      if (!policy.serviceId) {
-        throw new Error(
-          "Project-default backup policies aren't executable in Chunk 1. " +
-            "Create a per-service policy or wait for Chunk 2.",
-        );
-      }
-      const serviceRow = await repos.service.findById(policy.serviceId);
-      if (!serviceRow) throw new Error(`Service ${policy.serviceId} disappeared`);
-
-      const project = await repos.project.findById(serviceRow.projectId);
-      if (!project) throw new Error(`Project ${serviceRow.projectId} disappeared`);
-
-      // Defense-in-depth: project and destination must belong to the
-      // same organization. The controller allow-lists PATCH fields to
-      // prevent mass-assignment, but a future bug or a hand-written DB
-      // row could still misalign these. Refuse to back up across orgs.
-      if (project.organizationId !== destinationRow.organizationId) {
-        throw new Error(
-          `Org mismatch — refusing to run: project.org=${project.organizationId}, destination.org=${destinationRow.organizationId}`,
-        );
-      }
-      // Also: if the service's project doesn't match the policy's project,
-      // someone has tampered with serviceId. Refuse.
-      if (serviceRow.projectId !== policy.projectId) {
-        throw new Error(
-          `Service ${serviceRow.id} does not belong to policy's project ${policy.projectId}`,
-        );
-      }
-
-      // 2. Materialize the ServiceHandle. Decrypt env vars at the
-      //    boundary; producers use plaintext to invoke pg_dump etc.
-      serviceHandle = await this.buildServiceHandle(serviceRow);
-
-      // 3. Resolve adapters. toAdapterRow handles openship_server by
-      //    hydrating creds from the user's `servers` row; for all other
-      //    kinds it's a straight passthrough.
+      // 2. Resolve the destination up front (shared by both source kinds).
+      //    toAdapterRow handles openship_server by hydrating creds from the
+      //    user's `servers` row; other kinds are a straight passthrough.
       const adapterRow = await toAdapterRow(destinationRow);
       const destination = resolveDestination(adapterRow);
-
       const preflight = await destination.preflight();
       if (!preflight.ok) {
         throw new Error(`Destination preflight failed: ${preflight.reason}`);
       }
       await repos.backupDestination.setLastVerified(destinationRow.id, true);
 
-      // Pull the deployment's snapshot meta so we resolve the same
-      // runtime the service is actually running on (local Docker vs.
-      // remote SSH vs. cloud). When no active deployment exists yet,
-      // resolveDeploymentPlatform falls back to the host platform.
-      const activeDeployment = project.activeDeploymentId
-        ? await repos.deployment.findById(project.activeDeploymentId)
-        : null;
-      const platform = await resolveDeploymentPlatform(
-        (activeDeployment?.meta ?? {}) as Parameters<typeof resolveDeploymentPlatform>[0],
-        { organizationId: destinationRow.organizationId },
-      );
-      executor = resolveExecutor(platform.platform.runtime.name, platform.platform.runtime);
+      // 3. Materialize the SOURCE — a deployed project service, or a bare
+      //    mail server. Both yield an opaque ServiceHandle + an executor +
+      //    the key/manifest metadata the shared pipeline below needs.
+      let ctx: RunContext;
+      if (policy.sourceKind === "mail_server") {
+        if (!policy.mailServerId) throw new Error("mail_server policy has no mailServerId");
+        const built = await this.buildMailSource(
+          policy.mailServerId,
+          destinationRow.organizationId,
+        );
+        serviceHandle = built.handle;
+        executor = built.executor;
+        ctx = built.ctx;
+      } else {
+        if (!policy.serviceId) {
+          throw new Error(
+            "Project-default backup policies aren't executable yet. " +
+              "Create a per-service policy.",
+          );
+        }
+        const serviceRow = await repos.service.findById(policy.serviceId);
+        if (!serviceRow) throw new Error(`Service ${policy.serviceId} disappeared`);
+
+        const project = await repos.project.findById(serviceRow.projectId);
+        if (!project) throw new Error(`Project ${serviceRow.projectId} disappeared`);
+
+        // Defense-in-depth: project + destination must be in the same org.
+        if (project.organizationId !== destinationRow.organizationId) {
+          throw new Error(
+            `Org mismatch — refusing to run: project.org=${project.organizationId}, destination.org=${destinationRow.organizationId}`,
+          );
+        }
+        if (serviceRow.projectId !== policy.projectId) {
+          throw new Error(
+            `Service ${serviceRow.id} does not belong to policy's project ${policy.projectId}`,
+          );
+        }
+
+        serviceHandle = await this.buildServiceHandle(serviceRow);
+
+        const activeDeployment = project.activeDeploymentId
+          ? await repos.deployment.findById(project.activeDeploymentId)
+          : null;
+        const platform = await resolveDeploymentPlatform(
+          (activeDeployment?.meta ?? {}) as Parameters<typeof resolveDeploymentPlatform>[0],
+          { organizationId: destinationRow.organizationId },
+        );
+        executor = resolveExecutor(platform.platform.runtime.name, platform.platform.runtime);
+
+        ctx = {
+          projectSlug: project.slug,
+          projectName: project.name,
+          serviceName: serviceRow.name,
+          manifest: {
+            projectId: project.id,
+            serviceId: serviceRow.id,
+            serviceName: serviceRow.name,
+            serviceImage: serviceRow.image,
+            ports: (serviceRow.ports as string[] | null) ?? [],
+            command: serviceRow.command,
+            environmentKeys: Object.keys(
+              (serviceRow.environment as Record<string, string> | null) ?? {},
+            ),
+          },
+        };
+      }
 
       const producer =
         policy.payloadKind === "auto"
@@ -234,8 +272,8 @@ export class BackupOrchestrator {
 
       const baseKey = {
         pathPrefix: destinationRow.pathPrefix,
-        projectSlug: project.slug,
-        serviceName: serviceRow.name,
+        projectSlug: ctx.projectSlug,
+        serviceName: ctx.serviceName,
         runId,
       };
       const keyPrefix = runPrefix(baseKey);
@@ -276,21 +314,19 @@ export class BackupOrchestrator {
       await this.transition(runId, "verifying");
       const manifest = buildManifest({
         runId,
-        projectId: project.id,
-        projectSlug: project.slug,
-        serviceId: serviceRow.id,
-        serviceName: serviceRow.name,
-        serviceImage: serviceRow.image,
+        projectId: ctx.manifest.projectId,
+        projectSlug: ctx.projectSlug,
+        serviceId: ctx.manifest.serviceId,
+        serviceName: ctx.manifest.serviceName,
+        serviceImage: ctx.manifest.serviceImage,
         capturedAt: new Date(),
         artifacts: artifactsRecorded,
         envVarKeys: Object.keys(serviceHandle.env),
         serviceConfig: {
-          image: serviceRow.image,
-          ports: (serviceRow.ports as string[] | null) ?? [],
-          command: serviceRow.command,
-          environmentKeys: Object.keys(
-            (serviceRow.environment as Record<string, string> | null) ?? {},
-          ),
+          image: ctx.manifest.serviceImage,
+          ports: ctx.manifest.ports,
+          command: ctx.manifest.command,
+          environmentKeys: ctx.manifest.environmentKeys,
         },
       });
       const manifestK = manifestKey(baseKey);
@@ -331,8 +367,8 @@ export class BackupOrchestrator {
         resourceType: "backup_run",
         resourceId: runId,
         payload: {
-          projectName: project.name,
-          serviceName: serviceRow.name,
+          projectName: ctx.projectName,
+          serviceName: ctx.serviceName,
           destinationName: destinationRow.name,
           bytesTransferred: totalBytes,
           artifactCount: artifactsRecorded.length,
@@ -475,6 +511,65 @@ export class BackupOrchestrator {
     }
   }
 
+  /**
+   * Materialize a mail server as a backup source. A mail server is a bare
+   * SSH host (no project/service), so we build a synthetic ServiceHandle
+   * from the `mail_servers` + `servers` rows and resolve the `bare`
+   * executor bound to that server. resolveTargetPlatform enforces org
+   * membership (throws if the server isn't in the destination's org).
+   */
+  private async buildMailSource(
+    mailServerId: string,
+    destinationOrgId: string,
+  ): Promise<{ handle: ServiceHandle; executor: BackupExecutor; ctx: RunContext }> {
+    const mailRow = await repos.mailServer.get(mailServerId);
+    if (!mailRow) throw new Error(`Mail server ${mailServerId} not found`);
+    const domain = mailRow.domain ?? "mail";
+    const slug = (domain.replace(/[^a-zA-Z0-9.-]/g, "-").toLowerCase() || "mail").slice(0, 63);
+
+    const targetPlatform = await resolveTargetPlatform(
+      "server",
+      "bare",
+      mailServerId,
+      destinationOrgId,
+    );
+    const executor = resolveExecutor(
+      targetPlatform.runtime.name,
+      targetPlatform.runtime,
+    );
+
+    const handle: ServiceHandle = {
+      id: mailServerId,
+      projectId: "",
+      name: "mail",
+      image: null,
+      env: {},
+      volumes: ["/var/vmail"],
+      containerId: null,
+      projectSlug: slug,
+      namespaceVolumes: false,
+    };
+
+    return {
+      handle,
+      executor,
+      ctx: {
+        projectSlug: slug,
+        projectName: domain,
+        serviceName: "mail",
+        manifest: {
+          projectId: mailServerId,
+          serviceId: mailServerId,
+          serviceName: "mail",
+          serviceImage: null,
+          ports: [],
+          command: null,
+          environmentKeys: [],
+        },
+      },
+    };
+  }
+
   private async buildServiceHandle(serviceRow: Service): Promise<ServiceHandle> {
     const project = await repos.project.findById(serviceRow.projectId);
     if (!project) throw new Error(`Project ${serviceRow.projectId} not found`);
@@ -506,6 +601,7 @@ export class BackupOrchestrator {
       volumes: (serviceRow.volumes as string[] | null) ?? [],
       containerId: await this.resolveServiceContainerId(serviceRow),
       projectSlug: project.slug,
+      namespaceVolumes: serviceRow.namespaceVolumes,
     };
   }
 

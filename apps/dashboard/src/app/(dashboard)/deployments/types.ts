@@ -23,7 +23,7 @@ export interface Deployment {
   id: string;
   /** Monotonic per-project version (v1, v2, …). Null for legacy rows. */
   version: number | null;
-  status: "success" | "failed" | "building" | "pending" | "canceled" | "cancelled" | "partial_failure";
+  status: "success" | "failed" | "building" | "pending" | "canceled" | "cancelled" | "partial_failure" | "rejected";
   domain: string;
   framework: string;
   commit: {

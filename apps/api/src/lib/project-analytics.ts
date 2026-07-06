@@ -97,61 +97,16 @@ export async function resolveProjectTracking(projectId: string): Promise<Project
 }
 
 /**
- * Resolve where project request traffic is observed.
- *
- * SaaS and OpenShip Cloud deployments use Oblien edge analytics directly.
- * Self-hosted deployments use the OpenResty management API on the target server.
+ * Map a fixed list of tracked domains to their traffic sources — the shared core
+ * of the single/plural resolvers below. SaaS/OpenShip Cloud deploys observe
+ * traffic at the Oblien edge; self-hosted deploys observe it via the target
+ * server's OpenResty management API. Empty domain list (or no resolvable server)
+ * → no sources.
  */
-export async function resolveProjectTrafficSource(
-  projectId: string,
-): Promise<ProjectTrafficSource | null> {
-  const project = await repos.project.findById(projectId);
-  if (!project) return null;
-
-  // Domain: tracked route rows only
-  const primaryDomain = await repos.domain.getPrimaryByProject(projectId);
-  const hostname = primaryDomain?.hostname ?? null;
-  if (!hostname) return null;
-
-  const domain = normalizeTrackedDomain(hostname);
-
-  let { deployTarget, serverId } = await resolveTrafficRuntime(project);
-
-  if (isOblienBackedDeployment(deployTarget)) {
-    return {
-      kind: "cloud",
-      domain,
-      deployTarget: "cloud",
-    };
-  }
-
-  // Server: deployment meta first, then first configured server
-  if (!serverId) {
-    const servers = await repos.server.list();
-    serverId = servers[0]?.id ?? null;
-  }
-  if (!serverId) return null;
-
-  return {
-    kind: "self-hosted",
-    domain,
-    serverId,
-    deployTarget,
-  };
-}
-
-/**
- * Resolve all domains that should contribute to project-level overview analytics.
- * Normal apps usually have one domain; compose/service apps can have one domain
- * per exposed service, so the overview aggregates them.
- */
-export async function resolveProjectTrafficSources(
-  projectId: string,
+async function buildTrafficSourcesForDomains(
+  project: Project,
+  domains: string[],
 ): Promise<ProjectTrafficSource[]> {
-  const project = await repos.project.findById(projectId);
-  if (!project) return [];
-
-  const domains = await resolveProjectTrackedDomains(project);
   if (domains.length === 0) return [];
 
   let { deployTarget, serverId } = await resolveTrafficRuntime(project);
@@ -164,6 +119,7 @@ export async function resolveProjectTrafficSources(
     }));
   }
 
+  // Server: deployment meta first, then first configured server.
   if (!serverId) {
     const servers = await repos.server.list();
     serverId = servers[0]?.id ?? null;
@@ -176,6 +132,67 @@ export async function resolveProjectTrafficSources(
     serverId,
     deployTarget,
   }));
+}
+
+/**
+ * Resolve where request traffic is observed for ONE of the project's domains: a
+ * validated `domain` override (route switch), else the primary tracked route.
+ */
+export async function resolveProjectTrafficSource(
+  projectId: string,
+  opts?: {
+    /** Restrict traffic to ONE of the project's domains (route switch). Validated
+     *  against the project's tracked domains — an unknown value is ignored and we
+     *  fall back to the primary, so a client can never fetch logs for an arbitrary
+     *  (cross-tenant) host. */
+    domain?: string;
+  },
+): Promise<ProjectTrafficSource | null> {
+  const project = await repos.project.findById(projectId);
+  if (!project) return null;
+
+  // Domain: a validated override (route switch), else the primary tracked route.
+  let domain: string | null = null;
+  const requested = opts?.domain?.trim();
+  if (requested) {
+    const normalized = normalizeTrackedDomain(requested);
+    const tracked = (await resolveProjectTrackedDomains(project)).map(normalizeTrackedDomain);
+    if (tracked.includes(normalized)) domain = normalized;
+  }
+  if (!domain) {
+    const primaryDomain = await repos.domain.getPrimaryByProject(projectId);
+    domain = primaryDomain?.hostname ? normalizeTrackedDomain(primaryDomain.hostname) : null;
+  }
+  if (!domain) return null;
+
+  const [source] = await buildTrafficSourcesForDomains(project, [domain]);
+  return source ?? null;
+}
+
+/**
+ * Resolve all domains that should contribute to project-level overview analytics.
+ * Normal apps usually have one domain; compose/service apps can have one domain
+ * per exposed service, so the overview aggregates them.
+ */
+export async function resolveProjectTrafficSources(
+  projectId: string,
+  opts?: {
+    /** Scope to ONE tracked domain (route switch). Validated + primary fallback,
+     *  identical to resolveProjectTrafficSource, returned as a one-element array.
+     *  Omit to aggregate every tracked domain. */
+    domain?: string;
+  },
+): Promise<ProjectTrafficSource[]> {
+  if (opts?.domain) {
+    const source = await resolveProjectTrafficSource(projectId, { domain: opts.domain });
+    return source ? [source] : [];
+  }
+
+  const project = await repos.project.findById(projectId);
+  if (!project) return [];
+
+  const domains = await resolveProjectTrackedDomains(project);
+  return buildTrafficSourcesForDomains(project, domains);
 }
 
 // ─── OpenResty management API wrappers ───────────────────────────────────────

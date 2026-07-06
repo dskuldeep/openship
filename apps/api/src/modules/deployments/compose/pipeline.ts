@@ -19,6 +19,7 @@ import type {
   MultiServiceRuntimeAdapter,
   RoutingProvider,
   SslProvider,
+  SystemManager,
 } from "@repo/adapters";
 import { BuildLogger } from "@repo/adapters";
 
@@ -31,13 +32,11 @@ import {
   type LifecycleContext,
 } from "../deployment-lifecycle";
 import type { DeployableService } from "../../../lib/deployable-service";
-import { internalApiUrl } from "../../../config";
+import { webhookProxyTarget } from "../../../config";
 
 import { buildComposeImages } from "./build.service";
 import { deployComposeServices } from "./deploy.service";
 import { safeErrorMessage } from "@repo/core";
-
-// ─── Types ───────────────────────────────────────────────────────────────────
 
 export interface ComposePipelineOpts {
   project: Project;
@@ -45,6 +44,10 @@ export interface ComposePipelineOpts {
   runtime: MultiServiceRuntimeAdapter;
   routing: RoutingProvider;
   ssl: SslProvider;
+  /** SystemManager for the target (self-hosted); null for cloud/desktop. Used to
+   *  ensure openresty/certbot/docker once before the service fan-out, matching
+   *  the single-app deploy preflight. */
+  system: SystemManager | null;
   usesManagedRouting: boolean;
   logger: BuildLogger;
   ctx: LifecycleContext;
@@ -54,9 +57,13 @@ export interface ComposePipelineOpts {
   buildResources: ResourceConfig;
   runtimeResources: ResourceConfig;
   gitToken?: string;
+  /** Path to the git-credential relay helper on the build host (desktop relay).
+   *  When set, service clones authenticate through it instead of a token. */
+  gitCredentialHelperPath?: string;
+  /** Clone each service's source on the remote build host instead of cloning on
+   *  the orchestrator and transferring the context. */
+  cloneOnServer?: boolean;
 }
-
-// ─── Main ────────────────────────────────────────────────────────────────────
 
 /**
  * Run the full service pipeline: build service images, then deploy containers.
@@ -71,6 +78,7 @@ export async function executeComposePipeline(opts: ComposePipelineOpts): Promise
     runtime,
     routing,
     ssl,
+    system,
     usesManagedRouting,
     logger,
     ctx,
@@ -80,9 +88,22 @@ export async function executeComposePipeline(opts: ComposePipelineOpts): Promise
     buildResources,
     runtimeResources,
     gitToken,
+    gitCredentialHelperPath,
+    cloneOnServer,
   } = opts;
 
-  // ── Build phase: produce an image for each buildable service ───────
+  // Smart (partial) redeploy: when the snapshot carries a target subset and
+  // this isn't a forceAll deploy, build + recreate ONLY those services and
+  // leave the rest running (carried forward in the deploy step). forceAll or
+  // no subset → undefined → build + deploy everything (unchanged behavior).
+  const targetIds = (snapshot as { targetServiceIds?: string[] }).targetServiceIds;
+  const targetServiceIds =
+    !dep.forceAll && targetIds && targetIds.length > 0 ? new Set(targetIds) : undefined;
+  // Env-only refresh subset: in the target set but recreated WITHOUT a rebuild.
+  const refreshIds = (snapshot as { refreshServiceIds?: string[] }).refreshServiceIds;
+  const refreshServiceIds =
+    !dep.forceAll && refreshIds && refreshIds.length > 0 ? new Set(refreshIds) : undefined;
+
   const composeBuild = await buildComposeImages({
     project,
     dep,
@@ -93,9 +114,12 @@ export async function executeComposePipeline(opts: ComposePipelineOpts): Promise
     buildEnvVars,
     buildResources,
     gitToken,
+    gitCredentialHelperPath,
+    cloneOnServer,
+    targetServiceIds,
+    refreshServiceIds,
   });
 
-  // ── Transition to deploy phase ─────────────────────────────────────
   if (composeBuild.buildFailures.size > 0) {
     logger.log(
       `Build phase completed with ${composeBuild.buildFailures.size} failed service image${composeBuild.buildFailures.size === 1 ? "" : "s"}. Deploying available services...\n`,
@@ -108,7 +132,6 @@ export async function executeComposePipeline(opts: ComposePipelineOpts): Promise
     extra: { buildDurationMs: composeBuild.durationMs },
   });
 
-  // ── Deploy phase: spin up containers on the shared network ─────────
   const composeResult = await deployComposeServices(project, dep, runtime, logger, {
     builtImages: composeBuild.imageRefs,
     buildFailures: composeBuild.buildFailures,
@@ -116,17 +139,18 @@ export async function executeComposePipeline(opts: ComposePipelineOpts): Promise
     buildSessionId,
     routing,
     ssl,
+    system,
     usesManagedRouting,
     serverId: snapshot.serverId,
+    targetServiceIds,
     routeOptions: project.webhookDomain
       ? {
           webhookDomain: project.webhookDomain,
-          webhookProxy: `${internalApiUrl}/api/webhooks/`,
+          webhookProxy: webhookProxyTarget,
         }
       : undefined,
   });
 
-  // ── Lifecycle: success or failure ──────────────────────────────────
   if (composeResult.status === "failed") {
     for (const [serviceId, imageRef] of composeBuild.builtImageRefs) {
       await cleanupBuildArtifact(runtime, imageRef).catch((err) => {

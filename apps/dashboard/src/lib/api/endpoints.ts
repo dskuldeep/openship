@@ -102,6 +102,7 @@ export const endpoints = {
     preview: "domains/preview",
     verify: (id: string) => `domains/${encodeURIComponent(id)}/verify`,
     verifySsl: (id: string) => `domains/${encodeURIComponent(id)}/verify-ssl`,
+    primary: (id: string) => `domains/${encodeURIComponent(id)}/primary`,
   },
 
   /* ---------------------------------------------------------------- */
@@ -119,6 +120,8 @@ export const endpoints = {
     userHome: "github/home",
     orgRepos: (owner: string) => `github/orgs/${owner}/repos`,
     userRepos: "github/repos",
+    cloneToken: (owner: string, repo: string) =>
+      `github/repos/${encodeURIComponent(owner)}/${encodeURIComponent(repo)}/clone-token`,
     status: "github/status",
     connect: "github/connect",
     connectRedirect: "github/connect/redirect",
@@ -205,6 +208,8 @@ export const endpoints = {
     steps: "mail/steps",
     status: "mail/status",
     servers: "mail/servers",
+    forgetServer: (serverId: string) =>
+      `mail/servers/${encodeURIComponent(serverId)}`,
     scan: "mail/scan",
     adopt: "mail/adopt",
     setup: "mail/setup",
@@ -237,6 +242,10 @@ export const endpoints = {
         `mail/admin/${encodeURIComponent(serverId)}/stats`,
       dnsScan: (serverId: string) =>
         `mail/admin/${encodeURIComponent(serverId)}/dns-scan`,
+      backupPolicy: (serverId: string) =>
+        `mail/admin/${encodeURIComponent(serverId)}/backup-policy`,
+      backupRuns: (serverId: string) =>
+        `mail/admin/${encodeURIComponent(serverId)}/backup-runs`,
       testEmail: (serverId: string) =>
         `mail/admin/${encodeURIComponent(serverId)}/test-email`,
       componentAction: (serverId: string, key: string, action: string) =>

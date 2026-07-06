@@ -20,7 +20,7 @@
  *     the service layer calls manager.invalidate() to clear cache
  */
 
-import type { CommandExecutor, LogEntry } from "../types";
+import type { CommandExecutor, LogEntry, ProvisionLock } from "../types";
 import { checkAll, checkComponents, COMPONENT_CHECKS } from "./checks";
 import { COMPONENT_INSTALLERS } from "./installer";
 import {
@@ -95,6 +95,11 @@ export interface SystemManagerOptions {
   stateStore?: SetupStateStore;
   /** Pre-collected installer configuration */
   installerConfig?: InstallerConfig;
+  /**
+   * Serializes the check→install→revalidate section across concurrent deploys
+   * on the same server. Omitted → runs unlocked (single-deploy / tests).
+   */
+  provisionLock?: ProvisionLock;
 }
 
 export class SystemManager {
@@ -105,6 +110,7 @@ export class SystemManager {
   private readonly required: string[];
   private readonly stateStore: SetupStateStore;
   private readonly installerConfig: InstallerConfig;
+  private readonly provisionLock?: ProvisionLock;
 
   /** In-memory cache to avoid even reading from disk/DB on hot paths. */
   private cachedState: SetupState | null = null;
@@ -116,6 +122,7 @@ export class SystemManager {
     this.required = resolveRequired(mode);
     this.stateStore = opts.stateStore ?? new FileStateStore(opts.executor);
     this.installerConfig = opts.installerConfig ?? {};
+    this.provisionLock = opts.provisionLock;
   }
 
   // ── Fast-path state queries (cached) ─────────────────────────────────
@@ -516,34 +523,42 @@ export class SystemManager {
     heading: string,
     errorMessage: (missingNames: string[]) => string,
   ): Promise<void> {
-    const statuses = await checkComponents(this.executor, names);
-    const missing = statuses.filter((status) => !status.healthy);
-    if (missing.length === 0) {
-      await this.updateStateFromChecks(statuses);
-      return;
-    }
+    // The check→install→revalidate below is a check-then-act on server-global
+    // state (apt/dpkg, systemd units, port 80, /etc config, the state file).
+    // Serialize the WHOLE section — including the "already healthy, skip" check —
+    // so concurrent deploys to the same server can't both install or clobber.
+    const critical = async () => {
+      const statuses = await checkComponents(this.executor, names);
+      const missing = statuses.filter((status) => !status.healthy);
+      if (missing.length === 0) {
+        await this.updateStateFromChecks(statuses);
+        return;
+      }
 
-    logFn(info(heading));
-    logFn(info(`Missing: ${missing.map((component) => component.name).join(", ")}`));
+      logFn(info(heading));
+      logFn(info(`Missing: ${missing.map((component) => component.name).join(", ")}`));
 
-    const { failed } = await this.installMany(
-      missing.map((component) => component.name),
-      logFn,
-      installerConfig,
-      true,
-    );
+      const { failed } = await this.installMany(
+        missing.map((component) => component.name),
+        logFn,
+        installerConfig,
+        true,
+      );
 
-    if (failed.length > 0) {
-      throw new Error(failed[0].error ?? `Failed to install ${failed[0].component}`);
-    }
+      if (failed.length > 0) {
+        throw new Error(failed[0].error ?? `Failed to install ${failed[0].component}`);
+      }
 
-    const recheck = await checkComponents(this.executor, names);
-    await this.updateStateFromChecks(recheck);
+      const recheck = await checkComponents(this.executor, names);
+      await this.updateStateFromChecks(recheck);
 
-    const unhealthy = recheck.filter((status) => !status.healthy);
-    if (unhealthy.length > 0) {
-      throw new Error(errorMessage(unhealthy.map((status) => status.name)));
-    }
+      const unhealthy = recheck.filter((status) => !status.healthy);
+      if (unhealthy.length > 0) {
+        throw new Error(errorMessage(unhealthy.map((status) => status.name)));
+      }
+    };
+
+    return this.provisionLock ? this.provisionLock.run(critical) : critical();
   }
 }
 

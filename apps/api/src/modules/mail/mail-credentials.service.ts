@@ -15,7 +15,7 @@
  */
 
 import type { CommandExecutor } from "@repo/adapters";
-import { readState, writeState } from "./mail-state";
+import { readState, mutateState } from "./mail-state";
 
 /**
  * Shell-quote an arbitrary string so it survives as a single argv element
@@ -89,10 +89,9 @@ export async function updatePostmasterPassword(
   // as the mail server's own admin without paging the operator.
   const state = await readState(exec);
   if (state) {
-    const secrets = {
-      ...state.secrets,
-      DOMAIN_ADMIN_PASSWD_PLAIN: newPassword,
-    };
-    await writeState(exec, { ...state, secrets });
+    await mutateState(exec, state.serverId, (s) => ({
+      ...s,
+      secrets: { ...s.secrets, DOMAIN_ADMIN_PASSWD_PLAIN: newPassword },
+    }));
   }
 }

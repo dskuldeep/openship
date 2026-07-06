@@ -19,8 +19,6 @@ import * as sessionManager from "../session-manager";
 import { serviceKind } from "../../../lib/deployable-service";
 import { resolveServicePort } from "./domain-helpers";
 
-// ─── Helpers ─────────────────────────────────────────────────────────────────
-
 function sanitizeComposeImageName(value: string): string {
   return (
     value
@@ -29,9 +27,6 @@ function sanitizeComposeImageName(value: string): string {
       .replace(/^-+|-+$/g, "") || "service"
   );
 }
-
-// Port resolution moved to compose/domain-helpers.ts:resolveServicePort -
-// shared with the deploy pipeline so both stages compute the same number.
 
 /**
  * Resolve a monorepo sub-app's build overrides on top of the project-level
@@ -116,8 +111,6 @@ function resolveSubAppOverrides(opts: SubAppOverrideInputs): {
   };
 }
 
-// ─── Types ───────────────────────────────────────────────────────────────────
-
 export interface ComposeBuildImagesResult {
   imageRefs: Map<string, string>;
   /** Image/workspace refs created during this build phase, excluding image-only services. */
@@ -127,8 +120,6 @@ export interface ComposeBuildImagesResult {
   externalCount: number;
   durationMs: number;
 }
-
-// ─── Main ────────────────────────────────────────────────────────────────────
 
 export async function buildComposeImages(opts: {
   project: Project;
@@ -140,6 +131,17 @@ export async function buildComposeImages(opts: {
   buildEnvVars: Record<string, string>;
   buildResources: ResourceConfig;
   gitToken?: string;
+  /** Relay helper path on the build host — desktop clone-on-server credential. */
+  gitCredentialHelperPath?: string;
+  /** Clone each service on the remote build host instead of transferring. */
+  cloneOnServer?: boolean;
+  /** Smart (partial) redeploy: build ONLY these services. Undefined = build
+   *  all (full deploy). Non-targeted services are left running / carried
+   *  forward by the deploy step, so their existing image is reused. */
+  targetServiceIds?: Set<string>;
+  /** Env-only refresh subset (⊆ targetServiceIds): recreated at deploy from
+   *  their existing image, so they're excluded from the build here. */
+  refreshServiceIds?: Set<string>;
 }): Promise<ComposeBuildImagesResult> {
   const services = await repos.service.listByProject(opts.project.id);
   const enabled = services.filter((service) => service.enabled);
@@ -160,14 +162,19 @@ export async function buildComposeImages(opts: {
   // External = compose rows with a pre-built image and no Dockerfile build.
   const buildable = enabled.filter(
     (service) =>
-      !!service.build ||
-      (serviceKind(service) === "monorepo" &&
-        !service.image &&
-        (!!service.buildCommand || !!service.startCommand)),
+      // Smart redeploy: skip building services that aren't in the target
+      // subset — they're carried forward at deploy with their existing image.
+      // Also skip env-only refresh services — they recreate from their
+      // existing image (no rebuild).
+      (!opts.targetServiceIds || opts.targetServiceIds.has(service.id)) &&
+      !opts.refreshServiceIds?.has(service.id) &&
+      (!!service.build ||
+        (serviceKind(service) === "monorepo" &&
+          !service.image &&
+          (!!service.buildCommand || !!service.startCommand))),
   );
   const external = enabled.filter((service) => !service.build && !!service.image);
 
-  // ── Broadcast initial per-service status for ALL services ──────────
   // This seeds the UI check-list immediately so users see every service.
   for (const service of enabled) {
     sessionManager.broadcastServiceStatus(opts.dep.id, {
@@ -286,6 +293,13 @@ export async function buildComposeImages(opts: {
             hasServer: true,
           },
         });
+
+    // Clone-on-server credential, shared across the fan-out: the relay helper
+    // (desktop) or the token already on buildConfig.gitToken (non-desktop).
+    if (opts.cloneOnServer) buildConfig.cloneOnServer = true;
+    if (opts.gitCredentialHelperPath) {
+      buildConfig.gitCredentialHelperPath = opts.gitCredentialHelperPath;
+    }
 
     return { service, buildConfig, serviceLogger };
   };

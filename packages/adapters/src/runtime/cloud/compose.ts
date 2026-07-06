@@ -3,7 +3,7 @@ import type { Oblien, WorkspaceHandle } from "oblien";
 import { DEFAULT_RESOURCE_CONFIG, type LogCallback, type ResourceConfig } from "../../types";
 import type { WorkspaceRuntimePlan } from "../../dockerfile";
 import { sq, type BuildLogger } from "../build-pipeline";
-import { safeErrorMessage } from "@repo/core";
+import { SYSTEM, safeErrorMessage } from "@repo/core";
 import type {
   MultiServiceDeployConfig,
   MultiServiceDeployResult,
@@ -79,7 +79,7 @@ function restartPolicyForWorkload(policy?: string): "always" | "on-failure" | "n
   return "always";
 }
 
-function exposeTarget(port: number, serviceName: string, slug?: string, domain = "opsh.io") {
+function exposeTarget(port: number, serviceName: string, slug?: string, domain: string = SYSTEM.DOMAINS.CLOUD_DOMAIN) {
   const service = `service "${serviceName}" on port ${port}`;
   return slug ? `${service} for slug "${slug}" (${slug}.${domain})` : service;
 }
@@ -253,7 +253,7 @@ export class CloudComposeSupport {
           await withCloudOperationTimeout(
             ws.publicAccess.expose({
               port,
-              domain: "opsh.io",
+              domain: SYSTEM.DOMAINS.CLOUD_DOMAIN,
               slug: config.publicSlug,
             }),
             `Exposing public access for service "${config.serviceName}"`,

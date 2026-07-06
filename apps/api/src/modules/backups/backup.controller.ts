@@ -7,7 +7,7 @@
 import type { Context } from "hono";
 import crypto from "node:crypto";
 import { repos } from "@repo/db";
-import { assertResourceInOrg, param } from "../../lib/controller-helpers";
+import { assertResourceInOrg, isServerInOrg, param } from "../../lib/controller-helpers";
 import { getRequestContext } from "../../lib/request-context";
 import { permission } from "../../lib/permission";
 import { streamSSE } from "../../lib/sse";
@@ -309,12 +309,46 @@ export async function prepareRestore(c: Context) {
     return c.json({ error: "Backup run not found" }, 404);
   }
 
+  // Optional migration target: restore a mail-server backup onto a
+  // DIFFERENT mail server (mode="to_fork"). Validate the target is a
+  // registered, installed mail server in the caller's org before staging.
+  const body = (await c.req.json().catch(() => ({}))) as {
+    mode?: "in_place" | "to_fork";
+    forkMailServerId?: string | null;
+  };
+  const mode = body.mode === "to_fork" ? "to_fork" : "in_place";
+  let forkMailServerId: string | null = null;
+  if (mode === "to_fork") {
+    if (run.sourceKind !== "mail_server") {
+      return c.json({ error: "Only mail-server backups can be migrated to another server" }, 400);
+    }
+    forkMailServerId = body.forkMailServerId ?? null;
+    if (!forkMailServerId) {
+      return c.json({ error: "A target mail server is required to migrate" }, 400);
+    }
+    if (forkMailServerId === run.mailServerId) {
+      return c.json({ error: "Pick a different server than the source" }, 400);
+    }
+    const target = await repos.mailServer.get(forkMailServerId);
+    if (!target || !target.installedAt) {
+      return c.json(
+        { error: "Target must be a mail server that's already set up (install it first)" },
+        400,
+      );
+    }
+    if (!(await isServerInOrg(ctx, forkMailServerId))) {
+      return c.json({ error: "Target server not found" }, 404);
+    }
+  }
+
   const confirmationToken = crypto.randomBytes(8).toString("hex");
   try {
     const { restoreId } = await restoreOrchestrator.beginPrepare({
       runId,
       trigger: { source: "manual", userId: ctx.userId, clientIp },
       confirmationToken,
+      mode,
+      forkMailServerId,
     });
     return c.json({ data: { restoreId, confirmationToken } });
   } catch (err) {

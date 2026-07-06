@@ -15,6 +15,7 @@ import {
   deriveEnvironmentPublicEndpoints,
   deriveNextProjectRouteState,
   persistProjectRouteState,
+  reapplyProjectLiveRoutes,
   resolveProjectRouteState,
   syncProjectRouteState,
   type ProjectRouteState,
@@ -639,12 +640,28 @@ export async function updateProject(
     update.slug !== undefined ||
     update.port !== undefined
   ) {
+    // Snapshot the live hostnames before the sync so re-application can tear
+    // down any the edit drops.
+    const beforeState = await resolveProjectRouteState(p).catch(() => null);
+    const previousHostnames = beforeState?.projectDomains.map((d) => d.hostname) ?? [];
+
     await syncProjectRouteState(p, {
       nextPublicEndpoints: data.publicEndpoints,
       slug: typeof update.slug === "string" ? update.slug : p.slug,
     }).catch((err) =>
       console.warn(`[updateProject] route sync failed (non-fatal): ${safeErrorMessage(err)}`),
     );
+
+    // Re-apply the live route so a domain/port edit takes effect without a
+    // redeploy (best-effort — the DB rows are already committed).
+    const refreshed = await repos.project.findById(projectId);
+    if (refreshed) {
+      await reapplyProjectLiveRoutes(refreshed, previousHostnames).catch((err) =>
+        console.warn(
+          `[updateProject] live route re-apply failed (non-fatal): ${safeErrorMessage(err)}`,
+        ),
+      );
+    }
   }
 
   if (p.appId) {

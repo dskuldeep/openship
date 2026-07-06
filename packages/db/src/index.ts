@@ -1,5 +1,8 @@
 // ─── Database client ─────────────────────────────────────────────────────────
-export { db, getDriver, type Database, type Driver } from "./client";
+export { db, getDriver, getPgPool, type Database, type Driver } from "./client";
+
+// ─── Advisory locking (cross-process serialization) ──────────────────────────
+export { withAdvisoryLock, hashStringToInt } from "./advisory-lock";
 
 // ─── Schema (table definitions) ──────────────────────────────────────────────
 export * as schema from "./schema";

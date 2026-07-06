@@ -35,13 +35,23 @@ export function OAuthButtons({ callbackURL = "/" }: { callbackURL?: string }) {
   async function handleOAuth(provider: "github" | "google") {
     setLoading(provider);
     try {
-      await signIn.social({ provider, callbackURL });
+      // better-auth resolves sign-in errors into `{ error }` rather than
+      // throwing, so inspecting the return value is what actually surfaces a
+      // misconfigured/failed provider — the try/catch only covers thrown
+      // network/abort errors. Without this the spinner spun forever.
+      const { error } = await signIn.social({ provider, callbackURL });
+      if (error) {
+        toast("error", error.message ?? t.auth.errors.oauthFailed);
+        setLoading(null);
+      }
+      // Success → better-auth redirects the browser; keep the spinner until the
+      // navigation happens rather than flashing the button back.
     } catch (err) {
-      setLoading(null);
       const msg = isAbortError(err)
         ? t.auth.errors.serverUnreachable
         : t.auth.errors.oauthFailed;
       toast("error", msg);
+      setLoading(null);
     }
   }
 

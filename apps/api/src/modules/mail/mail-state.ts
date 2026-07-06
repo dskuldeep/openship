@@ -7,9 +7,11 @@
  * install attempt. Same model as Terraform's remote state on the resource
  * being managed, or Ansible facts living on the host.
  *
- * The file is one JSON object at a fixed path. We never lock - there's at
- * most one install per server at a time, enforced by the controller's
- * in-memory `activeSession` flag.
+ * The file is one JSON object at a fixed path. Incremental field updates go
+ * through `mutateState`, which serializes read-modify-write per server (an
+ * in-process keyed mutex) so two concurrent writers — e.g. the webmail deploy
+ * hook and a DNS ack — can't clobber each other's fields via last-writer-wins
+ * on the whole-file write.
  *
  * Logs are persisted here as a capped ring buffer so a page refresh
  * during/after an install can rehydrate the live log panel instead of
@@ -27,6 +29,7 @@ import {
   writeOpenshipFile,
   removeOpenshipFile,
 } from "../../lib/openship-server-store";
+import { withKeyedMutex } from "../../lib/provision-lock";
 
 /**
  * Mail state lives inside the one `.openship/` dir on the target server
@@ -366,6 +369,30 @@ export async function writeState(
 /** Wipe the state file. The next install will run as if fresh. */
 export async function clearState(exec: CommandExecutor): Promise<void> {
   await removeOpenshipFile(exec, MAIL_STATE_FILE);
+}
+
+/**
+ * Serialized read-modify-write of a server's mail-state.json. Every incremental
+ * field update must go through this: the `mutator` receives the FRESH on-disk
+ * state (read INSIDE a per-server lock) and returns the next state, then it's
+ * written atomically. Because the read and the write share the lock, a field
+ * change can't drop a field a concurrent writer set (e.g. the webmail block) —
+ * which a plain `readState` → `writeState({ ...stale, x })` would.
+ *
+ * Returns the written state, or `null` when there's no state file to mutate.
+ */
+export async function mutateState(
+  exec: CommandExecutor,
+  serverId: string,
+  mutator: (current: MailServerState) => MailServerState,
+): Promise<MailServerState | null> {
+  return withKeyedMutex(`mail-state:${serverId}`, async () => {
+    const current = await readState(exec);
+    if (!current) return null;
+    const next = mutator(current);
+    await writeState(exec, next);
+    return next;
+  });
 }
 
 // ─── Construction / mutation helpers ─────────────────────────────────────────

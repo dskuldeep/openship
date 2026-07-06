@@ -54,4 +54,11 @@ export const domainsApi = {
    */
   verifySsl: (domainId: string) =>
     api.post<{ data: DomainSslVerifyResult }>(endpoints.domains.verifySsl(domainId)),
+
+  /** Make this domain the project's primary (canonical) hostname. Unsets any
+   *  prior primary; exactly one row stays primary per project. */
+  setPrimary: (domainId: string) =>
+    api.post<{ data: { id: string; hostname: string; isPrimary: boolean } }>(
+      endpoints.domains.primary(domainId),
+    ),
 };

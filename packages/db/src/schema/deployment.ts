@@ -58,7 +58,10 @@ export const deployment = pgTable("deployment", {
   /**
    * Build status.
    *
-   * Values: `queued | building | deploying | ready | failed | cancelled | partial_failure`.
+   * Values: `queued | building | deploying | ready | failed | cancelled | partial_failure | rejected`.
+   * `rejected` is terminal: the operator declined a finished (ready /
+   * partial_failure) deploy; its runtime is torn down but the row + logs are
+   * kept for history (see rejectDeployment).
    * `partial_failure` is a terminal success-with-asterisk used by the
    * smart per-service deploy path when one or more services failed
    * but the rest came up ready — the dashboard treats it as deployed.

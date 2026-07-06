@@ -14,6 +14,7 @@ import { cloudClient, getOrgCloudToken } from "./cloud/client";
 import { resolveOrgCloudUserId } from "./cloud/transport";
 import { platform } from "./controller-helpers";
 import { buildSshConfig, sshManager } from "./ssh-manager";
+import { createProvisionLock } from "./provision-lock";
 
 /**
  * The shape of `deployment.meta` JSONB. Snapshotted per-deploy —
@@ -257,16 +258,21 @@ export async function resolveTargetPlatform(
       docker: runtimeMode === "docker"
         ? toDockerSshTransport(ssh, executor)
         : undefined,
+      // Serialize provisioning per target server, so concurrent deploys (across
+      // projects / single-app + compose) never race apt/openresty/networks/state.
+      provisionLock: createProvisionLock(`provision:server:${server.id}`),
     });
   }
 
-  // Local target - no SSH, no pooling needed
+  // Local target - no SSH, no pooling needed. Still serialize provisioning: two
+  // local deploys share the same host's openresty/docker/state.
   return createPlatform({
     target: "selfhosted",
     runtime: runtimeMode,
     docker: runtimeMode === "docker"
       ? { transport: "socket" as const }
       : undefined,
+    provisionLock: createProvisionLock("provision:local"),
   });
 }
 
@@ -299,10 +305,27 @@ function toDockerSshTransport(ssh: SshConfig, executor: CommandExecutor): Docker
  */
 export async function resolveDeploymentRuntime(
   dep: Pick<Deployment, "meta" | "organizationId">,
-): Promise<{ runtime: RuntimeAdapter; serverId: string | null }> {
+): Promise<{
+  runtime: RuntimeAdapter;
+  /**
+   * Routing provider for the deployment's ACTUAL host — the local box, or a
+   * remote server/sandbox over SSH. This is the single, reused routing the
+   * deploy pipeline uses; callers that re-apply routes on edit MUST use it
+   * rather than the global `platform()` singleton (which only ever targets the
+   * orchestrator's local openresty).
+   */
+  routing: Platform["routing"];
+  effectiveTarget: DeployTarget;
+  serverId: string | null;
+}> {
   const snapshot = (dep.meta ?? {}) as DeploymentMeta;
   const resolved = await resolveDeploymentPlatform(snapshot, {
     organizationId: dep.organizationId,
   });
-  return { runtime: resolved.platform.runtime, serverId: resolved.serverId };
+  return {
+    runtime: resolved.platform.runtime,
+    routing: resolved.platform.routing,
+    effectiveTarget: resolved.effectiveTarget,
+    serverId: resolved.serverId,
+  };
 }

@@ -162,6 +162,10 @@ export const deployApi = {
     /** Smart per-service routing for a manual multi-service redeploy: rebuild
      *  only the services whose files changed since the active deployment. */
     smartRoute?: boolean;
+    /** Refresh: re-apply the current env to the active deployment — no git
+     *  pull, no rebuild. Recreates env-changed services from their existing
+     *  images. */
+    refresh?: boolean;
   }) => api.post<any>("deployments", body),
 
   /** Resolve project info from GitHub repo or local path - detects stack */
@@ -208,6 +212,10 @@ export const deployApi = {
     /** Desktop-only, per-deploy: forward the local `gh` identity for an
      *  on-server clone (relay). The API enforces desktop + server-build gating. */
     forwardGitCredentials?: boolean;
+    /** Per-deploy clone location for a server target. "server" clones on the
+     *  build host (relay on desktop, token otherwise); default clones on the
+     *  API host and transfers. The API gates + falls back as needed. */
+    cloneStrategy?: "api-host" | "server";
   }) =>
     api.post<any>(endpoints.deploy.buildAccess, payload),
 

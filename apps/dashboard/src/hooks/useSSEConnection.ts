@@ -408,10 +408,13 @@ export const useBuildStream = (options: UseBuildStreamOptions = {}): UseBuildStr
 
   function shouldStopReconnect(error: Error) {
     const message = error.message.toLowerCase();
+    // Only permission failures are truly terminal. A transient "not found" can
+    // happen while the session is briefly unavailable mid-deploy (reconnect gap,
+    // proxied/promoted deploy); keep retrying and let the getBuildStatus poll own
+    // terminal detection — otherwise the stream gives up while the deploy is live.
     return (
       message.includes('unauthorized') ||
-      message.includes('forbidden') ||
-      message.includes('not found')
+      message.includes('forbidden')
     );
   }
 

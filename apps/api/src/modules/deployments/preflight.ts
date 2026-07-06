@@ -23,6 +23,7 @@ import { isCloudConnectedForOrg } from "../../lib/cloud/session";
 import { runCloudPreflight, type CloudPreflightData } from "../../lib/cloud-preflight";
 import type { DeployableService } from "../../lib/deployable-service";
 import { serviceKind } from "./compose/project-services";
+import { resolveClonePlan } from "./clone-plan";
 import { getRoutingBaseDomain } from "../../lib/routing-domains";
 import { resolveServerHost } from "../../lib/server-target";
 import { normalizeTargetPath } from "../../lib/public-endpoints";
@@ -273,6 +274,49 @@ async function checkRemoteCloneToken(
 }
 
 /**
+ * Clone-on-server credential check (DOCKER opt-in, `cloneStrategy === "server"`).
+ *
+ * Unlike bare (which hard-fails without a remote credential — see
+ * `checkRemoteCloneToken`), docker gracefully falls back to cloning on the API
+ * host + transfer when no shippable credential exists. So a missing credential
+ * here is a WARN, not a failure: it tells the user the deploy will fall back.
+ *
+ *   - desktop → the git-credential relay (reverse tunnel; nothing persisted).
+ *     Opened at deploy time; if the server's SSH auth can't host it the pipeline
+ *     warns + falls back. Nothing to verify up-front — pass.
+ *   - non-desktop → a short-lived token is shipped to the server. Same
+ *     `tokenFor(purpose:"remote")` resolver clone-auth uses; existence-only.
+ */
+async function checkCloneOnServerCredential(
+  ctx: RequestContext | null,
+  owner: string | null | undefined,
+  projectId: string | undefined,
+  platformTarget: string,
+): Promise<PreflightCheck> {
+  const baseCheck = {
+    id: "clone-on-server",
+    label: "Clone-on-server credential",
+  };
+  if (platformTarget === "desktop") return { ...baseCheck, status: "pass" };
+  if (!ctx || !owner) return { ...baseCheck, status: "pass" };
+
+  const source = await canResolveTokenFor(ctx, "remote", {
+    projectId,
+    owner,
+  }).catch(() => null);
+  if (source) return { ...baseCheck, status: "pass" };
+
+  return {
+    ...baseCheck,
+    status: "warn",
+    message:
+      `"Clone on the server" is selected, but no GitHub credential is available to ship to the build host. ` +
+      `The deploy will fall back to cloning on the API host and transferring the context. ` +
+      `Install the Openship App on "${owner}" or add a per-project clone token to clone directly on the server.`,
+  };
+}
+
+/**
  * A cloud lookup deferred from the sync validation pass so they can all run
  * in parallel: either a custom-domain DNS check or a free-subdomain
  * availability check, tied back to its endpoint by index.
@@ -362,7 +406,6 @@ async function checkPublicEndpoints(
       return;
     }
 
-    // Port range.
     if (hasPortTarget) {
       const port = endpoint.port as number;
       if (!Number.isFinite(port) || port < 1 || port > 65535) {
@@ -436,7 +479,6 @@ async function checkPublicEndpoints(
     if (canBridgeCloud) lookups.push({ kind: "slug", index, label, slug });
   });
 
-  // ── Pass 2: resolve all cloud lookups CONCURRENTLY. ──
   const resolved = await Promise.all(
     lookups.map(async (lk): Promise<PreflightCheck> => {
       if (lk.kind === "custom") {
@@ -538,8 +580,6 @@ async function checkComposeServiceDomains(
 
   return checks;
 }
-
-// TODO: is the preflight with orgid doenst need userid or userid access already coverd in the middleware check
 
 async function requestCloudPreflight(
   snapshot: DeploymentConfigSnapshot,
@@ -1093,26 +1133,66 @@ export async function runPreflightChecks(
     );
   }
 
-  // Remote-build credential check. For App-scoped modes (app / cloud-app)
-  // and local builds: pass. For cli mode + remote: hard FAIL (matches the
-  // backend's clone-auth refusal). For oauth/token + remote: warn only.
-  checks.push(
-    await checkRemoteBuildTokenLeak(githubCtx, effectiveTarget, effectiveBuildStrategy),
-  );
+  // A remote clone credential is only needed when the repo is actually cloned
+  // ON the remote build worker. Per the build pipeline (build-pipeline.ts:774),
+  // that is ONLY the bare runtime on a server build: Docker builds — including
+  // EVERY services deploy — clone on the orchestrator (the token never leaves
+  // the API host), and cloud builds clone inside the workspace. So the two
+  // credential checks below apply only to bare + server; otherwise the clone is
+  // local and these checks would wrongly demand a remote/App/cloud credential.
+  const runtimeMode = snapshot.runtimeMode ?? "docker";
+  const clonesOnRemote =
+    runtimeMode === "bare" &&
+    effectiveTarget === "server" &&
+    effectiveBuildStrategy !== "local";
 
-  // Atomic remote-clone-token check — the single source of truth for
-  // "can this deploy actually mint a token to clone the repo on the
-  // build worker?". Mirrors clone-auth.ts at deploy time so any failure
-  // here means the deploy would have failed downstream.
-  checks.push(
-    await checkRemoteCloneToken(
-      githubCtx,
-      opts?.gitOwner,
-      opts?.projectId,
-      effectiveTarget,
-      effectiveBuildStrategy,
-    ),
-  );
+  if (clonesOnRemote) {
+    // Remote-build credential check. For App-scoped modes (app / cloud-app):
+    // pass. For cli mode: hard FAIL (matches clone-auth's refusal to ship a gh
+    // CLI token to a remote worker). For oauth/token: warn only.
+    checks.push(
+      await checkRemoteBuildTokenLeak(githubCtx, effectiveTarget, effectiveBuildStrategy),
+    );
+
+    // Atomic remote-clone-token check — mirrors clone-auth.ts at deploy time so
+    // any failure here means the remote clone would have failed downstream.
+    checks.push(
+      await checkRemoteCloneToken(
+        githubCtx,
+        opts?.gitOwner,
+        opts?.projectId,
+        effectiveTarget,
+        effectiveBuildStrategy,
+      ),
+    );
+  }
+
+  // Clone-on-server for DOCKER (opt-in via cloneStrategy). Non-bare runtimes
+  // clone locally by default, but "Clone on the server" ships the clone to the
+  // build host. Warn (never fail) when no shippable credential exists — the
+  // pipeline falls back to an API-host clone + transfer. Skip for bare, which
+  // is already covered by the hard-fail clonesOnRemote checks above.
+  // Same clone decision the build pipeline uses (resolveClonePlan) — so this
+  // credential check verifies exactly the clone the pipeline will perform.
+  const dockerClonesOnServer = resolveClonePlan({
+    effectiveTarget,
+    serverId: snapshot.serverId,
+    runtimeIsBare: runtimeMode === "bare",
+    cloneStrategy: snapshot.cloneStrategy,
+    buildStrategy: effectiveBuildStrategy,
+    isDesktop: plat.target === "desktop",
+    forwardGitCredentials: snapshot.forwardGitCredentials,
+  }).dockerClonesOnServer;
+  if (dockerClonesOnServer) {
+    checks.push(
+      await checkCloneOnServerCredential(
+        githubCtx,
+        opts?.gitOwner,
+        opts?.projectId,
+        plat.target,
+      ),
+    );
+  }
 
   if (!hasEndpointRouting && opts?.customDomain) {
     checks.push(await checkCustomDomain(opts.customDomain, cloudPreflight, snapshot));

@@ -28,6 +28,7 @@ import {
   Send,
   Settings2,
   Trash2,
+  Unplug,
   Wrench,
 } from "lucide-react";
 import {
@@ -46,12 +47,16 @@ interface AdvancedTabProps {
   status: MailSetupStatus;
   serverId: string;
   onChanged: () => void;
+  /** Called after the server is removed from the mail registry (DB-only). */
+  onForgotten: () => void;
 }
 
-export function AdvancedTab({ status, serverId, onChanged }: AdvancedTabProps) {
+export function AdvancedTab({ status, serverId, onChanged, onForgotten }: AdvancedTabProps) {
   const { showModal, hideModal } = useModal();
   const [resetting, setResetting] = useState(false);
   const [resetError, setResetError] = useState<string | null>(null);
+  const [forgetting, setForgetting] = useState(false);
+  const [forgetError, setForgetError] = useState<string | null>(null);
 
   const openReset = () => {
     const id = showModal({
@@ -60,7 +65,7 @@ export function AdvancedTab({ status, serverId, onChanged }: AdvancedTabProps) {
       customContent: (
         <FormModalContent
           title="Reset on-server state?"
-          description="Wipes openship's tracking record on the mail VPS (/root/.openship-mail-state.json). The running mail stack is not touched - every mailbox, message, and queue stays intact."
+          description="Wipes openship's tracking of this install: the on-server state file (/root/.openship/mail-state.json) AND the mail-server registry row. The running mail stack is not touched - every mailbox, message, and queue stays intact - but you'll need to re-run the setup wizard to manage it again (Remove keeps the state file so you can just re-adopt)."
           submitLabel="Reset state"
           submittingLabel="Resetting…"
           submitVariant="danger"
@@ -84,6 +89,43 @@ export function AdvancedTab({ status, serverId, onChanged }: AdvancedTabProps) {
             After this, the /emails page will show the install wizard again
             for this server. You can then either re-run from step 1 or pick
             up from a specific step.
+          </div>
+        </FormModalContent>
+      ),
+    });
+  };
+
+  const openForget = () => {
+    const id = showModal({
+      maxWidth: "480px",
+      showCloseButton: false,
+      customContent: (
+        <FormModalContent
+          title="Remove this mail server?"
+          description="Removes this server from openship's mail list only. The mail stack keeps running and nothing is uninstalled - no mailboxes, messages, or DNS are touched. Re-add it anytime with Scan for an existing install."
+          submitLabel="Remove from list"
+          submittingLabel="Removing…"
+          submitVariant="danger"
+          onSubmit={async () => {
+            setForgetError(null);
+            setForgetting(true);
+            try {
+              await mailApi.forget(serverId);
+              hideModal(id);
+              onForgotten();
+            } catch (err) {
+              setForgetError(getApiErrorMessage(err, "Remove failed"));
+              throw err;
+            } finally {
+              setForgetting(false);
+            }
+          }}
+          onCancel={() => hideModal(id)}
+        >
+          <div className="rounded-xl border border-border/60 bg-muted/30 px-4 py-3 text-sm text-muted-foreground leading-relaxed">
+            Use this to clear a stale or mismarked entry. Because the on-server
+            install is left intact, re-adopting it later restores full
+            management with no reinstall.
           </div>
         </FormModalContent>
       ),
@@ -156,7 +198,7 @@ export function AdvancedTab({ status, serverId, onChanged }: AdvancedTabProps) {
         <DangerCard
           icon={Trash2}
           title="Reset on-server state"
-          description="Removes /root/.openship-mail-state.json from the VPS. Does NOT uninstall the mail stack or touch any mailboxes - the server keeps running. Use after a manual purge or re-image, when openship's tracking has drifted from reality."
+          description="Removes openship's tracking of this install - the on-server state file (/root/.openship/mail-state.json) and the registry row. Does NOT uninstall the mail stack or touch any mailboxes; the server keeps running, but you'll re-run the setup wizard to manage it again. Use after a manual purge or re-image when tracking has drifted from reality."
           action={
             <button
               onClick={openReset}
@@ -172,6 +214,28 @@ export function AdvancedTab({ status, serverId, onChanged }: AdvancedTabProps) {
             </button>
           }
           error={resetError}
+        />
+
+        {/* Remove from mail list (DB-only) */}
+        <DangerCard
+          icon={Unplug}
+          title="Remove mail server"
+          description="Stops managing this server - drops it from the /emails list only. The mail stack keeps running and the on-server state file is left intact, so you can re-adopt it later via Scan for an existing install. Use to clear a stale or mismarked entry."
+          action={
+            <button
+              onClick={openForget}
+              disabled={forgetting}
+              className="inline-flex items-center gap-1.5 px-4 py-2 text-sm font-medium rounded-xl bg-red-600 text-white hover:bg-red-700 transition-colors disabled:opacity-50"
+            >
+              {forgetting ? (
+                <Loader2 className="size-3.5 animate-spin" />
+              ) : (
+                <Unplug className="size-3.5" />
+              )}
+              Remove
+            </button>
+          }
+          error={forgetError}
         />
       </section>
 

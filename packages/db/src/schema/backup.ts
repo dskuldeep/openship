@@ -33,6 +33,7 @@ import { user } from "./auth";
 import { project } from "./project";
 import { service } from "./service";
 import { servers } from "./servers";
+import { mailServers } from "./mail";
 import { organization } from "./organization";
 
 // ─── backup_destination ──────────────────────────────────────────────────────
@@ -106,11 +107,22 @@ export const backupPolicy = pgTable(
   "backup_policy",
   {
     id: text("id").primaryKey(),
-    projectId: text("project_id")
-      .notNull()
-      .references(() => project.id, { onDelete: "cascade" }),
+    /**
+     * What this policy backs up. "service" (default) = a deployed project
+     * service (projectId + optional serviceId). "mail_server" = a bare mail
+     * server (mailServerId), which has no project/service.
+     */
+    sourceKind: text("source_kind").notNull().default("service"),
+    /** Null for a mail_server source. */
+    projectId: text("project_id").references(() => project.id, {
+      onDelete: "cascade",
+    }),
     /** NULL = project default. Non-null = service override. */
     serviceId: text("service_id").references(() => service.id, {
+      onDelete: "cascade",
+    }),
+    /** Set when sourceKind="mail_server" — the mail server being backed up. */
+    mailServerId: text("mail_server_id").references(() => mailServers.serverId, {
       onDelete: "cascade",
     }),
 
@@ -167,13 +179,20 @@ export const backupPolicy = pgTable(
   (table) => [
     // At most one active policy per (project, service). The serviceId
     // NULL row is the project default; non-null rows are overrides.
+    // (Postgres treats NULLs as distinct, so mail-server rows — projectId
+    // NULL — are naturally excluded from this constraint.)
     uniqueIndex("uq_backup_policy_project_service")
       .on(table.projectId, table.serviceId)
       .where(sql`${table.deletedAt} IS NULL`),
+    // At most one active policy per mail server.
+    uniqueIndex("uq_backup_policy_mail_server")
+      .on(table.mailServerId)
+      .where(sql`${table.mailServerId} IS NOT NULL AND ${table.deletedAt} IS NULL`),
     uniqueIndex("uq_backup_policy_webhook_token")
       .on(table.webhookToken)
       .where(sql`${table.webhookToken} IS NOT NULL`),
     index("idx_backup_policy_project").on(table.projectId),
+    index("idx_backup_policy_mail_server").on(table.mailServerId),
     index("idx_backup_policy_destination").on(table.destinationId),
   ],
 );
@@ -199,8 +218,14 @@ export const backupRun = pgTable(
       onDelete: "set null",
     }),
 
+    /** "service" | "mail_server" — mirrors the policy's source kind. */
+    sourceKind: text("source_kind").notNull().default("service"),
     projectId: text("project_id").references(() => project.id, { onDelete: "set null" }),
     serviceId: text("service_id").references(() => service.id, { onDelete: "set null" }),
+    /** Set when sourceKind="mail_server". SET NULL so history outlives the row. */
+    mailServerId: text("mail_server_id").references(() => mailServers.serverId, {
+      onDelete: "set null",
+    }),
 
     /** Org that owns this run — THE access primitive. The actor who
      *  triggered the run is captured below in triggeredByUserId. */
@@ -285,6 +310,11 @@ export const backupRestore = pgTable(
     mode: text("mode").notNull().default("in_place"),
     /** Set when mode='to_fork' — the new service row's id. */
     forkServiceId: text("fork_service_id").references(() => service.id, {
+      onDelete: "set null",
+    }),
+    /** Migration target when restoring a mail_server run onto a DIFFERENT
+     *  mail server (mode='to_fork'). NULL for in-place restores. */
+    forkMailServerId: text("fork_mail_server_id").references(() => mailServers.serverId, {
       onDelete: "set null",
     }),
 

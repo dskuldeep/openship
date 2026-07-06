@@ -14,6 +14,8 @@ export const AnalyticsQuery = Type.Object({
   to: Type.Optional(Type.String()),
   /** Include live (real-time) data from the running container */
   live: Type.Optional(Type.Boolean({ default: false })),
+  /** Scope to a single tracked domain instead of aggregating all project domains */
+  domain: Type.Optional(Type.String()),
 });
 
 export const UsageQuery = Type.Object({

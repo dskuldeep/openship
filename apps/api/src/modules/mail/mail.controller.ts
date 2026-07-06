@@ -25,7 +25,9 @@
  */
 
 import type { Context } from "hono";
+import crypto from "node:crypto";
 import { lookup as dnsLookup } from "node:dns/promises";
+import { buildMailBackupPayload } from "./admin/backup-plan";
 import { streamSSE } from "../../lib/sse";
 import { env } from "../../config";
 import { safeErrorMessage } from "@repo/core";
@@ -56,6 +58,7 @@ import { updatePostmasterPassword } from "./mail-credentials.service";
 import {
   readState,
   writeState,
+  mutateState,
   clearState,
   makeFreshState,
   recordStep,
@@ -461,12 +464,18 @@ export async function adoptMailServer(c: Context) {
       MAIL_SETUP_STEPS.every(
         (step) => state.completedSteps[String(step.id)]?.success === true,
       );
+    // Mark it installed when the stack is actually LIVE, not only when every
+    // current step id is recorded success. An adopted server set up by an
+    // older openship (or with step-id drift) has a running iRedMail stack but
+    // may not satisfy the exact per-step check — treating it as installed keeps
+    // the dashboard on the admin panel instead of bouncing to the setup wizard.
+    const completed = iredmailInstalled || installComplete;
     await repos.mailServer.upsert({
       serverId,
       domain,
-      installedAt: installComplete ? new Date() : null,
+      installedAt: completed ? new Date() : null,
     });
-    return c.json({ success: true, serverId, domain, completed: installComplete });
+    return c.json({ success: true, serverId, domain, completed });
   } catch (err) {
     return c.json({ error: `Adopt failed: ${safeErrorMessage(err)}` }, 502);
   }
@@ -519,16 +528,20 @@ async function augmentStateWithHostRecords(
 }
 
 /**
- * Cross-check `state.webmail.installed` against the actual webmail project's
- * latest deployment. Old state files (or interrupted deploys before this fix)
- * can have `installed: true` written before the build ever ran. We trust the
- * project's deployment status as the source of truth: if there's no project
- * row for `webmail-<serverId>`, or its latest deployment isn't `ready`, the
- * webmail is not installed - regardless of what the JSON file says.
+ * Cross-check `state.webmail.installed` against the webmail project's latest
+ * deployment — but ONLY when openship actually owns that deployment. A stale
+ * `installed: true` written before a build ran (interrupted deploy) leaves a
+ * `webmail-<serverId>` project whose deployment isn't `ready`; we override that.
  *
- * Read-time only: we don't write back. If the truth flips later (deploy
- * succeeds), the onSuccess hook in deployment-lifecycle writes `installed=true`
- * and we stop overriding it here.
+ * When there is NO `webmail-<serverId>` project at all, the webmail was adopted
+ * / is managed outside openship's deploy pipeline (e.g. this openship DB was
+ * rebuilt and the server re-adopted, so the deployment row no longer exists).
+ * The on-server state file is the source of truth there, so we TRUST it rather
+ * than masking it to not-installed — otherwise every refresh after an adopt
+ * flips the webmail back to "not installed".
+ *
+ * Read-time only: we never write back. If an openship deploy later succeeds,
+ * the onSuccess hook in deployment-lifecycle writes `installed=true`.
  */
 async function reconcileWebmailInstalled(
   state: MailServerState,
@@ -537,9 +550,11 @@ async function reconcileWebmailInstalled(
   if (!state.webmail?.installed) return state;
   try {
     const project = await repos.project.findFirstBySlug(`webmail-${serverId}`);
-    if (!project) {
-      return { ...state, webmail: { ...state.webmail, installed: false } };
-    }
+    // Adopted / externally-managed webmail (no openship-side project) — the
+    // server, not openship's deployment table, is authoritative. Trust the file.
+    if (!project) return state;
+    // openship owns this webmail deployment: downgrade only when it's genuinely
+    // gone / not live (interrupted or torn-down deploy).
     if (!project.activeDeploymentId) {
       return { ...state, webmail: { ...state.webmail, installed: false } };
     }
@@ -1034,11 +1049,10 @@ export async function acknowledgeDns(c: Context) {
 
   try {
     await sshManager.withExecutor(serverId, async (executor) => {
-      const state = await readState(executor);
-      if (!state) {
+      const result = await mutateState(executor, serverId, (s) => ({ ...s, dnsAcknowledged: true }));
+      if (!result) {
         throw new Error("No setup state on this server");
       }
-      await writeState(executor, { ...state, dnsAcknowledged: true });
     });
   } catch (err) {
     return c.json(
@@ -1083,11 +1097,10 @@ export async function acknowledgePtr(c: Context) {
 
   try {
     await sshManager.withExecutor(serverId, async (executor) => {
-      const state = await readState(executor);
-      if (!state) {
+      const result = await mutateState(executor, serverId, (s) => ({ ...s, ptrAcknowledged: true }));
+      if (!result) {
         throw new Error("No setup state on this server");
       }
-      await writeState(executor, { ...state, ptrAcknowledged: true });
     });
   } catch (err) {
     return c.json(
@@ -1150,6 +1163,155 @@ export async function resetSetup(c: Context) {
     );
   }
   return c.json({ ok: true });
+}
+
+/**
+ * DELETE /mail/servers/:serverId - stop managing a mail server.
+ *
+ * Drops ONLY the `mail_servers` DB row so /emails stops listing it.
+ * Deliberately does NOT SSH to the box: the mail stack keeps running and
+ * the on-server state file (`mail-state.json`) is left intact, so the
+ * server can be re-adopted later via the scan + adopt flow (which requires
+ * that state file's domain). This is the non-destructive sibling of
+ * resetSetup, for clearing a stale/corrupted registry mark.
+ */
+export async function forgetMailServer(c: Context) {
+  if (env.CLOUD_MODE) return c.json({ error: "Not available" }, 404);
+
+  const serverId = c.req.param("serverId");
+  if (!serverId) return c.json({ error: "serverId is required" }, 400);
+
+  await permission.assert(getRequestContext(c), {
+    resourceType: "mail_server",
+    resourceId: serverId,
+    action: "admin",
+  });
+  const ctx = getRequestContext(c);
+  if (!(await isServerInOrg(ctx, serverId))) {
+    return c.json({ error: "Server not found" }, 404);
+  }
+
+  // Don't detach a row out from under a running install - startSetup
+  // re-upserts it and the UI would flap.
+  if (active?.serverId === serverId) {
+    return c.json({ error: "Cancel the running setup first" }, 409);
+  }
+
+  await repos.mailServer.remove(serverId);
+  return c.json({ ok: true });
+}
+
+// ─── Backup (plugs the mail server into the general backup system) ───────────
+
+/** GET /mail/admin/:serverId/backup-policy — the mail server's backup
+ *  policy (or null), so the Backup tab can show its current config. */
+export async function getMailBackupPolicy(c: Context) {
+  if (env.CLOUD_MODE) return c.json({ error: "Not available" }, 404);
+  const serverId = c.req.param("serverId");
+  if (!serverId) return c.json({ error: "serverId is required" }, 400);
+  const ctx = getRequestContext(c);
+  await permission.assert(ctx, {
+    resourceType: "mail_server",
+    resourceId: serverId,
+    action: "read",
+  });
+  if (!(await isServerInOrg(ctx, serverId))) {
+    return c.json({ error: "Server not found" }, 404);
+  }
+  const policy = await repos.backupPolicy.findActiveByMailServer(serverId);
+  return c.json({ policy: policy ?? null });
+}
+
+/** POST /mail/admin/:serverId/backup-policy — create or update the mail
+ *  server's backup policy. Body: { destinationId, messageData?, keys?,
+ *  cronExpression?, retainCount?, retainDays? }. */
+export async function saveMailBackupPolicy(c: Context) {
+  if (env.CLOUD_MODE) return c.json({ error: "Not available" }, 404);
+  const serverId = c.req.param("serverId");
+  if (!serverId) return c.json({ error: "serverId is required" }, 400);
+  const ctx = getRequestContext(c);
+  await permission.assert(ctx, {
+    resourceType: "mail_server",
+    resourceId: serverId,
+    action: "admin",
+  });
+  if (!(await isServerInOrg(ctx, serverId))) {
+    return c.json({ error: "Server not found" }, 404);
+  }
+
+  const mailRow = await repos.mailServer.get(serverId);
+  if (!mailRow?.domain) {
+    return c.json({ error: "Mail server is not registered / has no domain" }, 404);
+  }
+
+  const body = (await c.req.json().catch(() => ({}))) as {
+    destinationId?: string;
+    messageData?: boolean;
+    keys?: boolean;
+    cronExpression?: string | null;
+    retainCount?: number | null;
+    retainDays?: number | null;
+  };
+  if (!body.destinationId) {
+    return c.json({ error: "destinationId is required" }, 400);
+  }
+  const destination = await repos.backupDestination.findById(body.destinationId);
+  if (!destination || destination.organizationId !== ctx.organizationId) {
+    return c.json({ error: "Destination not found" }, 404);
+  }
+
+  const messageData = body.messageData === true;
+  const keys = body.keys !== false; // default: include keys/secrets
+  const payload = buildMailBackupPayload(mailRow.domain, { messageData, keys });
+
+  const shared = {
+    sourceKind: "mail_server" as const,
+    mailServerId: serverId,
+    projectId: null,
+    serviceId: null,
+    destinationId: body.destinationId,
+    enabled: true,
+    cronExpression:
+      typeof body.cronExpression === "string" && body.cronExpression.trim()
+        ? body.cronExpression.trim()
+        : null,
+    retainCount: typeof body.retainCount === "number" ? body.retainCount : null,
+    retainDays: typeof body.retainDays === "number" ? body.retainDays : null,
+    payloadKind: payload.payloadKind,
+    payloadConfig: payload.payloadConfig,
+  };
+
+  const existing = await repos.backupPolicy.findActiveByMailServer(serverId);
+  const policy = existing
+    ? await repos.backupPolicy.update(existing.id, { ...shared, updatedAt: new Date() })
+    : await repos.backupPolicy.create({
+        id: `bkp_${crypto.randomUUID()}`,
+        createdBy: ctx.userId,
+        ...shared,
+      });
+
+  return c.json({ policy });
+}
+
+/** GET /mail/admin/:serverId/backup-runs — this mail server's backup runs. */
+export async function listMailBackupRuns(c: Context) {
+  if (env.CLOUD_MODE) return c.json({ error: "Not available" }, 404);
+  const serverId = c.req.param("serverId");
+  if (!serverId) return c.json({ error: "serverId is required" }, 400);
+  const ctx = getRequestContext(c);
+  await permission.assert(ctx, {
+    resourceType: "mail_server",
+    resourceId: serverId,
+    action: "read",
+  });
+  if (!(await isServerInOrg(ctx, serverId))) {
+    return c.json({ error: "Server not found" }, 404);
+  }
+  const runs = await repos.backupRun.listByOrganization(ctx.organizationId, {
+    mailServerId: serverId,
+    limit: 50,
+  });
+  return c.json({ runs });
 }
 
 /**

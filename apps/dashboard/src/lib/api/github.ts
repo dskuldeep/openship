@@ -43,6 +43,16 @@ export const githubApi = {
   getUserRepos: (owner: string) =>
     api.get<any>(endpoints.github.userRepos, { params: { owner } }),
 
+  /**
+   * Mint a short-lived GitHub App installation token for cloning a repo and
+   * return a ready-to-run `git clone` command. Cloud / GitHub-App mode only —
+   * 409s in gh-CLI / PAT mode (no installation token). Token expires ~1h.
+   */
+  getCloneToken: (owner: string, repo: string) =>
+    api.get<{ token: string; cloneUrl: string; command: string }>(
+      endpoints.github.cloneToken(owner, repo),
+    ),
+
   /** Check GitHub connection status (live, no dedup). */
   getStatus: () => api.get<any>(endpoints.github.status),
 

@@ -51,7 +51,7 @@ import {
   safeErrorMessage,
   type PlanTierId,
 } from "@repo/core";
-import { db, schema, repos, eq, sql } from "@repo/db";
+import { db, schema, repos, eq, sql, hashStringToInt } from "@repo/db";
 import { env } from "../../config/env";
 import { sendMail } from "../../lib/mail";
 import { resolveOrgOwner } from "../../lib/org-actor";
@@ -101,27 +101,6 @@ export function mapStripeStatusToCanonical(
   return "canceled";
 }
 
-/* ───────── Advisory-lock key derivation ─────────────────────────────────── */
-
-/**
- * 31-bit signed-positive int hash for `pg_try_advisory_xact_lock`. The
- * Postgres function takes a `bigint`; we hash the Stripe event id down
- * to one so an event's exclusive lock is keyed by string identity, not
- * by row presence. Collisions are tolerated (two unrelated events
- * sharing a lock just serialize; correctness is preserved) but the 31
- * bits give us ~2 billion buckets — collision risk is negligible at
- * Stripe's event volume.
- */
-function hashStringToInt(input: string): number {
-  // FNV-1a 32-bit, masked to 31 bits so the result fits a signed int4
-  // and stays consistent across drivers that don't auto-cast unsigned.
-  let h = 0x811c9dc5;
-  for (let i = 0; i < input.length; i++) {
-    h ^= input.charCodeAt(i);
-    h = Math.imul(h, 0x01000193);
-  }
-  return h & 0x7fffffff;
-}
 
 /* ───────── Event type allowlist ─────────────────────────────────────────── */
 

@@ -1,8 +1,8 @@
 "use client";
 
 import { useState, useEffect, useCallback, useRef } from "react";
-import { useSearchParams } from "next/navigation";
-import { Loader2 } from "lucide-react";
+import { useSearchParams, useRouter, usePathname } from "next/navigation";
+import { Loader2, ArrowLeft, Plus } from "lucide-react";
 import {
   mailApi,
   systemApi,
@@ -13,19 +13,25 @@ import {
 } from "@/lib/api";
 import type { ServerOption } from "@/components/shared/ServerSelector";
 import { PageContainer } from "@/components/ui/PageContainer";
+import { useModal } from "@/context/ModalContext";
+import { FormModalContent } from "./_components/admin/_shared/form-modal-content";
 import { MailSetupForm } from "./_components/mail-setup-form";
 import { MailProgress } from "./_components/mail-progress";
 import { MailSidebar } from "./_components/mail-sidebar";
 import { DnsHoldBanner } from "./_components/dns-hold-banner";
 import { PtrHoldBanner } from "./_components/ptr-hold-banner";
 import { MailAdminPanel } from "./_components/admin/admin-panel";
+import { MailServerList, type MailServerListItem } from "./_components/mail-server-list";
 
 export default function EmailsPage() {
   const searchParams = useSearchParams();
-  // Pre-select server when the user lands here via the Mail tab's
-  // "Provision" button on the server detail page (passes ?serverId=…).
-  // Takes precedence over the saved mail-status server until the user
-  // explicitly picks a different one.
+  const router = useRouter();
+  const pathname = usePathname();
+  // The selected mail server lives in the URL (?serverId=…). This is the
+  // single source of truth for "which server am I acting on": every admin
+  // action is scoped to it, and a refresh re-opens the same server instead
+  // of dropping back to the picker. Also set by the Mail tab's "Provision"
+  // button on the server detail page.
   const hintedServerId = searchParams.get("serverId");
 
   const [status, setStatus] = useState<MailSetupStatus | null>(null);
@@ -54,7 +60,27 @@ export default function EmailsPage() {
   const [portConflicts, setPortConflicts] = useState<PortConflict[] | null>(null);
   const [resolving, setResolving] = useState(false);
   const [selectedServer, setSelectedServer] = useState<ServerOption | null>(null);
+  // The `mail_servers` registry — the authority for "which servers are mail
+  // servers". Drives the view: auto-open one, list several, add when none.
+  const [mailServers, setMailServers] = useState<MailServerListItem[]>([]);
+  const [addingNew, setAddingNew] = useState(false);
   const abortRef = useRef<AbortController | null>(null);
+  // Guards the count-based auto-open logic to the FIRST mount only. After
+  // init, opens are URL-driven and clearing the URL shows the list/add flow
+  // rather than re-auto-opening a server.
+  const didInit = useRef(false);
+  const { showModal, hideModal } = useModal();
+
+  // Reflect the open server in the URL. null clears it (list / add flow).
+  const setServerInUrl = useCallback(
+    (serverId: string | null) => {
+      router.replace(
+        serverId ? `?serverId=${encodeURIComponent(serverId)}` : pathname,
+        { scroll: false },
+      );
+    },
+    [router, pathname],
+  );
 
   // Resolve a Server row → ServerOption (the shape ServerSelector + the
   // setup form expect). Used both for the saved mail-status server and
@@ -181,21 +207,97 @@ export default function EmailsPage() {
     [],
   );
 
-  // On mount, pick the right server in this order:
-  //
-  //   1. URL hint (?serverId=…) wins.
-  //   2. Otherwise, find servers that already have mail installed
-  //      (state file present on disk). Exactly one → silently select it
-  //      and jump straight to its admin/progress UI.
-  //   3. Otherwise, if the user has exactly ONE openship server at all,
-  //      pre-select it in the install form. There's nothing to pick, so
-  //      don't make them click.
-  //   4. Otherwise (multiple servers, no mail installed) → show picker
-  //      so the user chooses where to install.
-  //
-  // The combined effect: a single-VPS user never sees a picker, and a
-  // multi-VPS user only sees it the one time when no mail server exists
-  // yet - after that the auto-select kicks in.
+  // Registry helpers ────────────────────────────────────────────────────────
+  const refreshMailServers = useCallback(async (): Promise<MailServerListItem[]> => {
+    try {
+      const { servers } = await mailApi.listMailServers();
+      setMailServers(servers);
+      return servers;
+    } catch {
+      return [];
+    }
+  }, []);
+
+  // Open a registry mail server by writing it to the URL; the mount effect
+  // below picks up the change and loads its live status. URL-driven so the
+  // choice survives refresh and every action is scoped to it.
+  const openMailServer = useCallback(
+    (serverId: string) => {
+      setAddingNew(false);
+      setServerInUrl(serverId);
+    },
+    [setServerInUrl],
+  );
+
+  // Enter the provision/adopt flow from anywhere. Drops any state left over
+  // from a previously-opened server (incl. an in-flight install stream) so
+  // the wizard starts clean.
+  const handleAddNew = useCallback(() => {
+    abortRef.current?.abort();
+    setServerInUrl(null); // don't let a refresh re-open a server over the form
+    setSelectedServer(null);
+    setStatus(null);
+    setDomain("");
+    setAdminPassword("");
+    setDnsPendingStep(null);
+    setPtrPending(null);
+    setError(null);
+    setAddingNew(true);
+  }, [setServerInUrl]);
+
+  // After a DB-only "forget", reconcile the registry-driven view: clear the
+  // open server, refetch the list, and re-open the survivor if exactly one
+  // remains (mirrors the mount logic).
+  const reconcileAfterForget = useCallback(async () => {
+    setSelectedServer(null);
+    setStatus(null);
+    setAddingNew(false);
+    const servers = await refreshMailServers();
+    if (servers.length === 1) openMailServer(servers[0].id);
+    else setServerInUrl(null);
+  }, [refreshMailServers, openMailServer, setServerInUrl]);
+
+  // Remove a server straight from the registry list (for a stale/mismarked
+  // entry that may not open cleanly). Confirms first; DB-only + re-adoptable.
+  const handleRemoveFromList = useCallback(
+    (server: MailServerListItem) => {
+      const label = server.domain || server.name;
+      const id = showModal({
+        maxWidth: "480px",
+        showCloseButton: false,
+        customContent: (
+          <FormModalContent
+            title="Remove this mail server?"
+            description={`Removes ${label} from the mail list only. The mail stack keeps running and nothing is uninstalled — re-add it anytime with "Adopt" for an existing install.`}
+            submitLabel="Remove from list"
+            submittingLabel="Removing…"
+            submitVariant="danger"
+            onSubmit={async () => {
+              await mailApi.forget(server.id);
+              hideModal(id);
+              await reconcileAfterForget();
+            }}
+            onCancel={() => hideModal(id)}
+          >
+            <div className="rounded-xl border border-border/60 bg-muted/30 px-4 py-3 text-sm text-muted-foreground leading-relaxed">
+              Because the on-server install is left intact, re-adopting it later
+              restores full management with no reinstall.
+            </div>
+          </FormModalContent>
+        ),
+      });
+    },
+    [showModal, hideModal, reconcileAfterForget],
+  );
+
+  // The `mail_servers` registry drives the view; the URL (?serverId=) names
+  // the open server:
+  //   - URL names a server → open exactly that one (survives refresh).
+  //   - No server in URL, FIRST mount → derive a default: auto-open the only
+  //     registered mail server, else show the list (>1) / add flow (0).
+  //   - No server in URL, AFTER init → user backed out / entered the add
+  //     flow; just refresh the list. `didInit` stops us from re-auto-opening
+  //     a server the user just left.
   useEffect(() => {
     let cancelled = false;
     (async () => {
@@ -204,42 +306,53 @@ export default function EmailsPage() {
         if (cancelled) return;
         if (opt) setSelectedServer(opt);
         await fetchStatusForServer(hintedServerId);
+        refreshMailServers();
+        didInit.current = true;
         return;
       }
-      try {
-        const { servers: mailServers } = await mailApi.listMailServers();
+
+      if (didInit.current) {
+        await refreshMailServers();
+        if (!cancelled) setLoading(false);
+        return;
+      }
+
+      const servers = await mailApi
+        .listMailServers()
+        .then((r) => r.servers)
+        .catch(() => [] as MailServerListItem[]);
+      if (cancelled) return;
+      setMailServers(servers);
+      didInit.current = true;
+
+      if (servers.length === 1) {
+        const opt = await loadServerOption(servers[0].id);
         if (cancelled) return;
-        if (mailServers.length === 1) {
-          const opt = await loadServerOption(mailServers[0].id);
+        if (opt) setSelectedServer(opt);
+        await fetchStatusForServer(servers[0].id);
+        return;
+      }
+
+      if (servers.length === 0) {
+        const allServers = await systemApi.listServers().catch(() => []);
+        if (cancelled) return;
+        if (allServers.length === 1) {
+          const opt = await loadServerOption(allServers[0].id);
           if (cancelled) return;
           if (opt) setSelectedServer(opt);
-          await fetchStatusForServer(mailServers[0].id);
+          await fetchStatusForServer(allServers[0].id);
           return;
         }
-        if (mailServers.length === 0) {
-          // No mail installed anywhere yet - fall back to "is there only
-          // one openship server total?" and pre-select that one in the
-          // install form. Two-or-more openship servers with no mail still
-          // surface the picker so the user chooses where to provision.
-          const allServers = await systemApi.listServers();
-          if (cancelled) return;
-          if (allServers.length === 1) {
-            const opt = await loadServerOption(allServers[0].id);
-            if (cancelled) return;
-            if (opt) setSelectedServer(opt);
-            await fetchStatusForServer(allServers[0].id);
-            return;
-          }
-        }
-      } catch {
-        // Listing failed - fall through to the picker. Not fatal.
       }
+
+      // Several mail servers (list view) or several bare servers (add form):
+      // nothing to auto-open.
       if (!cancelled) setLoading(false);
     })();
     return () => {
       cancelled = true;
     };
-  }, [hintedServerId, loadServerOption, fetchStatusForServer]);
+  }, [hintedServerId, loadServerOption, fetchStatusForServer, refreshMailServers]);
 
   // Whenever the user picks a different server, refetch its state.
   useEffect(() => {
@@ -355,6 +468,11 @@ export default function EmailsPage() {
                 // credentials/health info until manual refresh.
                 if (selectedServer?.id) {
                   fetchStatusForServer(selectedServer.id);
+                  // The install just registered/marked this server — refresh
+                  // the registry and pin it in the URL so it stays the
+                  // explicit context on refresh.
+                  refreshMailServers();
+                  setServerInUrl(selectedServer.id);
                 }
                 break;
 
@@ -375,7 +493,7 @@ export default function EmailsPage() {
         setRunning(false);
       }
     },
-    [domain, adminPassword, selectedServer, fetchStatusForServer],
+    [domain, adminPassword, selectedServer, fetchStatusForServer, refreshMailServers, setServerInUrl],
   );
 
   const handleCancel = useCallback(async () => {
@@ -559,12 +677,67 @@ export default function EmailsPage() {
     [selectedServer],
   );
 
-  // Check if setup has been completed before
+  // A just-finished install (SSE reported every step complete).
   const isCompleted =
     status?.steps?.every((s) => s.status === "completed") || !!completionData;
   const hasStarted = status?.steps?.some(
     (s) => s.status === "completed" || s.status === "failed",
   );
+
+  // ── Registry-driven view control ──
+  // The `mail_servers` table — not getStatus step-completion — is the
+  // authority for "is this an installed mail server". This is what stops an
+  // adopted server (whose on-disk step ids may drift) from bouncing back to
+  // the setup wizard on refresh.
+  const selectedMailRow = selectedServer
+    ? mailServers.find((m) => m.id === selectedServer.id) ?? null
+    : null;
+  const registryCompleted = !!selectedMailRow?.completed;
+  const gatesActive = !!dnsPendingStep || !!ptrPending;
+
+  // Day-2 admin: the registry says installed (or an install just finished)
+  // and nothing is mid-install.
+  const showAdmin =
+    !addingNew &&
+    !!selectedServer &&
+    !!status &&
+    (registryCompleted || isCompleted) &&
+    !running &&
+    !gatesActive;
+
+  // Several registered mail servers, none opened → the registry cards list.
+  const showList = !addingNew && !selectedServer && mailServers.length > 1;
+
+  // The provision/adopt wizard: adding a new one, none registered yet, or a
+  // picked server that isn't a registered mail server — and no install active.
+  const showSetupForm =
+    !showAdmin &&
+    !showList &&
+    !running &&
+    !hasStarted &&
+    !gatesActive &&
+    !completionData;
+
+  // Install progress / gates surface (streaming, resumable, or partially done).
+  const showProgress =
+    !showAdmin &&
+    !showList &&
+    !showSetupForm &&
+    (running || hasStarted || gatesActive || !!completionData);
+
+  // "← Mail servers" is only meaningful when there's a list to return to.
+  const canGoBack = mailServers.length > 1 && (!!selectedServer || addingNew);
+  const handleBack = () => {
+    abortRef.current?.abort();
+    setServerInUrl(null);
+    setAddingNew(false);
+    setSelectedServer(null);
+    setStatus(null);
+    setRunning(false);
+    setDnsPendingStep(null);
+    setPtrPending(null);
+    setError(null);
+  };
 
   if (loading) {
     return (
@@ -578,21 +751,58 @@ export default function EmailsPage() {
     <PageContainer>
         {/* Header */}
         <div className="flex items-center justify-between mb-6">
-          <div>
-            <h1
-              className="text-2xl font-medium text-foreground/80"
-              style={{ letterSpacing: "-0.2px" }}
-            >
-              Email Server
-            </h1>
-            <p className="text-sm text-muted-foreground/70 mt-1">
-              Set up a self-hosted mail server with a few clicks
-            </p>
+          <div className="flex items-center gap-3">
+            {canGoBack && (
+              <button
+                type="button"
+                onClick={handleBack}
+                className="flex size-9 items-center justify-center rounded-xl border border-border/60 bg-card text-muted-foreground transition-colors hover:text-foreground"
+                title="Back to mail servers"
+              >
+                <ArrowLeft className="size-4" />
+              </button>
+            )}
+            <div>
+              <h1
+                className="text-2xl font-medium text-foreground/80"
+                style={{ letterSpacing: "-0.2px" }}
+              >
+                Email Server
+              </h1>
+              <p className="text-sm text-muted-foreground/70 mt-1">
+                Set up a self-hosted mail server with a few clicks
+              </p>
+            </div>
           </div>
+
+          {/* Add-server action while viewing a server (add a 2nd, etc.).
+              The list view has its own Add button; the setup/progress views
+              are already the add flow. */}
+          {showAdmin && (
+            <button
+              type="button"
+              onClick={handleAddNew}
+              className="inline-flex items-center gap-1.5 text-sm font-medium text-muted-foreground transition-colors hover:text-foreground"
+              title="Add mail server"
+            >
+              <Plus className="size-4" />
+              Add mail server
+            </button>
+          )}
         </div>
 
-        {/* ── Welcome state - server selector + setup form ── */}
-        {!hasStarted && !running && (
+        {/* ── Registry list - several mail servers, pick one or add ── */}
+        {showList && (
+          <MailServerList
+            servers={mailServers}
+            onOpen={openMailServer}
+            onAddNew={handleAddNew}
+            onRemove={handleRemoveFromList}
+          />
+        )}
+
+        {/* ── Provision / adopt entry - server selector + setup form ── */}
+        {showSetupForm && (
           <MailSetupForm
             domain={domain}
             adminPassword={adminPassword}
@@ -603,10 +813,10 @@ export default function EmailsPage() {
             onServerSelect={setSelectedServer}
             onStart={() => handleStart()}
             onAdopted={async (serverId) => {
-              // Re-adopted an existing mail server — select it; the
-              // server-change effect refetches its live status.
-              const opt = await loadServerOption(serverId);
-              if (opt) setSelectedServer(opt);
+              // Re-adopted an existing mail server — register it in the
+              // list, then open it (registry `completed` drives the admin).
+              await refreshMailServers();
+              await openMailServer(serverId);
             }}
           />
         )}
@@ -646,16 +856,17 @@ export default function EmailsPage() {
               talking to vmail.* on the mail VPS over SSH+psql. The install
               logs / step list are install-time concerns; this is the day-2
               surface. */}
-        {isCompleted && status && selectedServer?.id && (
+        {showAdmin && status && selectedServer?.id && (
           <MailAdminPanel
             status={status}
             serverId={selectedServer.id}
             onRefresh={() => fetchStatusForServer(selectedServer.id)}
+            onForgotten={reconcileAfterForget}
           />
         )}
 
         {/* ── Setup in progress (or partially failed) ── */}
-        {!isCompleted && (hasStarted || running) && (
+        {showProgress && (
           <div className="grid grid-cols-1 lg:grid-cols-[1fr_420px] gap-6">
             <MailProgress
               logs={logs}

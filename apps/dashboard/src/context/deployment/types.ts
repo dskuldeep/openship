@@ -69,6 +69,57 @@ export interface Screenshot {
  */
 export type ComposeServiceInfo = PrepareComposeService;
 
+/**
+ * Loosely-typed compose service as it arrives from any saved source — a DB
+ * `Service` row, a deployment snapshot's `composeServices`, or a prepare
+ * result. All carry the same camelCase fields but with nullable columns.
+ */
+export type RawComposeService = {
+  name: string;
+  image?: string | null;
+  build?: string | null;
+  dockerfile?: string | null;
+  ports?: string[] | null;
+  dependsOn?: string[] | null;
+  environment?: Record<string, string> | null;
+  volumes?: string[] | null;
+  command?: string | null;
+  restart?: string | null;
+  advanced?: ComposeServiceInfo["advanced"] | null;
+  exposed?: boolean | null;
+  exposedPort?: string | null;
+  domain?: string | null;
+  customDomain?: string | null;
+  domainType?: "free" | "custom" | null;
+};
+
+/**
+ * Normalize a raw compose service (DB row / snapshot / prepare) into the
+ * ComposeServiceInfo shape the wizard renders — one place so the config-edit
+ * and build-session hydration paths can't drift. Nullable columns collapse to
+ * undefined / empty collections.
+ */
+export function normalizeComposeService(raw: RawComposeService): ComposeServiceInfo {
+  return {
+    name: raw.name,
+    image: raw.image ?? undefined,
+    build: raw.build ?? undefined,
+    dockerfile: raw.dockerfile ?? undefined,
+    ports: raw.ports ?? [],
+    dependsOn: raw.dependsOn ?? [],
+    environment: raw.environment ?? {},
+    volumes: raw.volumes ?? [],
+    command: raw.command ?? undefined,
+    restart: raw.restart ?? undefined,
+    advanced: raw.advanced ?? undefined,
+    exposed: raw.exposed ?? false,
+    exposedPort: raw.exposedPort ?? undefined,
+    domain: raw.domain ?? undefined,
+    customDomain: raw.customDomain ?? undefined,
+    domainType: raw.domainType ?? undefined,
+  };
+}
+
 export interface PublicEndpoint {
   id: string;
   port: string;
@@ -94,6 +145,15 @@ export interface ServiceDeployStatus {
 // ─── Build Strategy ──────────────────────────────────────────────────────────
 
 export type { BuildStrategy, RuntimeMode, DeployTarget } from "@repo/core";
+
+/**
+ * Where a server deploy clones the repo:
+ *   - "api-host" (default) → clone on the orchestrator, transfer the context.
+ *   - "server"             → clone directly on the build host (relay on desktop,
+ *                            short-lived token otherwise). Build always runs on
+ *                            the server regardless.
+ */
+export type CloneStrategy = "api-host" | "server";
 
 // ─── Config ──────────────────────────────────────────────────────────────────
 
@@ -216,8 +276,18 @@ export interface DeploymentConfig {
    * LOCAL `gh` identity to a remote server so it can clone on-server using the
    * relay — instead of building locally + uploading. Only meaningful for a
    * server-target build; nothing is persisted on the remote.
+   *
+   * Internal now: derived from `cloneStrategy === "server"` on desktop. The
+   * user picks the clone location; this stays the backend relay switch.
    */
   forwardGitCredentials?: boolean;
+  /**
+   * Where a server deploy clones the repo (default "api-host"). "server" makes
+   * the build host clone directly — desktop via the credential relay, a
+   * server-hosted instance via a short-lived token. The build always runs on
+   * the server; only the clone location differs. See {@link CloneStrategy}.
+   */
+  cloneStrategy?: CloneStrategy;
   /** Local-only flag so env imports don't overwrite a user-edited runtime port. */
   productionPortTouched: boolean;
   /** Last runtime port auto-applied from env detection in this deploy flow. */

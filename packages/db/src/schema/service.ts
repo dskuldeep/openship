@@ -81,6 +81,13 @@ export const service = pgTable("service", {
   environment: jsonb("environment").$type<Record<string, string>>().default({}),
   /** JSON array of volume mounts (e.g. ["pgdata:/var/lib/postgresql/data"]) */
   volumes: jsonb("volumes").$type<string[]>().default([]),
+  /**
+   * Whether this service's NAMED volumes are project-scoped (openship-<slug>-<name>)
+   * at deploy time. True for services created after the volume-namespacing change;
+   * backfilled to false for pre-existing services so they keep their bare volume
+   * names and lose no data (see volume-namespace.ts). Bind mounts are unaffected.
+   */
+  namespaceVolumes: boolean("namespace_volumes").notNull().default(true),
   /** Override command */
   command: text("command"),
   /** Restart policy: no | always | on-failure | unless-stopped */

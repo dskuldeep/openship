@@ -12,6 +12,7 @@ import { repos } from "@repo/db";
 import { assertResourceInOrg } from "../../../lib/controller-helpers";
 import type { RequestContext } from "../../../lib/request-context";
 import { backupOrchestrator } from "../backup.orchestrator";
+import { policyOrganizationId } from "../backup.service";
 
 export async function triggerManualBackup(
   ctx: RequestContext,
@@ -21,9 +22,14 @@ export async function triggerManualBackup(
   if (!policy) {
     throw new Error("Backup policy not found");
   }
-  const project = await repos.project.findById(policy.projectId);
+  const orgId = await policyOrganizationId(policy);
   try {
-    assertResourceInOrg(project, "Backup policy", ctx.organizationId, policyId);
+    assertResourceInOrg(
+      orgId ? { organizationId: orgId } : null,
+      "Backup policy",
+      ctx.organizationId,
+      policyId,
+    );
   } catch {
     throw new Error("Backup policy not found"); // hide existence
   }

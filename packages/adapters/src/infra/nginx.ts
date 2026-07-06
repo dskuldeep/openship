@@ -24,6 +24,7 @@ import {
   rename as fsRename,
 } from "node:fs/promises";
 import { execFile as cpExecFile } from "node:child_process";
+import { randomBytes } from "node:crypto";
 import { promisify } from "node:util";
 import { dirname, join } from "node:path";
 
@@ -110,7 +111,9 @@ export class NginxProvider implements RoutingProvider, SslProvider {
   // ── File operation helpers (dual-path: local or remote) ──────────────
 
   private async _writeFile(path: string, content: string): Promise<void> {
-    const tmpPath = `${path}.tmp-${process.pid}-${Date.now()}`;
+    // Random suffix (not just pid+ms) so two same-ms writes to the same conf
+    // can't collide on the temp path and defeat the atomic rename.
+    const tmpPath = `${path}.tmp-${process.pid}-${Date.now()}-${randomBytes(4).toString("hex")}`;
 
     if (this.executor) {
       try {
@@ -300,8 +303,18 @@ ${webhookLocation}
 `;
     }
 
+    // Snapshot the prior conf so a block that fails `openresty -t` can be
+    // rolled back — otherwise a bad conf stays on disk and poisons every
+    // subsequent reload box-wide (same self-rollback applyRateLimit uses).
+    const snapshot = await this._captureFile(configPath);
     await this._writeFile(configPath, serverBlock);
-    await this.reload();
+    try {
+      await this.reload();
+    } catch (err) {
+      await this._restoreFile(configPath, snapshot);
+      await this.reload().catch(() => undefined);
+      throw err;
+    }
   }
 
   /**

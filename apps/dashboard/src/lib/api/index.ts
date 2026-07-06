@@ -77,6 +77,8 @@ export type {
   ComponentActionResult,
   ComponentLogs,
   BulkRestartResult,
+  MailBackupPolicy,
+  SaveMailBackupPolicyInput,
 } from "./mail-admin";
 export type {
   MailSetupStep,

@@ -10,6 +10,8 @@
 import type { Context } from "hono";
 import { streamSSE } from "../../lib/sse";
 import { assertResourceInOrg, param } from "../../lib/controller-helpers";
+import { serviceKind } from "../../lib/deployable-service";
+import { reconcileProjectRoutes } from "../../lib/route-apply.service";
 import { getRequestContext } from "../../lib/request-context";
 import type { RequestContext } from "../../lib/request-context";
 import { permission } from "../../lib/permission";
@@ -32,7 +34,7 @@ import { getOpenRestyPaths } from "@/lib/openresty-paths";
 import * as domainService from "../domains/domain.service";
 import * as prepareService from "../deployments/prepare.service";
 import { sshManager } from "../../lib/ssh-manager";
-import { env, internalApiUrl, runtimeTarget } from "../../config";
+import { env, runtimeTarget } from "../../config";
 import { resolveProjectTrafficSource, fetchMgmt, mgmtStream } from "../../lib/project-analytics";
 import { refreshProjectFaviconIfStale } from "../../lib/favicon-detector";
 import { getAdminOblienClient } from "../../lib/oblien-user-client";
@@ -50,7 +52,6 @@ import {
   listBranches as listGitHubBranches,
 } from "../github/github.service";
 import { getInstallationIdByOrg, getInstallUrl } from "../github/github.auth";
-import { platform } from "../../lib/controller-helpers";
 import { listProjectRouteRows, resolveProjectRouteState } from "../domains/project-route.service";
 
 // Track which servers have had Lua scripts deployed this session
@@ -968,7 +969,7 @@ export async function serverLogStreamToken(c: Context) {
     return c.json({ error: "Project not found" }, 404);
   }
 
-  const source = await resolveProjectTrafficSource(id);
+  const source = await resolveProjectTrafficSource(id, { domain: c.req.query("domain") });
   if (!source) {
     return c.json({ error: "No domain configured for this project" }, 400);
   }
@@ -1030,7 +1031,7 @@ export async function serverLogStream(c: Context) {
     return c.json({ error: "Project not found" }, 404);
   }
 
-  const source = await resolveProjectTrafficSource(id);
+  const source = await resolveProjectTrafficSource(id, { domain: c.req.query("domain") });
   if (!source || source.kind !== "self-hosted") {
     return c.json({ error: "Use stream-token endpoint for cloud projects" }, 400);
   }
@@ -1096,7 +1097,7 @@ export async function recentServerLogs(c: Context) {
     return c.json({ error: "Project not found" }, 404);
   }
 
-  const source = await resolveProjectTrafficSource(id);
+  const source = await resolveProjectTrafficSource(id, { domain: c.req.query("domain") });
   if (!source) {
     return c.json({ logs: [] });
   }
@@ -1658,16 +1659,24 @@ export async function setWebhookDomain(c: Context) {
  * Reads the current deployment's service info to get the route target.
  */
 async function reRegisterDomainRoute(
-  project: { id: string; activeDeploymentId: string | null; port: number | null },
+  project: {
+    id: string;
+    activeDeploymentId: string | null;
+    port: number | null;
+    cloudWorkspaceId: string | null;
+    organizationId: string;
+    webhookDomain: string | null;
+  },
   hostname: string,
   enableWebhook: boolean,
 ): Promise<void> {
   if (!project.activeDeploymentId) return;
 
   try {
-    const { routing } = platform();
+    const dep = await repos.deployment.findById(project.activeDeploymentId);
+    if (!dep) return;
 
-    // Find the service deployment to get the container target
+    // Find the service deployment to get the container target.
     const svcDeps = await repos.service.listByDeployment(project.activeDeploymentId);
     const primarySvc = svcDeps.find((s) => s.ip);
 
@@ -1675,11 +1684,20 @@ async function reRegisterDomainRoute(
 
     const port = primarySvc.hostPort?.toString() || project.port?.toString() || "3000";
 
-    await routing.registerRoute({
-      domain: hostname,
-      tls: true,
-      targetUrl: `http://${primarySvc.ip}:${port}`,
-      webhookProxy: enableWebhook ? `${internalApiUrl}/api/webhooks/` : undefined,
+    // Single reused path (deployment-scoped self-hosted routing / cloud). The
+    // webhook-proxy is forced on/off explicitly here because the project row's
+    // webhookDomain isn't updated yet at call time.
+    await reconcileProjectRoutes(project, {
+      deployment: dep,
+      registers: [
+        {
+          hostname,
+          targetUrl: `http://${primarySvc.ip}:${port}`,
+          port: Number(port) || undefined,
+          isCustomDomain: false,
+          webhook: enableWebhook,
+        },
+      ],
     });
   } catch (err) {
     console.error(`[Webhook Domain] Failed to update nginx for ${hostname}:`, err);
@@ -1849,11 +1867,14 @@ export async function getInfo(c: Context) {
   // project column. The dashboard's config-edit path uses this to hydrate from
   // saved data without re-detecting the repo. Single-app → "app" (Dockerfile
   // single-apps aren't separately signalled at the project level today).
+  // Use serviceKind so a row with a null/legacy `kind` still counts as compose
+  // (matches the schema default and every other consumer) — a compose project
+  // must never misreport as "app" just because a row lacks an explicit kind.
   const projectType: "app" | "services" | "monorepo" = serviceRows.some(
-    (s) => s.kind === "monorepo",
+    (s) => serviceKind(s) === "monorepo",
   )
     ? "monorepo"
-    : serviceRows.some((s) => s.kind === "compose")
+    : serviceRows.some((s) => serviceKind(s) === "compose")
       ? "services"
       : "app";
 

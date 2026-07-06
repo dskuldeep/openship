@@ -13,6 +13,7 @@ import { useToast } from "@/context/ToastContext";
 import { useTheme } from "@/components/theme-provider";
 import { deployApi } from "@/lib/api";
 import type { DeploymentStatus, ServiceDeployStatus } from "@/context/deployment/types";
+import { encodeRepoSlug, encodeLocalSlug } from "@/utils/repoSlug";
 import type { BuildLog } from "@/utils/deploymentPhaseDetector";
 
 const warningDismissedKey = (deploymentId: string) => `compose-warning-dismissed:${deploymentId}`;
@@ -193,6 +194,29 @@ const ComposeDeploymentProcessing: React.FC<Props> = ({ onRedeploy }) => {
             }
             hideModal(modalId);
           }}
+          onRetry={async () => {
+            // Rebuild ONLY the failed services — the successful ones carry
+            // forward on their existing containers (compose carry-forward).
+            // Same converged path as smart-route, just an explicit id list.
+            const failedIds = state.serviceStatuses
+              .filter((s) => s.status === "failed" && s.serviceId)
+              .map((s) => s.serviceId);
+            if (failedIds.length === 0 || !state.projectId) {
+              hideModal(modalId);
+              return;
+            }
+            handledWarningDeploymentRef.current = state.deploymentId;
+            if (typeof window !== "undefined") {
+              window.sessionStorage.setItem(warningKey, "1");
+            }
+            const res = await deployApi.trigger({
+              projectId: state.projectId,
+              serviceIds: failedIds,
+            });
+            hideModal(modalId);
+            const newId = res?.data?.deployment?.id;
+            router.push(newId ? `/build/${newId}` : `/projects/${state.projectId}`);
+          }}
           onReject={async () => {
             handledWarningDeploymentRef.current = state.deploymentId;
             if (typeof window !== "undefined") {
@@ -241,10 +265,18 @@ const ComposeDeploymentProcessing: React.FC<Props> = ({ onRedeploy }) => {
     if (state.projectId) router.push(`/projects/${state.projectId}`);
   };
 
-  // Jump to the project's Services tab — where compose/service config is edited
-  // (image, ports, env, volumes, healthcheck, …) before a redeploy.
+  // Re-open the deploy wizard rehydrated from THIS project's saved config
+  // (mode=config → initializeFromProject: no repo re-clone/re-detect). Same
+  // "Edit" the project Runtime page uses — the single place the full config
+  // (services, build, target, …) is edited. Deploy info is already stored, so
+  // there's nothing to re-fetch from the repo.
   const handleEditConfig = () => {
-    if (state.projectId) router.push(`/projects/${state.projectId}/services`);
+    const projectId = state.projectId || config.projectId;
+    if (!projectId) return;
+    const slug = config.localPath
+      ? encodeLocalSlug(config.localPath)
+      : encodeRepoSlug(config.owner, config.repo);
+    router.push(`/deploy/${slug}?projectId=${projectId}&mode=config`);
   };
 
   // ── Title ──────────────────────────────────────────────────────────────
@@ -260,7 +292,7 @@ const ComposeDeploymentProcessing: React.FC<Props> = ({ onRedeploy }) => {
             : "Deploying Services…";
 
   return (
-    <div className="min-h-screen bg-background mx-auto md:px-12">
+    <div className="min-h-screen bg-background max-w-[1600px] mx-auto px-4 sm:px-6 lg:px-8">
       {/* ── Header ─────────────────────────────────────────────────────── */}
       <div className="py-5">
         <div className="flex items-center justify-between">
@@ -710,18 +742,27 @@ function ComposeLogTerminal({
 }) {
   const terminalRef = useRef<any | null>(null);
   const writtenCountRef = useRef(0);
+  const prevActiveRef = useRef(false);
   const [ready, setReady] = useState(false);
 
   useEffect(() => {
     const terminal = terminalRef.current;
     if (!terminal || !ready) return;
 
-    if (logs.length < writtenCountRef.current) {
+    const becameActive = active && !prevActiveRef.current;
+    prevActiveRef.current = active;
+
+    // Repaint from scratch when this tab is (re)opened, or if the buffer was
+    // trimmed. xterm's DOM renderer does not reliably paint rows written while
+    // the tab was hidden (visibility:hidden), so a service that streamed its
+    // build output while another tab was focused would otherwise look empty
+    // (only the first line survives) until this forces a full re-render.
+    if (becameActive || logs.length < writtenCountRef.current) {
       terminal.reset();
       writtenCountRef.current = 0;
     }
 
-    const shouldScroll = active && isTerminalAtBottom(terminal);
+    const shouldScroll = becameActive || (active && isTerminalAtBottom(terminal));
     logs.slice(writtenCountRef.current).forEach((log) => {
       terminal.write(terminalBytes(log));
     });
@@ -762,15 +803,19 @@ function PartialSuccessModalContent({
   total,
   warningMessage,
   onKeep,
+  onRetry,
   onReject,
 }: {
   failed: number;
   total: number;
   warningMessage: string;
   onKeep: () => void;
+  onRetry: () => Promise<void>;
   onReject: () => Promise<void>;
 }) {
   const [isRejecting, setIsRejecting] = React.useState(false);
+  const [isRetrying, setIsRetrying] = React.useState(false);
+  const busy = isRejecting || isRetrying;
 
   return (
     <div className="p-6 space-y-5">
@@ -794,17 +839,18 @@ function PartialSuccessModalContent({
 
       <div className="rounded-xl border border-border bg-muted/40 p-4">
         <p className="text-sm text-muted-foreground">
-          Rejecting stops using this partial deployment. If a previous deployment exists, Openship
-          restores it. Otherwise, the new partial deployment is removed.
+          Rejecting tears down this partial deployment&apos;s containers and, if a previous
+          deployment exists, restores it. The deployment record and its build logs are kept in your
+          history so you can review what failed.
         </p>
       </div>
 
-      <div className="flex items-center justify-end gap-3 pt-2">
+      <div className="flex flex-wrap items-center justify-end gap-3 pt-2">
         <button
           type="button"
-          className="rounded-lg border border-border bg-muted px-4 py-2 text-sm font-medium text-foreground transition-colors hover:bg-muted/80"
+          className="rounded-lg border border-border bg-muted px-4 py-2 text-sm font-medium text-foreground transition-colors hover:bg-muted/80 disabled:opacity-50"
           onClick={onKeep}
-          disabled={isRejecting}
+          disabled={busy}
         >
           Keep And Fix Later
         </button>
@@ -819,7 +865,7 @@ function PartialSuccessModalContent({
               setIsRejecting(false);
             }
           }}
-          disabled={isRejecting}
+          disabled={busy}
         >
           {isRejecting ? (
             <span className="inline-flex items-center gap-2">
@@ -828,6 +874,28 @@ function PartialSuccessModalContent({
             </span>
           ) : (
             "Reject Deployment"
+          )}
+        </button>
+        <button
+          type="button"
+          className="rounded-lg bg-primary px-4 py-2 text-sm font-medium text-primary-foreground transition-colors hover:bg-primary/90 disabled:opacity-50"
+          onClick={async () => {
+            setIsRetrying(true);
+            try {
+              await onRetry();
+            } finally {
+              setIsRetrying(false);
+            }
+          }}
+          disabled={busy}
+        >
+          {isRetrying ? (
+            <span className="inline-flex items-center gap-2">
+              <Loader2 className="w-4 h-4 animate-spin" />
+              Retrying...
+            </span>
+          ) : (
+            `Retry ${failed} Failed Service${failed === 1 ? "" : "s"}`
           )}
         </button>
       </div>

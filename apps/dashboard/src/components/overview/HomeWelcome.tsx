@@ -88,7 +88,7 @@ const HomeWelcome: React.FC = () => {
       </div>
 
       {/* Feature row */}
-      <div className="grid grid-cols-3 gap-3 max-w-md mx-auto mt-9">
+      {/* <div className="grid grid-cols-3 gap-3 max-w-md mx-auto mt-9">
         {FEATURES.map(({ icon: Icon, label, sub }) => (
           <div key={label} className="bg-card border border-border/50 rounded-xl p-3.5 text-left">
             <div className="w-8 h-8 rounded-lg bg-muted flex items-center justify-center mb-2.5">
@@ -98,7 +98,7 @@ const HomeWelcome: React.FC = () => {
             <p className="text-[11px] text-muted-foreground mt-0.5">{sub}</p>
           </div>
         ))}
-      </div>
+      </div> */}
 
       <p className="text-center text-xs text-muted-foreground/60 mt-7">
         Tip: press{" "}

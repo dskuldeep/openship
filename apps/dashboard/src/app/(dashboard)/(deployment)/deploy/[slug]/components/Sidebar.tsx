@@ -1,6 +1,7 @@
 import React, { useCallback, useRef } from "react";
-import { GitBranch, Rocket, Github, Loader2, Globe, Container, Server, Layers, Check, AlertCircle, Key, Plus } from "lucide-react";
+import { GitBranch, Rocket, Github, Loader2, Globe, Container, Server, Layers, Check, AlertCircle, Key, Plus, Copy } from "lucide-react";
 import { CustomSelect } from "@/components/ui/CustomSelect";
+import DropdownMenu from "@/components/ui/DropdownMenu";
 import DomainSettings from "./DomainSettings";
 import BuildSummary from "./BuildSummary";
 import { useCloneStrategyGate } from "./CloneStrategyNudge";
@@ -17,7 +18,8 @@ import { useGitHub } from "@/context/GitHubContext";
 import { useModal } from "@/context/ModalContext";
 import { useRouter, useSearchParams } from "next/navigation";
 import { invalidateProjectCaches } from "@/hooks/useProjectEndpoints";
-import { projectsApi } from "@/lib/api";
+import { projectsApi, githubApi, getApiErrorMessage } from "@/lib/api";
+import { useToast } from "@/context/ToastContext";
 
 // ─── Deploy checklist for compose ────────────────────────────────────────────
 
@@ -143,8 +145,30 @@ const Sidebar: React.FC = () => {
   const { baseDomain, selfHosted, deployMode } = usePlatform();
   const { installUrl, state: githubState } = useGitHub();
   const { showModal, hideModal } = useModal();
+  const { showToast } = useToast();
   const router = useRouter();
   const isServices = usesServiceDeployment(config);
+
+  // Copy a ready-to-run `git clone` command with a short-lived GitHub App
+  // installation token. Cloud / GitHub-App mode only — surfaces a clear
+  // message otherwise (the backend 409s in gh-CLI / PAT mode).
+  const handleCopyCloneToken = useCallback(async () => {
+    if (!config.owner || !config.repo || config.owner === "local") {
+      showToast("No GitHub repository for this deployment.", "error", "Clone token");
+      return;
+    }
+    try {
+      const { command } = await githubApi.getCloneToken(config.owner, config.repo);
+      await navigator.clipboard.writeText(command);
+      showToast(
+        "git clone command copied. The embedded token expires within the hour.",
+        "success",
+        "Clone token copied",
+      );
+    } catch (err) {
+      showToast(getApiErrorMessage(err, "Could not mint a clone token"), "error", "Clone token");
+    }
+  }, [config.owner, config.repo, showToast]);
   const canConnectCloud = canUseCloudConnection({ selfHosted, deployMode });
   // Clone-strategy gate - only meaningful for self-hosted server deploys
   // where we need to pick how the repo gets cloned on the remote (local
@@ -360,6 +384,20 @@ const Sidebar: React.FC = () => {
                 {config.owner}/{config.repo}
               </p>
             </div>
+            {config.owner && config.owner !== "local" && config.repo && (
+              <DropdownMenu
+                align="right"
+                triggerClassName="p-1.5 -mr-1 rounded-lg text-muted-foreground hover:bg-muted transition-colors"
+                actions={[
+                  {
+                    id: "clone-token",
+                    label: "Copy clone token",
+                    icon: <Copy className="size-4" />,
+                    onClick: handleCopyCloneToken,
+                  },
+                ]}
+              />
+            )}
           </div>
           {config.branches.length > 0 && (
             <div className="mt-3">

@@ -41,6 +41,11 @@ export interface ServiceHandle {
   containerId: string | null;
   /** Project slug — used in destination key paths. */
   projectSlug: string;
+  /** Whether this service's NAMED volumes are project-scoped
+   *  (openship-<slug>-<name>). Mirrors service.namespaceVolumes so the DB
+   *  fallback in listSources resolves the same name deploy used. False for
+   *  grandfathered pre-migration services (bare names). */
+  namespaceVolumes: boolean;
 }
 
 export interface ExecExitInfo {

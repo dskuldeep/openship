@@ -28,6 +28,7 @@ r.post("/preview", { tag: "domain:read", readOnly: true }, ctrl.preview);
 // falls through to the local handler.
 r.delete("/:id", { tag: "domain:admin" }, cloudDomainProxy, ctrl.remove);
 r.post("/:id/verify", { tag: "domain:write" }, cloudDomainProxy, ctrl.verify);
+r.post("/:id/primary", { tag: "domain:write" }, cloudDomainProxy, ctrl.setPrimary);
 r.get("/:id/records", { tag: "domain:read" }, cloudDomainProxy, ctrl.records);
 r.post("/:id/renew", { tag: "domain:write" }, cloudDomainProxy, ctrl.renewSsl);
 r.post("/:id/verify-ssl", { tag: "domain:write" }, cloudDomainProxy, ctrl.verifySsl);

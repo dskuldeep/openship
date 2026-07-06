@@ -54,7 +54,9 @@ export async function triggerBackupViaWebhook(opts: {
   }
   // backup_policy doesn't carry organizationId directly — resolve via
   // its project. Required for the audit row's NOT NULL fk to org.
-  const project = await repos.project.findById(policy.projectId).catch(() => null);
+  const project = policy.projectId
+    ? await repos.project.findById(policy.projectId).catch(() => null)
+    : null;
   const organizationId = project?.organizationId;
 
   if (!policy.enabled) {

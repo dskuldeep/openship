@@ -40,7 +40,7 @@ import { decrypt, encrypt } from "../../../lib/encryption";
 import { sshManager } from "../../../lib/ssh-manager";
 import {
   readState,
-  writeState,
+  mutateState,
   type MailServerState,
   type TestMailboxState,
 } from "../mail-state";
@@ -197,13 +197,13 @@ async function mintAndPersist(args: MintArgs): Promise<PlatformMailboxCreds> {
     updatedAt: new Date().toISOString(),
   };
   try {
-    await writeState(exec, {
-      ...state,
+    await mutateState(exec, serverId, (s) => ({
+      ...s,
       testMailboxes: {
-        ...(state.testMailboxes ?? {}),
+        ...(s.testMailboxes ?? {}),
         [domain]: nextEntry,
       },
-    });
+    }));
   } catch (err) {
     await rollbackMailbox(exec, email, layout).catch(() => {});
     throw new PlatformMailboxError(

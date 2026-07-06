@@ -43,6 +43,9 @@ r.delete("/repos/:owner/:repo", { tag: "github:admin" }, ctrl.deleteRepo);
 /* ─── Branches ─────────────────────────────────────────────────────────── */
 r.get("/repos/:owner/:repo/branches", { tag: "github:list" }, ctrl.listBranches);
 
+/* ─── Clone token (short-lived GitHub App installation token) ──────────── */
+r.get("/repos/:owner/:repo/clone-token", { tag: "github:read" }, ctrl.getCloneToken);
+
 /* ─── Files ────────────────────────────────────────────────────────────── */
 r.get("/repos/:owner/:repo/files", { tag: "github:list" }, ctrl.listFiles);
 r.get("/repos/:owner/:repo/file", { tag: "github:read" }, ctrl.getFile);

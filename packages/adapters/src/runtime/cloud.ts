@@ -64,7 +64,7 @@ import { runLocalBuild } from "./local-build";
 import { transferLocalDirectory } from "./transfer";
 import { checkGit } from "../system/checks";
 import { installGit } from "../system/installer";
-import { STACKS, TRANSFER_EXCLUDES, safeErrorMessage, type StackId, type StackDefinition, type ComposeAdvanced } from "@repo/core";
+import { STACKS, TRANSFER_EXCLUDES, SYSTEM, safeErrorMessage, type StackId, type StackDefinition, type ComposeAdvanced } from "@repo/core";
 
 type CloudWorkspaceRuntime = Awaited<ReturnType<WorkspaceHandle["runtime"]>>;
 const DOCKERFILE_SOURCE_IMAGE = "node:22";
@@ -90,7 +90,7 @@ function summarizeCommandOutput(output: string): string {
   return lastLine.length > 300 ? `${lastLine.slice(0, 297)}...` : lastLine;
 }
 
-function exposeTarget(port: number, slug?: string, domain = "opsh.io") {
+function exposeTarget(port: number, slug?: string, domain: string = SYSTEM.DOMAINS.CLOUD_DOMAIN) {
   return slug ? `port ${port} for slug "${slug}" (${slug}.${domain})` : `port ${port}`;
 }
 
@@ -277,6 +277,11 @@ type DockerfileBuildSource =
     };
 
 // ─── CloudRuntime ────────────────────────────────────────────────────────────
+
+/** containerId prefix marking a static-page cloud deployment (`page:<slug>`),
+ *  vs a dynamic workspace id. Shared with the API-layer cloud-route helper so
+ *  the convention lives in one place. */
+export const PAGE_CONTAINER_PREFIX = "page:";
 
 export class CloudRuntime implements MultiServiceRuntimeAdapter {
   readonly name = "cloud";
@@ -1444,7 +1449,7 @@ fi`;
         });
         const exposeResult = await ws.publicAccess.expose({
           port: primaryPort,
-          domain: "opsh.io",
+          domain: SYSTEM.DOMAINS.CLOUD_DOMAIN,
           slug: primarySlug,
         });
         url = exposeResult.url as string | undefined;
@@ -1545,7 +1550,7 @@ fi`;
           path: outputPath,
           name: config.projectName ?? pageSlug,
           slug: pageSlug,
-          domain: "opsh.io",
+          domain: SYSTEM.DOMAINS.CLOUD_DOMAIN,
         });
         pg = result.page;
       } catch (err) {
@@ -1583,14 +1588,14 @@ fi`;
 
     return {
       deploymentId: config.deploymentId,
-      containerId: `page:${page.slug}`,
+      containerId: `${PAGE_CONTAINER_PREFIX}${page.slug}`,
       url: page.url ?? undefined,
       status: "running",
     };
   }
 
   async stop(containerId: string): Promise<void> {
-    if (containerId.startsWith("page:")) {
+    if (containerId.startsWith(PAGE_CONTAINER_PREFIX)) {
       const slug = containerId.slice(5);
       if (this.adminProxy?.disablePage) {
         await this.adminProxy.disablePage(slug);
@@ -1603,7 +1608,7 @@ fi`;
   }
 
   async start(containerId: string): Promise<void> {
-    if (containerId.startsWith("page:")) {
+    if (containerId.startsWith(PAGE_CONTAINER_PREFIX)) {
       const slug = containerId.slice(5);
       if (this.adminProxy?.enablePage) {
         await this.adminProxy.enablePage(slug);
@@ -1616,7 +1621,7 @@ fi`;
   }
 
   async restart(containerId: string): Promise<void> {
-    if (containerId.startsWith("page:")) {
+    if (containerId.startsWith(PAGE_CONTAINER_PREFIX)) {
       // Pages are static - no process to restart
       return;
     }
@@ -1624,7 +1629,7 @@ fi`;
   }
 
   async destroy(containerId: string): Promise<void> {
-    if (containerId.startsWith("page:")) {
+    if (containerId.startsWith(PAGE_CONTAINER_PREFIX)) {
       const slug = containerId.slice(5);
       if (this.adminProxy?.deletePage) {
         await this.adminProxy.deletePage(slug);
@@ -1686,7 +1691,7 @@ fi`;
   async archive(deployment: DeploymentRef): Promise<void> {
     // Page deployments: disable the page. Disk goes nowhere; the page
     // record itself IS the artifact.
-    if (deployment.containerId?.startsWith("page:")) {
+    if (deployment.containerId?.startsWith(PAGE_CONTAINER_PREFIX)) {
       const slug = deployment.containerId.slice(5);
       try {
         if (this.adminProxy?.disablePage) {
@@ -1727,7 +1732,7 @@ fi`;
 
   async purge(deployment: DeploymentRef): Promise<void> {
     // Page deployment — delete the page record.
-    if (deployment.containerId?.startsWith("page:")) {
+    if (deployment.containerId?.startsWith(PAGE_CONTAINER_PREFIX)) {
       const slug = deployment.containerId.slice(5);
       try {
         if (this.adminProxy?.deletePage) {
@@ -2113,7 +2118,7 @@ fi`;
    * Check whether a subdomain slug is available on opsh.io.
    * Uses Oblien's standalone `domain.checkSlug()` - no workspace needed.
    */
-  async checkSlug(slug: string, domain = "opsh.io"): Promise<{ available: boolean; url: string }> {
+  async checkSlug(slug: string, domain: string = SYSTEM.DOMAINS.CLOUD_DOMAIN): Promise<{ available: boolean; url: string }> {
     const result = await this.client.domain.checkSlug({ slug, domain });
     return { available: result.available, url: result.url };
   }

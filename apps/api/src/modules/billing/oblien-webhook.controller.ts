@@ -49,7 +49,7 @@
 
 import type { Context } from "hono";
 import { createHmac, timingSafeEqual } from "node:crypto";
-import { db, schema, eq, sql } from "@repo/db";
+import { db, schema, eq, sql, hashStringToInt } from "@repo/db";
 import { safeErrorMessage } from "@repo/core";
 
 import { env } from "../../config/env";
@@ -163,22 +163,6 @@ function extractNamespace(payload: OblienWebhookPayload): string | null {
   if (typeof payload.namespace === "string") return payload.namespace;
   if (typeof payload.data?.namespace === "string") return payload.data.namespace;
   return null;
-}
-
-/* ───────── Advisory-lock key derivation ─────────────────────────────────── */
-
-/**
- * 31-bit signed-positive int hash for `pg_try_advisory_xact_lock`. Same
- * implementation as billing.webhooks.ts — copied rather than imported
- * to keep webhook modules independent.
- */
-function hashStringToInt(input: string): number {
-  let h = 0x811c9dc5;
-  for (let i = 0; i < input.length; i++) {
-    h ^= input.charCodeAt(i);
-    h = Math.imul(h, 0x01000193);
-  }
-  return h & 0x7fffffff;
 }
 
 function readAcquired(result: unknown): boolean {

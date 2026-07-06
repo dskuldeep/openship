@@ -49,7 +49,7 @@ import {
 } from "../../domains/project-route.service";
 import {
   readState,
-  writeState,
+  mutateState,
   type MailWebmailState,
   type MailServerState,
 } from "../mail-state";
@@ -237,14 +237,12 @@ async function persistWebmailBlock(
   block: MailWebmailState,
 ): Promise<void> {
   await sshManager.withExecutor(mailServerId, async (exec) => {
-    const state = await readState(exec);
-    if (!state) {
+    const result = await mutateState(exec, mailServerId, (s) => ({ ...s, webmail: block }));
+    if (!result) {
       throw new Error(
         "Could not persist webmail state - mail state file is missing on the server.",
       );
     }
-    const next: MailServerState = { ...state, webmail: block };
-    await writeState(exec, next);
   });
 }
 
@@ -297,34 +295,34 @@ export async function markWebmailInstalled(
     let proxyUpstream = "";
 
     await sshManager.withExecutor(mailServerId, async (exec) => {
-      const state = await readState(exec);
-      if (!state?.webmail) return;
+      await mutateState(exec, mailServerId, (state) => {
+        if (!state.webmail) return state; // nothing to flip — leave as-is
 
-      // Detect: was this deploy on Opshcloud, targeted at the mail
-      // server's own mail.<install> subdomain? If so we'll register the
-      // proxy AFTER the state write below.
-      const installDomain = state.domain;
-      const wm = state.webmail;
-      const isCloud = wm.target === "cloud";
-      const isOwnMailSubdomain =
-        !!installDomain && wm.hostname === `mail.${installDomain}`;
-      needsProxy = isCloud && isOwnMailSubdomain && !!deployedUrl;
+        // Detect: was this deploy on Opshcloud, targeted at the mail server's
+        // own mail.<install> subdomain? If so we'll register the proxy AFTER
+        // the (locked) state write returns.
+        const installDomain = state.domain;
+        const wm = state.webmail;
+        const isCloud = wm.target === "cloud";
+        const isOwnMailSubdomain =
+          !!installDomain && wm.hostname === `mail.${installDomain}`;
+        needsProxy = isCloud && isOwnMailSubdomain && !!deployedUrl;
 
-      if (needsProxy) {
-        proxyHostname = wm.hostname;
-        proxyUpstream = deployedUrl!;
-      }
+        if (needsProxy) {
+          proxyHostname = wm.hostname;
+          proxyUpstream = deployedUrl!;
+        }
 
-      const next: MailServerState = {
-        ...state,
-        webmail: {
-          ...wm,
-          installed: true,
-          deployedAt: new Date().toISOString(),
-          ...(deployedUrl ? { cloudUrl: isCloud ? deployedUrl : wm.cloudUrl } : {}),
-        },
-      };
-      await writeState(exec, next);
+        return {
+          ...state,
+          webmail: {
+            ...wm,
+            installed: true,
+            deployedAt: new Date().toISOString(),
+            ...(deployedUrl ? { cloudUrl: isCloud ? deployedUrl : wm.cloudUrl } : {}),
+          },
+        };
+      });
     });
 
     if (needsProxy) {
@@ -427,11 +425,12 @@ export async function cleanupWebmailInstall(input: {
   // 3. Strip the webmail block from mail-state on the mail VPS.
   try {
     await sshManager.withExecutor(input.mailServerId, async (exec) => {
-      const state = await readState(exec);
-      if (!state?.webmail) return;
-      const next: MailServerState = { ...state };
-      delete next.webmail;
-      await writeState(exec, next);
+      await mutateState(exec, input.mailServerId, (state) => {
+        if (!state.webmail) return state;
+        const next: MailServerState = { ...state };
+        delete next.webmail;
+        return next;
+      });
     });
   } catch (err) {
     console.warn(

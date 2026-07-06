@@ -25,6 +25,7 @@ export const OverviewTab = () => {
     setActiveTab,
     id,
     servicesData,
+    selectedDomain,
   } = useProjectSettings();
 
   // ATOMIC PER-ENDPOINT HOOKS — each one owns its own skeleton state.
@@ -32,7 +33,7 @@ export const OverviewTab = () => {
   // concurrent fetches across components (e.g. OverviewTab and
   // MonitoringTab share one summary fetch).
   const projectInfoQuery = useProjectInfo(id);
-  const analytics = useAnalyticsData(id);
+  const analytics = useAnalyticsData(id, selectedDomain);
   const analyticsData = analytics.data;
   const services = servicesData.services;
   const serviceCount = servicesData.isLoading

@@ -19,16 +19,18 @@ import type { TAnalyticsQuery, TUsageQuery, TUsageStreamQuery } from "./analytic
 /** GET /analytics - cumulative summary */
 export async function summary(c: Context) {
   const ctx = getRequestContext(c);
-  const { projectId } = c.req.query() as unknown as TAnalyticsQuery;
-  const data = await analyticsService.getAnalyticsSummary(ctx, projectId);
+  const { projectId, domain } = c.req.query() as unknown as TAnalyticsQuery;
+  // Slice the single fetch+compute overview (last 24h) to just its summary.
+  const data = (await analyticsService.getAnalyticsOverview(ctx, projectId, undefined, undefined, domain)).summary;
   return c.json({ data });
 }
 
 /** GET /analytics/periods - time-series periods */
 export async function periods(c: Context) {
   const ctx = getRequestContext(c);
-  const { projectId, from, to } = c.req.query() as unknown as TAnalyticsQuery;
-  const data = await analyticsService.getAnalyticsPeriods(ctx, projectId, from, to);
+  const { projectId, from, to, domain } = c.req.query() as unknown as TAnalyticsQuery;
+  // Slice the single fetch+compute overview to just its time-series periods.
+  const data = (await analyticsService.getAnalyticsOverview(ctx, projectId, from, to, domain)).periods;
   return c.json({ data });
 }
 
@@ -36,11 +38,14 @@ export async function periods(c: Context) {
  * GET /analytics/overview - summary + periods together, from ONE underlying
  * traffic fetch. The dashboard reads this so a project view makes a single
  * cloud round-trip instead of two (separate /summary + /periods).
+ *
+ * `domain` scopes the numbers to a single tracked domain (multi-domain
+ * projects); omitted, it aggregates every domain like before.
  */
 export async function overview(c: Context) {
   const ctx = getRequestContext(c);
-  const { projectId, from, to } = c.req.query() as unknown as TAnalyticsQuery;
-  const data = await analyticsService.getAnalyticsOverview(ctx, projectId, from, to);
+  const { projectId, from, to, domain } = c.req.query() as unknown as TAnalyticsQuery;
+  const data = await analyticsService.getAnalyticsOverview(ctx, projectId, from, to, domain);
   return c.json({ data });
 }
 

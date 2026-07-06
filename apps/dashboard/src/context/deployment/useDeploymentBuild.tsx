@@ -1,6 +1,6 @@
 "use client";
 
-import { useState, useRef, useCallback } from "react";
+import { useState, useRef, useCallback, useEffect } from "react";
 import type { Terminal } from "@xterm/xterm";
 import { useToast } from "@/context/ToastContext";
 import { useCloud } from "@/context/CloudContext";
@@ -12,21 +12,61 @@ import { useBuildStream } from "@/hooks/useSSEConnection";
 import { deployApi, projectsApi } from "@/lib/api";
 import { ApiError, getApiErrorMessage } from "@/lib/api/client";
 import { DeployCredentialModal } from "@/components/deployments/DeployCredentialModal";
-import type { DeploymentConfig, DeploymentState, DeploymentStatus } from "./types";
+import type { DeploymentConfig, DeploymentState, DeploymentStatus, ServiceDeployStatus } from "./types";
 import { syncActiveModeSnapshot } from "./mode-config";
 import {
   BUILD_PHASES,
   DEFAULT_CONFIG,
   INITIAL_STATE,
   ensurePublicEndpoints,
+  normalizeComposeService,
   publicEndpointsNeedCloud,
   resolveBuildElapsedMs,
   syncPublicEndpointState,
   usesServiceDeployment,
 } from "./types";
+import type { RawComposeService } from "./types";
 
 const ERROR_DEBOUNCE_MS = 1000;
 const MAX_RENDERED_BUILD_LOGS = 2000;
+const BUILD_STATUS_POLL_MS = 3000;
+
+// Map a getBuildStatus snapshot's per-service rows into UI service statuses.
+// Shared by the initial hydrate (loadBuildSession) and the self-heal poll so
+// both derive serviceStatuses identically. DB may store running/failed/pending/
+// deploying/building/stopped; collapse build+deploy into "deploying" for the UI.
+function mapServiceStatusesFromBuildStatus(data: any): ServiceDeployStatus[] {
+  if (
+    !(
+      (data.projectType === "services" || data.projectType === "monorepo") &&
+      data.services &&
+      data.serviceStatuses
+    )
+  ) {
+    return [];
+  }
+  return (data.services as any[]).map((svc: any) => {
+    const sd = (data.serviceStatuses as any[]).find((s: any) => s.serviceId === svc.serviceId);
+    const rawStatus = sd?.status ?? "pending";
+    const status: ServiceDeployStatus["status"] =
+      rawStatus === "running"
+        ? "running"
+        : rawStatus === "failed"
+          ? "failed"
+          : rawStatus === "deploying" || rawStatus === "building"
+            ? "deploying"
+            : "pending";
+    return {
+      serviceId: svc.serviceId,
+      serviceName: svc.serviceName,
+      status,
+      containerId: sd?.containerId,
+      hostPort: sd?.hostPort,
+      image: svc.image,
+      build: svc.build,
+    } as ServiceDeployStatus;
+  });
+}
 
 function serializeProjectPublicEndpoint(
   endpoint: DeploymentConfig["publicEndpoints"][number],
@@ -80,6 +120,53 @@ function logTypeFromHydratedEntry(entry: Record<string, unknown>, text: string):
   if (entry.type === "error" || entry.level === "error") return "error";
   if (entry.type === "success") return "success";
   return logTypeFromStreamMessage(entry.level, text);
+}
+
+// Rebuild the terminal buffer from a getBuildStatus snapshot. Shared by the
+// initial hydrate (loadBuildSession) and the self-heal poll. Structured
+// logEntries preserve per-service serviceName (so compose tabs stay populated);
+// the plain-text fallback has no attribution.
+function mapBuildLogsFromStatus(data: any): BuildLog[] {
+  if (Array.isArray(data.logEntries)) {
+    return (data.logEntries as Record<string, unknown>[])
+      .map((entry): BuildLog | null => {
+        const text =
+          typeof entry.text === "string"
+            ? entry.text
+            : typeof entry.message === "string"
+              ? entry.message
+              : "";
+        if (!text.trim()) return null;
+        return {
+          type: logTypeFromHydratedEntry(entry, text),
+          text,
+          time:
+            typeof entry.time === "string"
+              ? entry.time
+              : typeof entry.timestamp === "string"
+                ? entry.timestamp
+                : new Date().toISOString(),
+          serviceName:
+            typeof entry.serviceName === "string" && entry.serviceName.trim()
+              ? entry.serviceName
+              : undefined,
+          rawData: typeof entry.rawData === "string" ? entry.rawData : undefined,
+          eventId: typeof entry.eventId === "number" ? entry.eventId : undefined,
+        };
+      })
+      .filter((entry): entry is BuildLog => entry !== null);
+  }
+  if (data.logs) {
+    return (data.logs as string)
+      .split("\n")
+      .filter((line: string) => line.trim())
+      .map((line: string) => ({
+        type: "info" as const,
+        text: line,
+        time: new Date().toISOString(),
+      }));
+  }
+  return [];
 }
 
 const STEPS = [
@@ -574,6 +661,13 @@ export function useDeploymentBuild(
           config.deployTarget === "server" && config.forwardGitCredentials === true
             ? true
             : undefined,
+        // Clone location — only meaningful for a server target. Default
+        // "api-host" is left implicit (undefined) so the backend keeps today's
+        // clone-on-orchestrator behavior unless the user opted into "server".
+        cloneStrategy:
+          config.deployTarget === "server" && config.cloneStrategy === "server"
+            ? "server"
+            : undefined,
         runtimeMode:
           config.projectType === "docker" || isServiceDeployment
             ? "docker"
@@ -728,6 +822,78 @@ export function useDeploymentBuild(
     await buildStream.connect(id, startBuild);
   }, [state.deploymentId, buildStream]);
 
+  // Self-heal the services view when the live stream drops mid-deploy. The build
+  // SSE can go terminal (a transient reconnect miss, a premature terminal event)
+  // while the deploy is still running server-side — without this the UI freezes
+  // on "Prepare" until a manual refresh. While the deployment is active and the
+  // stream is NOT connected, poll getBuildStatus (the same source a refresh uses)
+  // and merge the live-relevant fields so per-service progress advances on its own.
+  useEffect(() => {
+    const deploymentId = state.deploymentId;
+    const active =
+      state.isDeploying &&
+      !state.deploymentSuccess &&
+      !state.deploymentFailed &&
+      !state.deploymentCanceled;
+    if (!deploymentId || !active || buildStream.isConnected) return;
+
+    let cancelled = false;
+    const tick = async () => {
+      try {
+        const data = await deployApi.getBuildStatus(deploymentId);
+        if (cancelled || !data?.success) return;
+        const isActive = data.is_active;
+        const status = data.status;
+        const mapped = mapServiceStatusesFromBuildStatus(data);
+        // The stream is detached, so live logs stopped flowing — refresh the
+        // terminal buffer from the snapshot too (structured entries keep their
+        // serviceName so per-service tabs repopulate). Keep lastEventIdRef in
+        // sync so a later reconnect-replay dedups against what we just applied.
+        const polledLogs = mapBuildLogsFromStatus(data);
+        if (typeof data.lastEventId === "number") {
+          lastEventIdRef.current = data.lastEventId;
+        }
+        setState((prev) => ({
+          ...prev,
+          currentProgress: data.progress ?? prev.currentProgress,
+          currentStepIndex: data.currentStep ?? prev.currentStepIndex,
+          isDeploying: isActive,
+          deploymentSuccess: !isActive && status === "ready",
+          deploymentFailed: !isActive && status === "failed",
+          deploymentCanceled: !isActive && status === "cancelled",
+          ...(mapped.length ? { serviceStatuses: mapped } : {}),
+          ...(polledLogs.length > prev.buildLogs.length ? { buildLogs: polledLogs } : {}),
+          ...(!isActive
+            ? {
+                failureMessage: data.failureMessage || prev.failureMessage,
+                warningMessage: data.warningMessage || prev.warningMessage,
+                errorCode: data.errorCode || prev.errorCode,
+              }
+            : {}),
+        }));
+        // Deploy settled while the stream was detached — stop reconnect churn.
+        if (!isActive && !cancelled) buildStream.disconnect();
+      } catch {
+        // Transient poll error — keep trying on the next tick.
+      }
+    };
+
+    void tick();
+    const interval = setInterval(tick, BUILD_STATUS_POLL_MS);
+    return () => {
+      cancelled = true;
+      clearInterval(interval);
+    };
+  }, [
+    state.deploymentId,
+    state.isDeploying,
+    state.deploymentSuccess,
+    state.deploymentFailed,
+    state.deploymentCanceled,
+    buildStream.isConnected,
+    buildStream.disconnect,
+  ]);
+
   const loadBuildSession = useCallback(
     async (deploymentId: string): Promise<{ success: boolean; error?: string }> => {
       try {
@@ -795,6 +961,10 @@ export function useDeploymentBuild(
             // so the detail UI reflects how it really ran, not the live default.
             buildStrategy: apiConfig.buildStrategy || prev.buildStrategy,
             deployTarget: apiConfig.deployTarget || prev.deployTarget,
+            // Actual runtime isolation of THIS deployment (docker for compose),
+            // so the target step's clone picker + summary reflect reality rather
+            // than the "bare" default.
+            runtimeMode: apiConfig.runtimeMode || prev.runtimeMode,
             serverId: apiConfig.serverId ?? prev.serverId,
             serverName: apiConfig.serverName ?? prev.serverName,
             envVars: apiConfig.envVars || prev.envVars,
@@ -805,6 +975,15 @@ export function useDeploymentBuild(
             serviceDeploymentMode:
               apiConfig.serviceDeploymentMode ||
               (data.projectType === "services" ? "services" : "single"),
+            // Full compose config from the deployment snapshot (getBuildStatus
+            // returns it as `composeServices`). Hydrating config.services here
+            // means the shared DeploymentProvider carries the real services into
+            // "Edit Configuration" — so the compose wizard shows them even when
+            // the service table is empty (e.g. a deploy that failed before its
+            // rows were persisted). Falls back to whatever's already loaded.
+            services: Array.isArray(data.composeServices)
+              ? (data.composeServices as RawComposeService[]).map(normalizeComposeService)
+              : prev.services,
             options: {
               buildCommand: apiConfig.buildCommand || prev.options.buildCommand,
               outputDirectory: apiConfig.outputDirectory || prev.options.outputDirectory,
@@ -823,45 +1002,7 @@ export function useDeploymentBuild(
 
         // Parse existing logs. Compose needs structured entries so service tabs
         // keep serviceName/raw terminal data after refresh.
-        const buildLogs: BuildLog[] = Array.isArray(data.logEntries)
-          ? data.logEntries
-              .map((entry: Record<string, unknown>) => {
-                const text =
-                  typeof entry.text === "string"
-                    ? entry.text
-                    : typeof entry.message === "string"
-                      ? entry.message
-                      : "";
-                if (!text.trim()) return null;
-
-                return {
-                  type: logTypeFromHydratedEntry(entry, text),
-                  text,
-                  time:
-                    typeof entry.time === "string"
-                      ? entry.time
-                      : typeof entry.timestamp === "string"
-                        ? entry.timestamp
-                        : new Date().toISOString(),
-                  serviceName:
-                    typeof entry.serviceName === "string" && entry.serviceName.trim()
-                      ? entry.serviceName
-                      : undefined,
-                  rawData: typeof entry.rawData === "string" ? entry.rawData : undefined,
-                  eventId: typeof entry.eventId === "number" ? entry.eventId : undefined,
-                } satisfies BuildLog;
-              })
-              .filter((entry: BuildLog | null): entry is BuildLog => entry !== null)
-          : data.logs
-            ? data.logs
-                .split("\n")
-                .filter((line: string) => line.trim())
-                .map((line: string) => ({
-                  type: "info" as const,
-                  text: line,
-                  time: new Date().toISOString(),
-                }))
-            : [];
+        const buildLogs: BuildLog[] = mapBuildLogsFromStatus(data);
 
         const isActive = data.is_active;
         const status = data.status;
@@ -891,29 +1032,7 @@ export function useDeploymentBuild(
           // Restore per-service statuses for compose AND monorepo projects.
           // Monorepo sub-apps fan out through the same multi-service pipeline,
           // so the same SSE statuses apply.
-          serviceStatuses:
-            (data.projectType === "services" || data.projectType === "monorepo") &&
-            data.services && data.serviceStatuses
-            ? (data.services as any[]).map((svc: any) => {
-                const sd = (data.serviceStatuses as any[]).find((s: any) => s.serviceId === svc.serviceId);
-                const rawStatus = sd?.status ?? "pending";
-                // Map DB statuses to UI statuses (DB may store "running", "failed", "pending", "deploying", "building", "stopped")
-                const status: import("./types").ServiceDeployStatus["status"] =
-                  rawStatus === "running" ? "running"
-                  : rawStatus === "failed" ? "failed"
-                  : rawStatus === "deploying" || rawStatus === "building" ? "deploying"
-                  : "pending";
-                return {
-                  serviceId: svc.serviceId,
-                  serviceName: svc.serviceName,
-                  status,
-                  containerId: sd?.containerId,
-                  hostPort: sd?.hostPort,
-                  image: svc.image,
-                  build: svc.build,
-                } as import("./types").ServiceDeployStatus;
-              })
-            : [],
+          serviceStatuses: mapServiceStatusesFromBuildStatus(data),
         }));
 
         // Hydrate current terminal output before subscribing.
@@ -1020,6 +1139,12 @@ export function useDeploymentBuild(
         terminalRef.current?.clear();
         buildStream.disconnect();
         pendingLogsBuffer.current = [];
+        // Reset the SSE dedup cursor. The new deployment emits a fresh event-id
+        // sequence starting near 0; leaving the previous deploy's cursor here
+        // makes the message processor drop the new stream's events (eventId <=
+        // stale cursor) — logs freeze until a manual refresh resets it via
+        // loadBuildSession. Clearing it makes the re-attach atomic.
+        lastEventIdRef.current = undefined;
         if (!terminalRef.current) {
           isTerminalReady.current = false;
         }
@@ -1093,6 +1218,7 @@ export function useDeploymentBuild(
     setConfig(DEFAULT_CONFIG);
     setState(INITIAL_STATE);
     buildStream.disconnect();
+    lastEventIdRef.current = undefined; // fresh dedup cursor for the next deploy
     isTerminalReady.current = false;
     pendingLogsBuffer.current = [];
     terminalRef.current?.clear();

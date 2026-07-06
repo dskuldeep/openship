@@ -7,6 +7,7 @@ import './logs.css';
 import { useProjectSettings } from "@/context/ProjectSettingsContext";
 import { getApiBaseUrl, api } from "@/lib/api";
 import { endpoints } from "@/lib/api/endpoints";
+import { DomainSwitcher } from "@/components/routing/DomainSwitcher";
 
 interface ServerLog {
   id: string;
@@ -38,9 +39,23 @@ export const ServerLogs: React.FC<ServerLogsProps> = ({
   projectName,
   onLogsChange,
 }) => {
-  const { serverLogsData, addServerLog, mergeServerLogs, setServerLogs } = useProjectSettings();
+  const { serverLogsData, addServerLog, mergeServerLogs, setServerLogs, domain, domainsData } =
+    useProjectSettings();
   const [isLoading, setIsLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
+
+  // Route switch: which domain's request logs to view (default = primary).
+  const domains = useMemo(
+    () =>
+      (domainsData?.domains ?? [])
+        .map((d: any) => d?.domain)
+        .filter((d: unknown): d is string => typeof d === "string" && d.length > 0),
+    [domainsData?.domains],
+  );
+  const [selectedDomain, setSelectedDomain] = useState(domain || "");
+  useEffect(() => {
+    setSelectedDomain((current) => (current && domains.includes(current) ? current : domain || ""));
+  }, [domain, domains]);
 
   const formatBytes = useCallback((bytes?: number) => {
     const b = typeof bytes === 'number' ? bytes : 0;
@@ -155,7 +170,9 @@ export const ServerLogs: React.FC<ServerLogsProps> = ({
     const initStream = async () => {
       try {
         const tokenRes = await api.get<{ kind: string; url?: string; token?: string }>(
-          endpoints.projects.serverLogsStreamToken(projectId),
+          selectedDomain
+            ? appendQueryParam(endpoints.projects.serverLogsStreamToken(projectId), "domain", selectedDomain)
+            : endpoints.projects.serverLogsStreamToken(projectId),
         );
         if (cancelled) return;
 
@@ -168,7 +185,8 @@ export const ServerLogs: React.FC<ServerLogsProps> = ({
           es.addEventListener("request", handleRequestEvent);
         } else if (tokenRes.kind === "self-hosted") {
           // Self-hosted: connect to API SSE
-          const streamUrl = `${getApiBaseUrl()}${endpoints.projects.serverLogsStream(projectId)}`;
+          let streamUrl = `${getApiBaseUrl()}${endpoints.projects.serverLogsStream(projectId)}`;
+          if (selectedDomain) streamUrl = appendQueryParam(streamUrl, "domain", selectedDomain);
           es = new EventSource(streamUrl, { withCredentials: true });
           es.addEventListener("request", handleRequestEvent);
         } else {
@@ -196,7 +214,7 @@ export const ServerLogs: React.FC<ServerLogsProps> = ({
 
     // Fetch recent logs in parallel and merge them behind live data.
     api.get<{ logs: any[] }>(endpoints.projects.serverLogsRecent(projectId), {
-      params: { limit: 100 },
+      params: { limit: 100, ...(selectedDomain ? { domain: selectedDomain } : {}) },
     }).then((res: any) => {
       if (cancelled) return;
       const logs: unknown[] = Array.isArray(res.logs)
@@ -228,7 +246,7 @@ export const ServerLogs: React.FC<ServerLogsProps> = ({
       cancelled = true;
       es?.close();
     };
-  }, [projectId, setServerLogs, addServerLog, mergeServerLogs, normalizeLogEntry]);
+  }, [projectId, selectedDomain, setServerLogs, addServerLog, mergeServerLogs, normalizeLogEntry]);
 
   const logsStrings = useMemo(() => {
     return serverLogsData.logs.map((log: any) =>
@@ -300,12 +318,21 @@ export const ServerLogs: React.FC<ServerLogsProps> = ({
           <Server className="w-4 h-4 text-muted-foreground" />
           <h3 className="text-sm font-medium text-foreground">HTTP Request Logs</h3>
         </div>
-        {!error && (
-          <div className="flex items-center gap-1.5">
-            <div className="w-1.5 h-1.5 rounded-full bg-emerald-500 animate-pulse" />
-            <span className="text-xs text-muted-foreground">Live</span>
-          </div>
-        )}
+        <div className="flex items-center gap-3">
+          {domains.length > 1 && (
+            <DomainSwitcher
+              domains={domains}
+              value={selectedDomain || domain || ""}
+              onChange={setSelectedDomain}
+            />
+          )}
+          {!error && (
+            <div className="flex items-center gap-1.5">
+              <div className="w-1.5 h-1.5 rounded-full bg-emerald-500 animate-pulse" />
+              <span className="text-xs text-muted-foreground">Live</span>
+            </div>
+          )}
+        </div>
       </div>
 
       {/* Logs */}

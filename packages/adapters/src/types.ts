@@ -117,6 +117,15 @@ export interface BuildConfig {
    * `.git/config`. Mutually exclusive in practice with `gitToken`.
    */
   gitCredentialHelperPath?: string;
+  /**
+   * Clone the repo ON the remote build host instead of cloning on the
+   * orchestrator and transferring the context. The Docker runtime honors this
+   * for SSH (server) builds: it runs `git clone` in a remote host shell (using
+   * `gitCredentialHelperPath` when set — the relay — else `gitToken`) into the
+   * remote build dir, then builds there. Avoids the download-then-reupload of a
+   * large repo. Ignored for local-socket builds and local-path projects.
+   */
+  cloneOnServer?: boolean;
 }
 
 export interface DeployPublicEndpoint {
@@ -210,6 +219,18 @@ export interface LogEntry {
   serviceName?: string;
   /** Pre-encoded base64 data - passed through to SSE without re-encoding. */
   rawData?: string;
+}
+
+/**
+ * A serialization gate for server/workspace-scoped provisioning. The API injects
+ * a concrete implementation (in-process mutex + Postgres advisory lock) so
+ * concurrent deploys touching the same server's shared state — apt/dpkg, the
+ * openresty unit + shared config, docker networks, the setup-state file — wait
+ * for each other instead of racing. Callers wrap the racy critical section in
+ * `run`; when no lock is injected, callers fall back to running `fn` directly.
+ */
+export interface ProvisionLock {
+  run<T>(fn: () => Promise<T>): Promise<T>;
 }
 
 export interface ContainerInfo {

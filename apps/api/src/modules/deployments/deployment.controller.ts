@@ -10,13 +10,12 @@ import { getRequestContext } from "../../lib/request-context";
 import { permission } from "../../lib/permission";
 import * as deploymentService from "./deployment.service";
 import * as buildService from "./build.service";
+import * as buildStatusService from "./build-status.service";
 import * as sslService from "./ssl.service";
 import * as prepareService from "./prepare.service";
 import { maybeProxyCloudProject, proxyToSaaS } from "../../lib/cloud/project-router";
 import { promoteProjectToCloud, TransferConflictError } from "../projects/transfer.service";
 import { env } from "../../config";
-
-// ─── Handlers ────────────────────────────────────────────────────────────────
 
 export async function list(c: Context) {
   const ctx = getRequestContext(c);
@@ -54,6 +53,8 @@ export async function create(c: Context) {
     serviceIds?: string[];
     /** Manual smart redeploy: rebuild only services changed since the active deploy. */
     smartRoute?: boolean;
+    /** Refresh: re-apply current env to the active deploy — no git pull, no rebuild. */
+    refresh?: boolean;
   }>();
   if (body.projectId) {
     await permission.assert(getRequestContext(c), { resourceType: "project", resourceId: body.projectId, action: "write" });
@@ -79,6 +80,7 @@ export async function create(c: Context) {
     forceAll: body.forceAll,
     serviceIds: body.serviceIds,
     smartRoute: body.smartRoute,
+    refresh: body.refresh,
   });
   return c.json({ data: result }, 202);
 }
@@ -147,10 +149,6 @@ function streamBuildSession(c: Context, deploymentId: string, initialEvent?: { e
   });
 }
 
-/**
- * SSE endpoint for streaming build logs in real-time.
- * GET /deployments/:id/stream
- */
 export async function stream(c: Context) {
   const ctx = getRequestContext(c);
   const id = param(c, "id");
@@ -256,8 +254,6 @@ export async function buildRespond(c: Context) {
   return c.json({ success: result });
 }
 
-// ─── Prepare (resolve project info) ────────────────────────────────────────────
-
 /**
  * POST /deployments/prepare - resolve project info from GitHub or local path.
  *
@@ -306,12 +302,6 @@ export async function prepare(c: Context) {
   }
 }
 
-// ─── Build access / status / cancel / redeploy ───────────────────────────────
-
-/**
- * POST /deployments/build/access - create deployment + build session for existing project.
- * Requires { projectId }. Returns { success, deployment_id, project_id }.
- */
 export async function buildAccess(c: Context) {
   const ctx = getRequestContext(c);
   const body = await c.req.json<buildService.BuildAccessInput>();
@@ -385,16 +375,13 @@ export async function buildAccess(c: Context) {
   }
 }
 
-/**
- * GET /deployments/:id/build - get build session status and config.
- */
 export async function buildStatus(c: Context) {
   const ctx = getRequestContext(c);
   const id = param(c, "id");
   await permission.assert(getRequestContext(c), { resourceType: "deployment", resourceId: id, action: "read" });
 
   try {
-    const result = await buildService.getBuildSessionStatus(id);
+    const result = await buildStatusService.getBuildSessionStatus(id);
     return c.json(result);
   } catch (err) {
     const message = err instanceof Error ? err.message : "Build session not found";
@@ -465,11 +452,6 @@ export async function buildStart(c: Context) {
   });
 }
 
-// ─── SSL ─────────────────────────────────────────────────────────────────────
-
-/**
- * POST /deployments/ssl/status - check SSL status for a domain.
- */
 export async function sslStatus(c: Context) {
   const ctx = getRequestContext(c);
   const body = await c.req.json<{ domain: string }>();
@@ -487,9 +469,6 @@ export async function sslStatus(c: Context) {
   }
 }
 
-/**
- * POST /deployments/ssl/renew - renew SSL certificate for a domain.
- */
 export async function sslRenew(c: Context) {
   const ctx = getRequestContext(c);
   const body = await c.req.json<{ domain: string; includeWww?: boolean }>();

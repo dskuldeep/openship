@@ -15,6 +15,7 @@
 import type Dockerode from "dockerode";
 import { PassThrough, Readable } from "node:stream";
 import { DockerRuntime } from "../../runtime/docker";
+import { isHostPathSource, scopedVolumeName } from "../../runtime/volume-namespace";
 import { registerExecutor } from "../registry";
 import type {
   BackupExecutor,
@@ -61,12 +62,10 @@ function parseVolumeSpec(spec: string): { source: string; target: string; type: 
     return { source: "", target: parts[0], type: "tmpfs" };
   }
   const [source, target] = parts;
-  // Heuristic: a source that looks like a host path (starts with `.` or `/`)
-  // is a bind mount. Otherwise treat as a named volume.
-  const type: BackupSource["type"] =
-    source.startsWith("/") || source.startsWith("./") || source.startsWith("../")
-      ? "bind"
-      : "volume";
+  // A source that looks like a host path (/, ./, ../, ~) is a bind mount.
+  // Otherwise treat as a named volume. Delegates to the shared classifier so
+  // the deploy path and this classifier agree (incl. the ~ case).
+  const type: BackupSource["type"] = isHostPathSource(source) ? "bind" : "volume";
   return { source, target, type };
 }
 
@@ -114,9 +113,17 @@ export class DockerBackupExecutor implements BackupExecutor {
       .map((spec, i): BackupSource | null => {
         const parsed = parseVolumeSpec(spec);
         if (!parsed || !parsed.source) return null;
+        // Named volumes are project-scoped at deploy time; resolve the SAME
+        // name here so the fallback mounts the real volume (not an empty one
+        // docker would auto-create). Bind mounts and grandfathered services
+        // (namespaceVolumes=false) keep the raw source.
+        const source =
+          parsed.type === "volume" && service.namespaceVolumes
+            ? scopedVolumeName(service.projectSlug, parsed.source)
+            : parsed.source;
         return {
-          id: `${parsed.source}-${i}`,
-          source: parsed.source,
+          id: `${source}-${i}`,
+          source,
           target: parsed.target,
           type: parsed.type,
         };

@@ -201,6 +201,9 @@ interface ProjectSettingsContextType {
     sourceMode?: "branch" | "manual";
   }) => Promise<ProjectEnvironment | null>;
   domain: string;
+  /** Shared domain selection driving the overview URL + analytics (multi-domain projects). */
+  selectedDomain: string;
+  setSelectedDomain: (domain: string) => void;
   slug?: string[]; // Optional array for catch-all routes
   activeTab: string;
   setActiveTab: (tab: string) => void;
@@ -369,6 +372,20 @@ export const ProjectSettingsProvider: React.FC<ProviderProps> = ({
       "",
     [projectData.domains],
   );
+
+  // Shared domain selection driving the overview URL + analytics: the sidebar
+  // switcher writes it, OverviewTab/MonitoringTab read it to refetch per-domain.
+  // Defaults to the primary and snaps back to it when the current pick drops out
+  // of the project's domains. (The /logs view keeps its own separate selection.)
+  const [selectedDomain, setSelectedDomain] = useState("");
+  useEffect(() => {
+    const available = (projectData.domains || [])
+      .map((d: any) => d?.domain)
+      .filter((d: unknown): d is string => typeof d === "string" && d.length > 0);
+    setSelectedDomain((current) =>
+      current && available.includes(current) ? current : domain,
+    );
+  }, [domain, projectData.domains]);
 
   // Derived: do we have multi-service rendering paths to enable?
   // projectData hint OR serviceCount > 1 OR loaded services > 1.
@@ -854,6 +871,8 @@ export const ProjectSettingsProvider: React.FC<ProviderProps> = ({
       environments,
       createEnvironment,
       domain,
+      selectedDomain,
+      setSelectedDomain,
       slug,
       activeTab,
       setActiveTab,
@@ -889,6 +908,7 @@ export const ProjectSettingsProvider: React.FC<ProviderProps> = ({
       environments,
       createEnvironment,
       domain,
+      selectedDomain,
       slug,
       activeTab,
       tabs,

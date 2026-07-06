@@ -46,8 +46,6 @@ async function listDeploymentContainerIds(dep: { id: string; containerId?: strin
   return dep.containerId ? [dep.containerId] : [];
 }
 
-// ─── List deployments ────────────────────────────────────────────────────────
-
 export async function listDeployments(
   organizationId: string,
   opts: {
@@ -102,8 +100,6 @@ export async function listDeployments(
   return { ...result, rows: enriched };
 }
 
-// ─── Get deployment ──────────────────────────────────────────────────────────
-
 export async function getDeployment(
   deploymentId: string,
   organizationId: string,
@@ -119,8 +115,6 @@ export async function getDeployment(
   return dep;
 }
 
-// ─── Delete deployment ───────────────────────────────────────────────────────
-
 export async function deleteDeployment(
   deploymentId: string,
   organizationId: string,
@@ -133,13 +127,17 @@ export async function deleteDeployment(
 
   const project = await repos.project.findById(dep.projectId);
 
-  // Collect and destroy runtime resources via shared cleanup orchestrator
   const manifest = await collectDeploymentManifest(dep, project ?? null);
   if (manifest.resources.length > 0) {
     await executeCleanup(manifest);
   }
 
-  // If this is the active deployment, clear it from the project
+  // Deleting the active release clears the live pointer → project reads draft.
+  // We deliberately do NOT auto-point at an older successful deploy: its runtime
+  // was stopped when this one went active, so claiming it "live" would be a lie
+  // (a 502 masked as healthy). To bring a previous release back up, roll back to
+  // it explicitly (restores its runtime). Reject uses the predecessor path for
+  // that; a bare delete just detaches.
   if (project && project.activeDeploymentId === deploymentId) {
     await repos.project.setActiveDeployment(project.id, null);
   }
@@ -147,8 +145,6 @@ export async function deleteDeployment(
   await repos.deployment.deleteDeployment(deploymentId);
 }
 
-// ─── Rollback deployment ─────────────────────────────────────────────────────
-//
 // Thin wrapper around the RollbackOrchestrator. The orchestrator owns
 // the policy + the runtime primitive calls; this service just adds the
 // per-org ownership check via getDeployment.
@@ -164,8 +160,6 @@ export async function rollbackDeployment(
   return (await repos.deployment.findById(dep.id)) ?? dep;
 }
 
-// ─── Pin / unpin deployment ─────────────────────────────────────────────────
-
 export async function setDeploymentPin(
   deploymentId: string,
   organizationId: string,
@@ -176,15 +170,16 @@ export async function setDeploymentPin(
   return (await repos.deployment.findById(dep.id)) ?? dep;
 }
 
-// ─── Reject partial deployment ─────────────────────────────────────────────
-
 export async function rejectDeployment(
   deploymentId: string,
   organizationId: string,
 ) {
   const dep = await getDeployment(deploymentId, organizationId);
 
-  if (dep.status !== "ready") {
+  // Reject targets a FINISHED deploy: a fully-ready one, or a partial-failure
+  // compose deploy (the case that surfaces the "N of M services failed —
+  // reject?" prompt). Anything still in flight must be cancelled first.
+  if (dep.status !== "ready" && dep.status !== "partial_failure") {
     throw new ForbiddenError("Can only reject a completed deployment");
   }
 
@@ -194,19 +189,39 @@ export async function rejectDeployment(
   const meta = (dep.meta as { previousActiveDeploymentId?: string } | null) ?? null;
   const previousDeploymentId = meta?.previousActiveDeploymentId;
 
+  // Restore the deployment this one replaced (if any) as the active/finalized
+  // one — same as before.
   if (previousDeploymentId && previousDeploymentId !== deploymentId) {
     await rollbackDeployment(previousDeploymentId, organizationId);
   }
 
-  await deleteDeployment(deploymentId, organizationId);
+  // Tear down THIS deployment's runtime resources (containers/routes). We
+  // deliberately do NOT delete the deployment row or its build_session:
+  // "reject" means "don't finalize this deploy", not "erase it". Keeping the
+  // record + logs is the whole point — the failure has to stay inspectable in
+  // the project's deployment history.
+  const manifest = await collectDeploymentManifest(dep, project);
+  if (manifest.resources.length > 0) {
+    await executeCleanup(manifest);
+  }
+
+  // With no recorded predecessor there's nothing to restore, so clear the live
+  // pointer (→ draft). A redeploy over an active project always records a
+  // predecessor (handled above, which restores that release AND its runtime),
+  // so this only fires when rejecting a first/only deploy — where draft is the
+  // honest state. We don't point at an older deploy whose runtime is stopped.
+  if (!previousDeploymentId && project.activeDeploymentId === deploymentId) {
+    await repos.project.setActiveDeployment(project.id, null);
+  }
+
+  // Terminal "rejected" status — record and logs preserved.
+  await repos.deployment.updateStatus(deploymentId, "rejected");
 
   return {
     success: true,
     restoredDeploymentId: previousDeploymentId ?? null,
   };
 }
-
-// ─── Deployment logs ─────────────────────────────────────────────────────────
 
 export async function getDeploymentLogs(
   deploymentId: string,
@@ -227,8 +242,6 @@ export async function getDeploymentLogs(
 
   return [];
 }
-
-// ─── Restart deployment ──────────────────────────────────────────────────────
 
 export async function restartDeployment(
   deploymentId: string,
@@ -252,8 +265,6 @@ export async function restartDeployment(
   return dep;
 }
 
-// ─── Container info ──────────────────────────────────────────────────────────
-
 export async function getContainerInfo(
   deploymentId: string,
   organizationId: string,
@@ -266,8 +277,6 @@ export async function getContainerInfo(
   return runtime.getContainerInfo(dep.containerId);
 }
 
-// ─── Container usage ─────────────────────────────────────────────────────────
-
 export async function getContainerUsage(
   deploymentId: string,
   organizationId: string,
@@ -279,8 +288,6 @@ export async function getContainerUsage(
   const { runtime } = await resolveDeploymentRuntime(dep);
   return runtime.getUsage(dep.containerId);
 }
-
-// ─── Build logs ──────────────────────────────────────────────────────────────
 
 export async function getBuildLogs(
   deploymentId: string,

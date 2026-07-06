@@ -100,6 +100,21 @@ export async function records(c: Context) {
   return c.json({ data: result });
 }
 
+/** POST /domains/:id/primary - make this domain the project's primary */
+export async function setPrimary(c: Context) {
+  const ctx = getRequestContext(c);
+  const id = param(c, "id");
+  await permission.assert(getRequestContext(c), { resourceType: "domain", resourceId: id, action: "write" });
+  const domain = await domainService.setPrimaryDomain(ctx, id);
+  audit.recordAsync(auditContextFrom(c, ctx.organizationId, ctx.userId), {
+    eventType: "domain.set_primary",
+    resourceType: "domain",
+    resourceId: id,
+    after: { projectId: domain.projectId, hostname: domain.hostname, isPrimary: true },
+  });
+  return c.json({ data: domain });
+}
+
 /** POST /domains/preview - get DNS records for a hostname (no DB write) */
 export async function preview(c: Context) {
   const body = await c.req.json<{ hostname: string }>();

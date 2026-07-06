@@ -54,6 +54,10 @@ const PRUNE_PAGE_SIZE = 500;
 async function prunePolicy(policy: BackupPolicy): Promise<number> {
   if (!policy.retainCount && !policy.retainDays) return 0;
 
+  // Mail-server policies aren't project-scoped; their runs list by project,
+  // so retention pruning for them is a follow-up. Skip cleanly for now.
+  if (!policy.projectId) return 0;
+
   const destinationId = policy.destinationId;
   const project = await repos.project.findById(policy.projectId);
   if (!project) {

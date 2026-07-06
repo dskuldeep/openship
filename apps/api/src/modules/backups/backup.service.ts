@@ -15,6 +15,26 @@ import type { RequestContext } from "../../lib/request-context";
 import { syncPolicySchedule, removePolicySchedule, validateCronExpression } from "./triggers/cron";
 import { generateWebhookToken } from "./triggers/webhook";
 
+/**
+ * Resolve the owning org for a policy regardless of source: project-scoped
+ * policies via their project, mail-server policies via the server row.
+ * Returns null when neither resolves (soft-deleted / detached).
+ */
+export async function policyOrganizationId(policy: {
+  projectId: string | null;
+  mailServerId: string | null;
+}): Promise<string | null> {
+  if (policy.projectId) {
+    const project = await repos.project.findById(policy.projectId);
+    return project?.organizationId ?? null;
+  }
+  if (policy.mailServerId) {
+    const server = await repos.server.get(policy.mailServerId);
+    return server?.organizationId ?? null;
+  }
+  return null;
+}
+
 // ─── Policy CRUD ─────────────────────────────────────────────────────────────
 
 export async function listPoliciesByProject(ctx: RequestContext, projectId: string) {
@@ -113,8 +133,13 @@ export async function updatePolicy(
 ) {
   const policy = await repos.backupPolicy.findById(policyId);
   if (!policy) throw new Error("Policy not found");
-  const project = await repos.project.findById(policy.projectId);
-  assertResourceInOrg(project, "Policy", ctx.organizationId, policyId);
+  const orgId = await policyOrganizationId(policy);
+  assertResourceInOrg(
+    orgId ? { organizationId: orgId } : null,
+    "Policy",
+    ctx.organizationId,
+    policyId,
+  );
 
   if (patch.destinationId) {
     const destination = await repos.backupDestination.findById(patch.destinationId);
@@ -164,8 +189,13 @@ export async function updatePolicy(
 export async function deletePolicy(ctx: RequestContext, policyId: string) {
   const policy = await repos.backupPolicy.findById(policyId);
   if (!policy) return;
-  const project = await repos.project.findById(policy.projectId);
-  assertResourceInOrg(project, "Policy", ctx.organizationId, policyId);
+  const orgId = await policyOrganizationId(policy);
+  assertResourceInOrg(
+    orgId ? { organizationId: orgId } : null,
+    "Policy",
+    ctx.organizationId,
+    policyId,
+  );
   await repos.backupPolicy.softDelete(policyId);
   // Drop the BullMQ repeat schedule.
   await removePolicySchedule(policyId);

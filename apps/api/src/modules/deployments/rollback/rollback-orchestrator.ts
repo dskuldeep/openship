@@ -33,16 +33,12 @@ import { resolveRollbackWindow } from "../release-retention";
 import { checkNoActiveBuild, triggerDeployment, type DeploymentConfigSnapshot } from "../build.service";
 import { buildBackgroundContext } from "../../../lib/request-context";
 
-// ─── Error codes (surfaced to the API layer) ────────────────────────────────
-
 export const ROLLBACK_ERROR_CODES = {
   NOT_READY: "ROLLBACK_NOT_READY",
   ALREADY_ACTIVE: "ROLLBACK_ALREADY_ACTIVE",
   ARTIFACT_GONE: "ROLLBACK_ARTIFACT_GONE",
   UNSUPPORTED_RUNTIME: "ROLLBACK_UNSUPPORTED_RUNTIME",
 } as const;
-
-// ─── Helpers ────────────────────────────────────────────────────────────────
 
 /** Project the DB Deployment row down to the minimal DeploymentRef the
  *  runtime primitives consume. Keeps the adapter layer free of
@@ -69,8 +65,6 @@ function toRef(dep: Deployment): DeploymentRef {
   };
 }
 
-// ─── Public API ─────────────────────────────────────────────────────────────
-
 /**
  * Called by the deployment lifecycle when a new deployment goes
  * `ready`. Archives the previously-active deployment, marks the new
@@ -86,7 +80,6 @@ export async function onDeploymentReady(opts: {
 }): Promise<void> {
   const { newDeployment, previousActive } = opts;
 
-  // 1. Archive the previous active (if any and different from the new one).
   if (previousActive && previousActive.id !== newDeployment.id) {
     try {
       const { runtime } = await resolveDeploymentRuntime(previousActive);
@@ -106,8 +99,6 @@ export async function onDeploymentReady(opts: {
   //    currently-active one — fully rollback-restorable).
   await repos.deployment.setArtifactRetainedAt(newDeployment.id, new Date());
 
-  // 3. Prune older deployments beyond the rollback window. Pinned
-  //    deployments are exempt.
   try {
     await prune(newDeployment.projectId);
   } catch (err) {
@@ -400,8 +391,6 @@ export async function prune(projectId: string): Promise<{ purged: number }> {
 
   return { purged };
 }
-
-// ─── Pin / unpin ────────────────────────────────────────────────────────────
 
 /**
  * Cap on pinned deployments per project. Bounds disk usage. Today

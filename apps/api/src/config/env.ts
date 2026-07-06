@@ -448,3 +448,10 @@ export const trustedOrigins = [
 
 /** Internal loopback URL for the API (used by nginx webhook proxy, etc.) */
 export const internalApiUrl = `http://127.0.0.1:${env.PORT}`;
+
+/**
+ * proxy_pass target for the `/_openship/hooks/` webhook location injected into a
+ * project's nginx vhost. Single source so the deploy-time and edit-time route
+ * builders can't drift.
+ */
+export const webhookProxyTarget = `${internalApiUrl}/api/webhooks/`;

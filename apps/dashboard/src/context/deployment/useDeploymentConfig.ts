@@ -2,17 +2,19 @@
 
 import { useState, useCallback, useEffect, useRef } from "react";
 import type { FrameworkId } from "@/components/import-project/types";
-import { deployApi, projectsApi } from "@/lib/api";
-import type { PrepareProjectResponse } from "@/lib/api/deploy";
+import { deployApi, projectsApi, servicesApi, serviceKind } from "@/lib/api";
+import type { PrepareProjectResponse, PrepareComposeService, PrepareMonorepoApp } from "@/lib/api/deploy";
+import type { Service } from "@/lib/api/services";
 import { ApiError, getApiErrorMessage } from "@/lib/api/client";
 import { settingsApi } from "@/lib/api/settings";
 import type { BuildMode } from "@/lib/api/settings";
-import { STACKS, type StackDefinition } from "@repo/core";
+import { STACKS, type StackDefinition, type StackId } from "@repo/core";
 import type { BuildStrategy, DeploymentConfig, DeploymentModeSnapshot, MonorepoAppConfig, MonorepoWorkspaceConfig, PublicEndpoint } from "./types";
 import {
   DEFAULT_CONFIG,
   createPublicEndpoint,
   ensurePublicEndpoints,
+  normalizeComposeService,
   syncPublicEndpointState,
 } from "./types";
 import {
@@ -192,6 +194,100 @@ function buildComposeDefaults(
       ...buildPreparedOptions(response),
       productionPort: "",
     },
+  };
+}
+
+/**
+ * Reconstruct a prepare-shaped response from SAVED project + service data.
+ *
+ * This is the seam that lets the config-edit path (initializeFromProject)
+ * hydrate through the exact SAME `buildPreparedConfig` core the repo/local
+ * detection paths use — the only difference is the DATA SOURCE (saved DB rows
+ * vs a live repo scan). That keeps single-app, services, and monorepo edits on
+ * one code path AND means editing never re-clones the repo or collapses a
+ * DB-defined compose stack to a single app because the repo has no compose file.
+ */
+function buildSavedProjectResponse(
+  project: NonNullable<PersistedProject>,
+  services: Service[],
+): PrepareProjectResponse {
+  // Derive the shape from the ACTUAL saved service rows (monorepo wins, then
+  // compose), not the getInfo-provided `projectType` field — a compose project
+  // whose rows exist must hydrate as "services" even if that derived field is
+  // stale/absent. `serviceKind` treats a null `kind` as compose, matching the
+  // rest of the app. Fall back to the field, then "app", only when there are
+  // no service rows at all.
+  const monorepoRows = services.filter((s) => serviceKind(s) === "monorepo");
+  const composeRows = services.filter((s) => serviceKind(s) === "compose");
+  const projectType: PrepareProjectResponse["projectType"] = monorepoRows.length
+    ? "monorepo"
+    : composeRows.length
+      ? "services"
+      : ((project.projectType as PrepareProjectResponse["projectType"]) || "app");
+  const opts = project.options ?? {};
+  const productionPaths: string[] = Array.isArray(opts.productionPaths)
+    ? opts.productionPaths
+    : typeof opts.productionPaths === "string" && opts.productionPaths.trim()
+      ? opts.productionPaths.split(",").map((p: string) => p.trim()).filter(Boolean)
+      : [];
+
+  const composeServices: PrepareComposeService[] = composeRows.map(normalizeComposeService);
+
+  const monorepoApps: PrepareMonorepoApp[] = monorepoRows
+    .map((s) => ({
+      id: s.id,
+      name: s.name,
+      rootDirectory: s.rootDirectory ?? "",
+      stack: (s.framework ?? "unknown") as StackId,
+      category: "",
+      packageManager: s.packageManager ?? project.packageManager ?? "npm",
+      buildCommand: s.buildCommand ?? "",
+      installCommand: s.installCommand ?? "",
+      startCommand: s.startCommand ?? "",
+      buildImage: s.buildImage ?? "",
+      outputDirectory: s.outputDirectory ?? "",
+      productionPaths: [],
+      port: s.exposedPort ? Number(s.exposedPort) || 0 : 0,
+    }));
+
+  const branchName = typeof project.gitBranch === "string" ? project.gitBranch : "main";
+
+  return {
+    stack: (project.framework as StackId) || "nextjs",
+    projectType,
+    category: "",
+    packageManager: project.packageManager || "npm",
+    buildCommand: opts.buildCommand ?? "",
+    installCommand: opts.installCommand ?? "",
+    startCommand: opts.startCommand ?? "",
+    buildImage: project.buildImage || "node:22",
+    outputDirectory: opts.outputDirectory ?? "",
+    rootDirectory: opts.rootDirectory ?? "./",
+    productionPaths,
+    port: typeof project.port === "number" ? project.port : Number(opts.productionPort) || 0,
+    hasServer: opts.hasServer ?? project.hasServer ?? true,
+    hasBuild: opts.hasBuild ?? true,
+    repository: {
+      name: project.gitRepo || project.name || "project",
+      full_name:
+        project.gitOwner && project.gitRepo
+          ? `${project.gitOwner}/${project.gitRepo}`
+          : project.name || "project",
+      owner: { login: project.gitOwner || "local" },
+      private: false,
+      default_branch: branchName,
+      selected_branch: branchName,
+      branches: [{ name: branchName }],
+    },
+    services: composeServices,
+    monorepoApps: monorepoApps.length ? monorepoApps : undefined,
+    monorepoWorkspace: project.monorepoWorkspace
+      ? {
+          packageManager: project.monorepoWorkspace.packageManager || project.packageManager || "npm",
+          prepareCommand: project.monorepoWorkspace.prepareCommand || "",
+        }
+      : undefined,
+    rootEnv: {},
   };
 }
 
@@ -479,10 +575,18 @@ export function useDeploymentConfig() {
         // chosen "docker" back to the "bare" default. resolvePreparedRuntimeConfig
         // hydrates every OTHER options field from the project but not this one,
         // so without this the wizard would re-send the default and clobber it.
+        //
+        // When the column is UNSET (legacy projects — 0021 added runtime_mode
+        // nullable with no backfill), default an existing project to "docker":
+        // the historical default runtime was the sandbox, so an un-chosen project
+        // must NOT be silently downgraded to Direct-on-host (bare) on save. Only
+        // brand-new deploys (no projectId) use the projectType-derived default.
         runtimeMode:
           projectId && (project?.runtimeMode === "bare" || project?.runtimeMode === "docker")
             ? project.runtimeMode
-            : normalizeRuntimeMode(preparedContext.projectType),
+            : projectId
+              ? "docker"
+              : normalizeRuntimeMode(preparedContext.projectType),
         packageManager: runtimeConfig.packageManager,
         buildImage: runtimeConfig.buildImage,
         branch,
@@ -628,11 +732,13 @@ export function useDeploymentConfig() {
   );
 
   // ── Config edit: hydrate from the SAVED project, no repo re-detection ───────
-  // Used for the Runtime-tab "Edit" (mode=config). Loads the persisted settings
-  // directly (getInfo + getEnv) instead of running deployApi.prepare — so the
-  // wizard opens instantly and a fresh stack re-detection can never clobber the
-  // saved config. Compose/monorepo (whose structure is edited via the Services
-  // tab and benefits from detection) delegate to the prepare path.
+  // Used for the wizard's "Edit" (mode=config). Reconstructs a prepare-shaped
+  // response from the persisted project + service rows (buildSavedProjectResponse)
+  // and runs it through the SAME buildPreparedConfig core the repo/local detection
+  // paths use — so single-app, services, and monorepo edits share one code path.
+  // Nothing re-clones the repo, the wizard opens instantly, and a DB-defined
+  // compose stack can never collapse to a single app just because the repo has
+  // no committed compose file (the services come from the DB, not detection).
   const initializeFromProject = useCallback(
     async (
       projectId: string,
@@ -645,103 +751,58 @@ export function useDeploymentConfig() {
           return { success: false, error: "Project was not found", errorType: "api_error" };
         }
 
-        const projectType = (project.projectType as DeploymentConfig["projectType"]) || "app";
+        // Always pull the saved service rows — they're the source of truth for
+        // whether this is a services/monorepo project (buildSavedProjectResponse
+        // derives the shape from them). Fetching for a plain app is a cheap empty
+        // list and removes any dependency on the getInfo-derived projectType.
+        const svcRes = await servicesApi.list(projectId).catch(() => null);
+        const serviceRows: Service[] = svcRes?.services ?? [];
 
-        // Compose / monorepo: structure is repo-derived and edited in the
-        // Services tab — keep the detection path for those. Local-sourced
-        // projects scan the folder; git-sourced ones re-detect from the repo.
-        if (projectType === "services" || projectType === "monorepo") {
-          if (project.localPath && !project.gitOwner) {
-            return initializeFromLocal(project.localPath, { projectId });
-          }
-          return initializeFromRepo(project.gitOwner || "", project.gitRepo || "", undefined, {
-            projectId,
-            branch: typeof project.gitBranch === "string" ? project.gitBranch : context?.branch,
-          });
-        }
-
-        // Single-app — hydrate purely from saved data.
+        // Production env → config.envVars (secret VALUES come back masked; blank
+        // them — the env editor owns secret edits — rather than seeding the mask).
         const envRes = await projectsApi.getEnv(projectId).catch(() => null);
         const envVars: DeploymentConfig["envVars"] = (envRes?.data ?? [])
           .filter((v) => v.environment === "production")
-          // Secret VALUES come back masked — show blank (the env editor owns
-          // secret edits) rather than seeding the mask string.
           .map((v) => ({ key: v.key, value: v.isSecret ? "" : v.value, visible: false }));
 
-        const framework = (typeof project.framework === "string" && project.framework
-          ? project.framework
-          : "nextjs") as FrameworkId;
-        const stackDef = STACKS[framework as keyof typeof STACKS] as StackDefinition | undefined;
+        const response = buildSavedProjectResponse(project, serviceRows);
         const repoName = project.gitRepo || project.name || "project";
         const branch =
           typeof project.gitBranch === "string" ? project.gitBranch : (context?.branch ?? "");
 
-        // getInfo returns `options` already in DeploymentConfig.options shape.
-        const po = project.options ?? {};
-        const options: DeploymentConfig["options"] = {
-          buildCommand: po.buildCommand ?? "",
-          installCommand: po.installCommand ?? "",
-          outputDirectory: po.outputDirectory ?? "",
-          productionPaths: po.productionPaths ?? "",
-          startCommand: po.startCommand ?? "",
-          // String-guard like the prepare path: the field is typed string but the
-          // saved source is loosely typed (Record<string, any>).
-          productionPort: String(po.productionPort ?? ""),
-          rootDirectory: po.rootDirectory ?? "./",
-          // Default to true (the schema/DEFAULT_CONFIG default), matching the
-          // prepare path — never silently flip an undetermined project to static.
-          hasServer: po.hasServer ?? project.hasServer ?? true,
-          hasBuild: po.hasBuild ?? true,
-        };
+        setConfig((prev) => {
+          // Guard: don't let an EMPTY service-row fetch collapse an already-loaded
+          // multi-service config to single-app. The DeploymentProvider is shared
+          // across /build/[id] and /deploy/[slug] (one layout), so arriving here
+          // from a compose deploy's build page means `prev` already holds that
+          // deployment's services — the freshest, most complete source. Keep it
+          // when the DB returned nothing (rows can lag a just-started deploy).
+          const prevHoldsThisMultiProject =
+            prev.projectId === projectId &&
+            (prev.projectType === "services" || prev.projectType === "monorepo") &&
+            ((prev.services?.length ?? 0) > 0 || (prev.monorepoApps?.length ?? 0) > 0);
+          if (serviceRows.length === 0 && prevHoldsThisMultiProject) {
+            return { ...prev, projectId, envVars: envVars.length ? envVars : prev.envVars };
+          }
 
-        const primaryDomain = project.slug || normalizeSubdomain(repoName);
-        const publicEndpoints = buildSingleAppEndpoints(
-          project,
-          primaryDomain,
-          options.hasServer,
-          options.productionPort,
-        );
-
-        setConfig((prev) => normalizePreparedConfig({
-          ...prev,
-          projectId,
-          repo: repoName,
-          // Non-empty owner keeps the page's `!config.owner` guard satisfied;
-          // local-sourced projects use the "local" sentinel (matches initializeFromLocal).
-          owner: project.gitOwner || (project.localPath ? "local" : repoName),
-          localPath: project.localPath || undefined,
-          projectName: project.name || repoName,
-          projectType: "app",
-          serviceDeploymentMode: "single",
-          composeDefaults: undefined,
-          singleAppCandidate: undefined,
-          monorepoApps: undefined,
-          monorepoWorkspace: undefined,
-          modeSnapshots: undefined,
-          framework,
-          detectedFramework: framework,
-          buildStrategy: normalizeBuildStrategy("app", stackDef),
-          // Saved runtime isolation; default to Sandbox (docker) when unset rather
-          // than the bare host default — so an un-chosen project doesn't show Direct.
-          runtimeMode:
-            project.runtimeMode === "bare" || project.runtimeMode === "docker"
-              ? project.runtimeMode
-              : "docker",
-          packageManager: project.packageManager || "npm",
-          buildImage: project.buildImage || "node:22",
-          branch,
-          branches: branch ? [branch] : [],
-          services: [],
-          publicEndpoints,
-          rootEnvVars: [],
-          // Only mark the port "touched" for a server app — a static project has
-          // no port, so leaving this false lets the env-PORT auto-detect kick in
-          // if the user later flips hasServer on.
-          productionPortTouched: options.hasServer && hasSavedProjectPort(project),
-          lastAutoDetectedEnvPort: null,
-          envVars,
-          options,
-        }));
+          return {
+            ...buildPreparedConfig(prev, {
+              response,
+              project,
+              repoName,
+              // Non-empty owner keeps the page's `!config.owner` guard satisfied;
+              // local-sourced projects use the "local" sentinel (matches initializeFromLocal).
+              owner: project.gitOwner || (project.localPath ? "local" : repoName),
+              branch,
+              branches: branch ? [branch] : [],
+              projectId,
+              localPath: project.localPath || undefined,
+            }),
+            // buildPreparedConfig (shared with detection) doesn't load production
+            // env — overlay the saved values we fetched above.
+            envVars,
+          };
+        });
 
         return { success: true };
       } catch (err) {
@@ -752,7 +813,7 @@ export function useDeploymentConfig() {
         };
       }
     },
-    [initializeFromRepo, initializeFromLocal, normalizeBuildStrategy, normalizePreparedConfig],
+    [buildPreparedConfig],
   );
 
   return {

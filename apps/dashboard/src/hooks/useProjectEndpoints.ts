@@ -162,6 +162,11 @@ function useEndpoint<T>(
   id: string | null | undefined,
   cache: Map<string, CacheEntry<T>>,
   fetcher: (id: string) => Promise<T>,
+  // Identity whose revision counter drives invalidation. Defaults to `id`;
+  // pass the raw project id when `id` is a composite cache key (e.g. the
+  // domain-scoped analytics key) so invalidateProjectCaches(projectId) still
+  // notifies this hook.
+  revisionId?: string | null,
 ): AsyncState<T> {
   // Ref tracks the LATEST id from props at any moment. Combined with
   // the `cancelled` flag, this prevents an in-flight fetch for project
@@ -178,9 +183,10 @@ function useEndpoint<T>(
   // useSyncExternalStore triggers a re-render, and the effect below
   // re-runs (because `revision` is in its deps) — firing a fresh
   // fetch so currently-mounted consumers see new data immediately.
+  const revKey = revisionId ?? id;
   const revision = useSyncExternalStore(
-    (cb) => (id ? subscribeRevision(id, cb) : () => {}),
-    () => (id ? getRevision(id) : 0),
+    (cb) => (revKey ? subscribeRevision(revKey, cb) : () => {}),
+    () => (revKey ? getRevision(revKey) : 0),
     () => 0,
   );
 
@@ -270,10 +276,22 @@ async function fetchProjectInfo(id: string): Promise<ProjectInfoData> {
   return response.data;
 }
 
-async function fetchOverview(id: string): Promise<AnalyticsOverviewResponse> {
+// Analytics are cached per (project, domain). The cache key encodes the
+// domain so switching the overview domain refetches instead of returning the
+// first domain's cached numbers; `fetchOverview` splits it back apart.
+const OVERVIEW_KEY_SEP = "::";
+
+function overviewCacheKey(id: string, domain?: string | null): string {
+  return domain ? `${id}${OVERVIEW_KEY_SEP}${domain}` : id;
+}
+
+async function fetchOverview(key: string): Promise<AnalyticsOverviewResponse> {
+  const sepIndex = key.indexOf(OVERVIEW_KEY_SEP);
+  const projectId = sepIndex === -1 ? key : key.slice(0, sepIndex);
+  const domain = sepIndex === -1 ? undefined : key.slice(sepIndex + OVERVIEW_KEY_SEP.length);
   const response = await api.get<{ data: AnalyticsOverviewResponse; success?: boolean; error?: string }>(
     endpoints.analytics.overview,
-    { params: { projectId: id } },
+    { params: { projectId, ...(domain ? { domain } : {}) } },
   );
   if (response.success === false || !response.data) {
     throw new Error(response.error || "Failed to load analytics");
@@ -310,8 +328,9 @@ export function useProjectInfo(id: string | null | undefined) {
  * round-trip server-side). The single source for the Overview / Monitoring
  * tabs; no separate /summary + /periods double-fetch.
  */
-export function useAnalyticsOverview(id: string | null | undefined) {
-  return useEndpoint(id, overviewCache, fetchOverview);
+export function useAnalyticsOverview(id: string | null | undefined, domain?: string | null) {
+  const key = id ? overviewCacheKey(id, domain) : id;
+  return useEndpoint(key, overviewCache, fetchOverview, id);
 }
 
 /**
@@ -321,11 +340,11 @@ export function useAnalyticsOverview(id: string | null | undefined) {
  * isLoadingSummary/isLoadingPeriods fields are kept for API compatibility but
  * now reflect the one shared load.
  */
-export function useAnalyticsData(id: string | null | undefined) {
-  const overview = useAnalyticsOverview(id);
+export function useAnalyticsData(id: string | null | undefined, domain?: string | null) {
+  const overview = useAnalyticsOverview(id, domain);
   const summary = overview.data?.summary ?? null;
   const periods = overview.data?.periods ?? null;
-  const data = summary ? mapAnalyticsData(summary, periods ?? [], "") : null;
+  const data = summary ? mapAnalyticsData(summary, periods ?? [], domain ?? "") : null;
   return {
     data,
     summary,
@@ -415,6 +434,11 @@ export function mapAnalyticsData(
  */
 export function invalidateProjectCaches(id: string) {
   infoCache.delete(id);
-  overviewCache.delete(id);
+  // Drop every domain-scoped overview entry for this project, not just the
+  // aggregate key (entries are keyed `id` or `id::domain`).
+  const prefix = `${id}${OVERVIEW_KEY_SEP}`;
+  for (const key of overviewCache.keys()) {
+    if (key === id || key.startsWith(prefix)) overviewCache.delete(key);
+  }
   bumpRevision(id);
 }

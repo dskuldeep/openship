@@ -9,6 +9,11 @@ import { assertResourceInOrg, platform } from "../../lib/controller-helpers";
 import type { RequestContext } from "../../lib/request-context";
 import { resolveDeploymentRuntime } from "../../lib/deployment-runtime";
 import { buildServiceRouteDomain } from "../../lib/routing-domains";
+import {
+  reconcileProjectRoutes,
+  type RouteRegister,
+  type RouteRemove,
+} from "../../lib/route-apply.service";
 import type {
   TCreateServiceBody,
   TUpdateServiceBody,
@@ -297,45 +302,49 @@ export async function updateService(
 
   if (updated && (enabledChanged || exposedChanged || touchesRouting || nameChanged)) {
     try {
-      const { routing, runtime } = platform();
-      const runtimeName = runtime.name;
+      const runtimeName = platform().runtime.name;
       const wasRoutable = svc.enabled && svc.exposed;
       // `enabled` / `exposed` are non-nullable DB columns - no need to
       // fall back to `svc.*` on the updated row.
       const isRoutable = updated.enabled && updated.exposed;
-      const oldRoute = buildServiceRouteDomain({
-        project,
-        service: svc,
-        runtimeName,
-        usesManagedRouting: true,
-      });
-      const nextRoute = buildServiceRouteDomain({
-        project,
-        service: updated,
-        runtimeName,
-        usesManagedRouting: true,
-      });
+      const oldRoute = buildServiceRouteDomain({ project, service: svc, runtimeName, usesManagedRouting: true });
+      const nextRoute = buildServiceRouteDomain({ project, service: updated, runtimeName, usesManagedRouting: true });
       const oldHostname = oldRoute?.hostname.toLowerCase();
       const nextHostname = nextRoute?.hostname.toLowerCase();
+      const routeDropped = wasRoutable && (!isRoutable || oldHostname !== nextHostname);
 
-      if (wasRoutable && (!isRoutable || oldHostname !== nextHostname)) {
-        if (oldRoute) {
-          await routing.removeRoute(oldRoute.hostname);
+      const removes: RouteRemove[] =
+        routeDropped && oldRoute
+          ? [{ hostname: oldRoute.hostname, isCustomDomain: svc.domainType === "custom" }]
+          : [];
+
+      const registers: RouteRegister[] = [];
+      if (isRoutable && nextRoute) {
+        // Self-hosted upstream = the active deployment's service-row IP; cloud
+        // ignores targetUrl and routes by port. Compute both; reconcile picks.
+        let targetUrl: string | undefined;
+        if (!project.cloudWorkspaceId && project.activeDeploymentId) {
+          const rows = await repos.service.listByDeployment(project.activeDeploymentId);
+          const row = rows.find((r) => r.serviceId === serviceId);
+          if (row?.ip) {
+            targetUrl = `http://${row.ip}:${updated.exposedPort || row.hostPort?.toString() || "80"}`;
+          }
         }
+        registers.push({
+          hostname: nextRoute.hostname,
+          targetUrl,
+          port: Number(updated.exposedPort) || nextRoute.targetPort,
+          isCustomDomain: updated.domainType === "custom",
+        });
       }
 
-      if (isRoutable && nextRoute && project.activeDeploymentId) {
-        const rows = await repos.service.listByDeployment(project.activeDeploymentId);
-        const row = rows.find((r) => r.serviceId === serviceId);
-        if (row?.ip) {
-          const port = updated.exposedPort || row.hostPort?.toString() || "80";
-          await routing.registerRoute({
-            domain: nextRoute.hostname,
-            tls: true,
-            targetUrl: `http://${row.ip}:${port}`,
-          });
-        }
-      }
+      // Single reused path: cloud → page/workspace primitives, self-hosted →
+      // the deployment's own routing (local box or remote server/sandbox).
+      const dep =
+        !project.cloudWorkspaceId && project.activeDeploymentId
+          ? await repos.deployment.findById(project.activeDeploymentId)
+          : null;
+      await reconcileProjectRoutes(project, { deployment: dep, registers, removes });
     } catch (err) {
       console.error(`[SERVICE] Failed to update route for ${svc.name}:`, err);
     }
@@ -369,15 +378,24 @@ export async function deleteService(
 
   if (svc.exposed) {
     try {
-      const { routing, runtime } = platform();
       const route = buildServiceRouteDomain({
         project,
         service: svc,
-        runtimeName: runtime.name,
+        runtimeName: platform().runtime.name,
         usesManagedRouting: true,
       });
       if (route) {
-        await routing.removeRoute(route.hostname);
+        // Same single path as edit: cloud → page/workspace teardown, self-hosted
+        // → the deployment's OWN routing (never the local singleton, which would
+        // leave a remote vhost proxying a now-dead upstream → 502).
+        const dep =
+          !project.cloudWorkspaceId && project.activeDeploymentId
+            ? await repos.deployment.findById(project.activeDeploymentId)
+            : null;
+        await reconcileProjectRoutes(project, {
+          deployment: dep,
+          removes: [{ hostname: route.hostname, isCustomDomain: svc.domainType === "custom" }],
+        });
       }
     } catch (err) {
       console.error(`[SERVICE] Failed to remove route for ${svc.name}:`, err);

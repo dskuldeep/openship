@@ -12,7 +12,7 @@ import { settingsApi } from "@/lib/api/settings";
 import type { ServerInfo } from "@/lib/api/system";
 import { useToast } from "@/context/ToastContext";
 import { useModal } from "@/context/ModalContext";
-import type { DeployTarget, BuildStrategy } from "@/context/deployment/types";
+import type { DeployTarget, BuildStrategy, CloneStrategy } from "@/context/deployment/types";
 import { createPersistedValue, createPersistedFlag } from "@/lib/persisted-value";
 import { AddServerModal } from "./AddServerModal";
 import ServerRuntimePicker from "./ServerRuntimePicker";
@@ -989,6 +989,48 @@ const DeployTargetStep: React.FC<DeployTargetStepProps> = ({ targets, onContinue
       ]
     : buildOptions;
 
+  // Clone-location picker (DOCKER server deploys, incl. services). Bare always
+  // clones on the target, so it keeps the credential-forwarding checkbox below
+  // instead — there's no "clone on the API host" alternative for it. Cloud
+  // clones inside the workspace and local has no remote, so both are excluded.
+  // Services always deploy as docker (build on the server), so the clone picker
+  // applies to them regardless of the config.runtimeMode field (which may not be
+  // hydrated to "docker" on a config-edit).
+  const showCloneStrategy =
+    config.deployTarget === "server" &&
+    (config.runtimeMode === "docker" || isServiceDeployment);
+  const cloneStrategy: CloneStrategy = config.cloneStrategy ?? "api-host";
+  const cloneOptions: Array<{
+    value: CloneStrategy;
+    icon: React.ReactNode;
+    label: string;
+    description: string;
+  }> = [
+    {
+      value: "api-host",
+      // The "api host" is the machine running Openship: the user's own device in
+      // desktop mode, the Openship orchestrator when self-hosted. Not the cloud —
+      // so no cloud icon, and a label that says which machine it actually is.
+      icon: <Cpu className="size-5" />,
+      label: isDesktop ? "On your device" : "On Openship",
+      description: isDesktop
+        ? "Clone on your machine, then upload the build context. Works everywhere."
+        : "Clone on the Openship host, then upload the build context. Works everywhere.",
+    },
+    {
+      value: "server",
+      icon: <GitBranch className="size-5" />,
+      label: "On the server",
+      description: "Clone straight on the server — no upload, best for big repos.",
+    },
+  ];
+
+  // Advanced-panel summary line (build location). Clone location has its own
+  // right-panel picker, so it isn't summarized here.
+  const advancedSummary = showBuildStrategy
+    ? `${config.options.hasBuild ? "Build" : "Prepare"} on ${visibleBuildOptions.find((o) => o.value === config.buildStrategy)?.label ?? "—"}`
+    : "Options";
+
   const hasAnyDeployTarget = deployTargetOptions.length > 0;
   const canContinue = ready && (
     config.deployTarget === "cloud" ||
@@ -1095,7 +1137,12 @@ const DeployTargetStep: React.FC<DeployTargetStepProps> = ({ targets, onContinue
     config.options.hasServer &&
     config.projectType !== "docker" &&
     !isServiceDeployment;
-  const showRightPanel = showCloudPicker || showServerRuntime;
+  // Docker/services server deploys always build on the server; their "how it
+  // runs" choice is the clone LOCATION. Give it the same right-panel treatment
+  // as the cloud power + runtime pickers so the step uses the full width instead
+  // of stacking everything in one narrow column.
+  const showClonePanel = showFullPicker && showCloneStrategy && !!config.serverId;
+  const showRightPanel = showCloudPicker || showServerRuntime || showClonePanel;
 
   return (
     <div
@@ -1187,11 +1234,12 @@ const DeployTargetStep: React.FC<DeployTargetStepProps> = ({ targets, onContinue
             </button>
           )}
 
-          {/* Git credential forwarding — desktop-only, server target only,
-              default off. Lets the remote clone with the operator's local `gh`
-              instead of build-local-then-upload. Nothing is persisted on the
-              remote; the relay closes when the build ends. */}
-          {isDesktop && config.deployTarget === "server" && (
+          {/* Git credential forwarding — BARE runtime only (docker uses the
+              clone-location picker in Advanced below). Desktop-only, server
+              target, default off. Bare always clones on the server; this lets it
+              clone with the operator's local `gh` instead of failing on a private
+              repo. Nothing is persisted; the relay closes when the build ends. */}
+          {isDesktop && config.deployTarget === "server" && config.runtimeMode === "bare" && !isServiceDeployment && (
             <label className="flex items-start gap-2.5 cursor-pointer select-none rounded-xl border border-border/50 bg-card/40 px-4 py-3">
               <input
                 type="checkbox"
@@ -1291,10 +1339,7 @@ const DeployTargetStep: React.FC<DeployTargetStepProps> = ({ targets, onContinue
               </div>
               <div>
                 <p className="text-sm font-semibold text-foreground">Advanced</p>
-                <p className="text-xs text-muted-foreground">
-                  {config.options.hasBuild ? "Build" : "Prepare"} on{" "}
-                  {visibleBuildOptions.find((o) => o.value === config.buildStrategy)?.label ?? "—"}
-                </p>
+                <p className="text-xs text-muted-foreground">{advancedSummary}</p>
               </div>
             </div>
             {advancedOpen ? (
@@ -1305,32 +1350,34 @@ const DeployTargetStep: React.FC<DeployTargetStepProps> = ({ targets, onContinue
           </button>
 
           {advancedOpen && (
-            <div className="border-t border-border/50 px-5 py-4 space-y-3">
-              <div>
-                <h3 className="text-sm font-semibold text-foreground">
-                  {config.options.hasBuild ? "Where do you want to build?" : "Where do you want to prepare it?"}
-                </h3>
-                <p className="text-xs text-muted-foreground mt-0.5">
-                  {config.options.hasBuild
-                    ? "Choose where the build process runs"
-                    : "Choose where the repository is cloned and staged before deploy"}
-                </p>
-              </div>
-              <div className="space-y-2">
-                {visibleBuildOptions.map((opt) => (
-                  <OptionCard
-                    key={opt.value}
-                    value={opt.value}
-                    selected={config.buildStrategy === opt.value}
-                    onSelect={() => {
-                      buildStrategyTouchedRef.current = true;
-                      updateConfig({ buildStrategy: opt.value });
-                    }}
-                    icon={opt.icon}
-                    label={opt.label}
-                    description={opt.description}
-                  />
-                ))}
+            <div className="border-t border-border/50 px-5 py-4">
+              <div className="space-y-3">
+                <div>
+                  <h3 className="text-sm font-semibold text-foreground">
+                    {config.options.hasBuild ? "Where do you want to build?" : "Where do you want to prepare it?"}
+                  </h3>
+                  <p className="text-xs text-muted-foreground mt-0.5">
+                    {config.options.hasBuild
+                      ? "Choose where the build process runs"
+                      : "Choose where the repository is cloned and staged before deploy"}
+                  </p>
+                </div>
+                <div className="space-y-2">
+                  {visibleBuildOptions.map((opt) => (
+                    <OptionCard
+                      key={opt.value}
+                      value={opt.value}
+                      selected={config.buildStrategy === opt.value}
+                      onSelect={() => {
+                        buildStrategyTouchedRef.current = true;
+                        updateConfig({ buildStrategy: opt.value });
+                      }}
+                      icon={opt.icon}
+                      label={opt.label}
+                      description={opt.description}
+                    />
+                  ))}
+                </div>
               </div>
             </div>
           )}
@@ -1376,9 +1423,48 @@ const DeployTargetStep: React.FC<DeployTargetStepProps> = ({ targets, onContinue
             mobile where the layout collapses to a single column. */}
         <div className="hidden lg:block w-px bg-border self-stretch" />
         {/* Slide-in keyed on deployTarget so the animation re-fires
-            each time the user flips targets (not only on first selection). */}
-        <div key={config.deployTarget} className="lg:pl-6 animate-slide-in-right">
-          {showCloudPicker ? <CloudPowerPicker /> : <ServerRuntimePicker />}
+            each time the user flips targets (not only on first selection).
+            Stacks whichever "how it runs" pickers apply to this target:
+            cloud power, runtime isolation, and/or clone location. */}
+        <div key={config.deployTarget} className="lg:pl-6 animate-slide-in-right space-y-6">
+          {showCloudPicker && <CloudPowerPicker />}
+          {showServerRuntime && <ServerRuntimePicker />}
+          {showClonePanel && (
+            <div className="space-y-3">
+              <div>
+                <h3 className="text-sm font-semibold text-foreground">
+                  Where do you want to clone?
+                </h3>
+                <p className="text-xs text-muted-foreground mt-0.5">
+                  The build always runs on the server — this only changes where the
+                  repo is cloned.{" "}
+                  {isDesktop
+                    ? "Cloning on the server forwards your git credentials temporarily; nothing is stored."
+                    : "Cloning on the server ships a short-lived token to the build host."}
+                </p>
+              </div>
+              <div className="space-y-2">
+                {cloneOptions.map((opt) => (
+                  <OptionCard
+                    key={opt.value}
+                    value={opt.value}
+                    selected={cloneStrategy === opt.value}
+                    onSelect={() =>
+                      updateConfig({
+                        cloneStrategy: opt.value,
+                        // Desktop opts into the relay when cloning on the server;
+                        // non-desktop uses the token path (no relay).
+                        forwardGitCredentials: opt.value === "server" && isDesktop,
+                      })
+                    }
+                    icon={opt.icon}
+                    label={opt.label}
+                    description={opt.description}
+                  />
+                ))}
+              </div>
+            </div>
+          )}
         </div>
       </>
     )}

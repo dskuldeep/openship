@@ -1,13 +1,18 @@
 import { repos, type Domain, type Project } from "@repo/db";
 import {
-  inferPublicRouteDomainType,
-  normalizeTargetPath,
+  managedHostnameToSlug,
   publicEndpointHostname,
+  routeDomainRowToPublicEndpoint,
   syncStoredPublicEndpoints,
   type StoredPublicEndpoint,
 } from "../../lib/public-endpoints";
-import { getRoutingBaseDomain } from "../../lib/routing-domains";
 import { syncProjectPublicRoutes } from "../../lib/project-route-store";
+import { resolveDeploymentRuntime } from "../../lib/deployment-runtime";
+import {
+  reconcileProjectRoutes,
+  type RouteRegister,
+  type RouteRemove,
+} from "../../lib/route-apply.service";
 
 type ProjectRouteProject = Pick<Project, "id" | "slug">;
 type RouteStateProject = Pick<Project, "slug">;
@@ -68,15 +73,6 @@ function normalizeProjectRouteRows(projectDomains: Domain[]): Domain[] {
     });
 }
 
-function managedHostnameToSlug(hostname: string): string | undefined {
-  const normalized = hostname.trim().toLowerCase();
-  const suffix = `.${getRoutingBaseDomain().trim().toLowerCase()}`;
-  if (!normalized.endsWith(suffix)) return undefined;
-
-  const slug = normalized.slice(0, -suffix.length);
-  return slug || undefined;
-}
-
 function draftEndpointsWithIds(
   projectDomains: Domain[],
   endpoints: StoredPublicEndpoint[],
@@ -97,40 +93,19 @@ function draftEndpointsWithIds(
 }
 
 function routeRowToEndpoint(domain: Domain): ProjectRouteEndpoint | null {
-  const hostname = domain.hostname?.trim().toLowerCase();
-  if (!hostname || domain.serviceId) return null;
-
-  const port = domain.targetPort ?? undefined;
-  const targetPath = normalizeTargetPath(domain.targetPath);
-  const domainType = inferPublicRouteDomainType(hostname, domain.domainType);
-
-  if ((port !== undefined) === Boolean(targetPath)) {
-    return null;
-  }
-
-  if (domainType === "free") {
-    const slug = managedHostnameToSlug(hostname);
-    if (!slug) return null;
-
-    return {
-      id: domain.id,
-      hostname,
-      isPrimary: domain.isPrimary,
-      ...(port !== undefined ? { port } : {}),
-      ...(targetPath ? { targetPath } : {}),
-      domain: slug,
-      domainType,
-    } satisfies ProjectRouteEndpoint;
-  }
+  // Service-scoped rows are per-service routes, not project-level endpoints.
+  if (domain.serviceId) return null;
+  // Shared domain-row → endpoint rule (port XOR path, free→slug / custom→host).
+  const endpoint = routeDomainRowToPublicEndpoint(domain);
+  if (!endpoint) return null;
+  const hostname = publicEndpointHostname(endpoint);
+  if (!hostname) return null;
 
   return {
+    ...endpoint,
     id: domain.id,
     hostname,
     isPrimary: domain.isPrimary,
-    ...(port !== undefined ? { port } : {}),
-    ...(targetPath ? { targetPath } : {}),
-    customDomain: hostname,
-    domainType,
   } satisfies ProjectRouteEndpoint;
 }
 
@@ -235,4 +210,122 @@ export async function syncProjectRouteState(
   await persistProjectRouteState(project.id, nextState.publicEndpoints, projectDomains);
   const refreshedDomains = await listProjectRouteRows(project.id);
   return deriveProjectRouteState(project, { projectDomains: refreshedDomains });
+}
+
+/**
+ * Re-apply a single-app project's LIVE routes after a domain/port edit so the
+ * change takes effect immediately instead of waiting for the next deploy
+ * (`syncProjectRouteState` only writes DB rows). Best-effort: the rows are
+ * already committed, so a routing failure just defers to the next deploy.
+ *
+ * `previousHostnames` are the hostnames tracked BEFORE the edit; any that are
+ * gone now get their live route torn down.
+ *
+ * Self-hosted uses the routing provider (nginx/openresty), resolving the
+ * upstream from the active deployment's container (docker) or the host (bare).
+ * Cloud re-applies via the runtime's page/workspace primitives.
+ *
+ * Static-path routes (served straight from the web root) are left to the next
+ * deploy — they have no live upstream to point at here.
+ */
+export async function reapplyProjectLiveRoutes(
+  project: Pick<
+    Project,
+    | "id"
+    | "slug"
+    | "port"
+    | "cloudWorkspaceId"
+    | "activeDeploymentId"
+    | "organizationId"
+    | "webhookDomain"
+  >,
+  previousHostnames: string[],
+): Promise<void> {
+  const isCloud = !!project.cloudWorkspaceId;
+  if (!isCloud && !project.activeDeploymentId) return;
+
+  const state = await resolveProjectRouteState({ id: project.id, slug: project.slug });
+  const current = normalizeProjectRouteRows(state.projectDomains);
+  const currentHostnames = new Set(current.map((d) => d.hostname.toLowerCase()));
+  // domainType isn't retained for a dropped row — infer managed vs custom from
+  // the base-domain suffix so cloud teardown targets the right primitive.
+  const removes: RouteRemove[] = previousHostnames
+    .filter((h) => !currentHostnames.has(h.toLowerCase()))
+    .map((hostname) => ({ hostname, isCustomDomain: !managedHostnameToSlug(hostname) }));
+
+  // Cloud: no upstream resolution — the workspace/page owns routing by port.
+  if (isCloud) {
+    const registers: RouteRegister[] = current
+      .filter((domain) => !domain.targetPath)
+      .map((domain) => ({
+        hostname: domain.hostname,
+        port: domain.targetPort ?? project.port ?? undefined,
+        // Infer from the hostname suffix (same signal the removes use) so a
+        // legacy null `domainType` row still resolves the right cloud primitive.
+        isCustomDomain: !managedHostnameToSlug(domain.hostname),
+      }));
+    await reconcileProjectRoutes(project, { registers, removes });
+    return;
+  }
+
+  // Self-hosted: resolve the deployment's routing + runtime ONCE (the same
+  // resolver deploy/delete use), then compute each upstream from the container.
+  const deployment = await repos.deployment.findById(project.activeDeploymentId!);
+  if (!deployment) {
+    console.warn(
+      `[project-route] ${project.slug}: no active deployment row — skipping live route re-apply`,
+    );
+    return;
+  }
+  const { routing, runtime, effectiveTarget, serverId } =
+    await resolveDeploymentRuntime(deployment);
+
+  const containerId = deployment.containerId;
+  if (!containerId) {
+    // Compose/multi-service deployments track containers per-service, so the
+    // parent deployment row has no containerId — nothing to point a single-app
+    // route at (per-service routes are handled in updateService). Still tear
+    // down any dropped hostnames on the correct host.
+    console.warn(
+      `[project-route] ${project.slug}: deployment ${deployment.id} has no containerId (target=${effectiveTarget}) — skipping single-app route registration`,
+    );
+    await reconcileProjectRoutes(project, { routing, removes });
+    return;
+  }
+
+  const resolveTargetUrl = async (port: number): Promise<string | null> => {
+    if (runtime.supports("containerIp")) {
+      const ip = await runtime.getContainerIp(containerId);
+      if (!ip) {
+        console.warn(
+          `[project-route] ${project.slug}: getContainerIp returned null for ${containerId} (target=${effectiveTarget}, server=${serverId ?? "local"})`,
+        );
+        return null;
+      }
+      return `http://${ip}:${port}`;
+    }
+    // Bare metal: the app runs directly on the host.
+    return `http://127.0.0.1:${port}`;
+  };
+
+  const registers: RouteRegister[] = [];
+  for (const domain of current) {
+    if (domain.targetPath) continue;
+    const port = domain.targetPort ?? project.port;
+    if (!port) {
+      console.warn(`[project-route] ${project.slug}: no port for ${domain.hostname} — skipping`);
+      continue;
+    }
+    const targetUrl = await resolveTargetUrl(port);
+    if (!targetUrl) continue;
+    registers.push({
+      hostname: domain.hostname,
+      targetUrl,
+      isCustomDomain: domain.domainType === "custom",
+    });
+  }
+
+  // The webhook-proxy location is re-attached automatically for the project's
+  // webhookDomain inside reconcileProjectRoutes.
+  await reconcileProjectRoutes(project, { routing, registers, removes });
 }

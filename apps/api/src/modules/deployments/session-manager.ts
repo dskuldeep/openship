@@ -1,9 +1,6 @@
 /**
  * Build session manager - manages active build SSE streams.
  *
- * Ported from old sessionManager.js into a typed, TtlCache-backed implementation.
- * Uses Hono's SSE streaming instead of raw Express res.write().
- *
  * Responsibilities:
  *   - Track active build sessions with log buffers
  *   - Broadcast log entries to SSE subscribers
@@ -14,8 +11,7 @@
 import { SYSTEM } from "@repo/core";
 import { TtlCache } from "../../lib/cache";
 import type { LogEntry } from "@repo/adapters";
-
-// ─── Types ───────────────────────────────────────────────────────────────────
+import { STEP_INDEX, STEP_PROGRESS, progressForStep } from "./build-steps";
 
 export interface ServiceStatusPayload {
   serviceName: string;
@@ -42,28 +38,6 @@ export interface BuildSessionState {
 
 export type SseWriter = (event: string, data: string) => boolean;
 
-// ─── Step-to-progress mapping ────────────────────────────────────────────────
-
-const STEP_INDEX: Record<string, number> = {
-  prepare: 0,
-  clone: 1,
-  install: 2,
-  build: 3,
-  deploy: 4,
-};
-
-const STEP_PROGRESS: Record<string, number> = {
-  prepare: 3,
-  clone: 10,
-  install: 30,
-  build: 55,
-  deploy: 80,
-};
-
-function progressForStep(step: string, stepStatus?: LogEntry["stepStatus"]): number {
-  const base = STEP_PROGRESS[step] ?? 0;
-  return stepStatus === "completed" ? base + 10 : base;
-}
 
 /** Convert a LogEntry into the JSON payload the frontend expects. */
 function formatLogPayload(entry: LogEntry, eventId: number): string {
@@ -82,15 +56,11 @@ function formatLogPayload(entry: LogEntry, eventId: number): string {
   });
 }
 
-// ─── Cache ───────────────────────────────────────────────────────────────────
-
 /** Active sessions cache - keyed by deployment ID (dep_xxx) */
 const sessions = new TtlCache<BuildSessionState>({
   maxSize: SYSTEM.SSE.MAX_SESSIONS,
   sweepIntervalMs: SYSTEM.SSE.SWEEP_INTERVAL_MS,
 });
-
-// ─── Heartbeat ───────────────────────────────────────────────────────────────
 
 /** Send keep-alive pings to all active subscribers to prevent connection drops */
 const heartbeatTimer = setInterval(() => {
@@ -354,8 +324,6 @@ export function removeSession(sessionId: string): void {
   // Clean up any pending prompt - reject so the pipeline doesn't hang
   rejectPendingPrompt(sessionId, "Session removed");
 }
-
-// ─── Interactive prompts (pipeline ↔ user) ───────────────────────────────────
 
 /**
  * Pending prompt - the pipeline blocks on `promise` while the user

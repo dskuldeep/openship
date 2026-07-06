@@ -294,6 +294,9 @@ export interface MultiServiceDeployConfig {
   ports: string[];
   environment: Record<string, string>;
   volumes: string[];
+  /** When true, NAMED volumes are project-scoped (openship-<slug>-<name>) at
+   *  create time. False for grandfathered pre-migration services (bare names). */
+  namespaceVolumes: boolean;
   command?: string;
   restart?: string;
   /** Extended compose fields (healthcheck, …). Docker honors them; runtimes

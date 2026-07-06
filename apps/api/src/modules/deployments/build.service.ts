@@ -2,9 +2,10 @@
  * Build service — build session LIFECYCLE + config/snapshot helpers.
  *
  * Public API: triggerDeployment, requestBuildAccess, redeployBuildSession,
- * startBuild, cancelBuildSession, getBuildSessionStatus, respondToPrompt,
- * createQueuedDeployment, checkNoActiveBuild, buildConfigSnapshot,
- * runDeploymentPreflight, encryptEnvVars, metaWithPrevious.
+ * startBuild, cancelBuildSession, respondToPrompt, createQueuedDeployment,
+ * checkNoActiveBuild, buildConfigSnapshot, runDeploymentPreflight,
+ * encryptEnvVars, metaWithPrevious, loadDeployment.
+ * (getBuildSessionStatus moved to ./build-status.service.)
  *
  * The build→deploy EXECUTION engine (kickoffBuild → executeBuildAndDeploy
  * → deploy phases → post-deploy sync) lives in `./build-pipeline.ts`.
@@ -56,7 +57,7 @@ import {
   projectServicesToDeployableServices,
 } from "./compose";
 import * as settingsService from "../settings/settings.service";
-import { type DeployableService } from "../../lib/deployable-service";
+import { type DeployableService, serviceKind } from "../../lib/deployable-service";
 import {
   listProjectRouteRows,
   resolveProjectRouteState,
@@ -124,8 +125,6 @@ export async function runDeploymentPreflight(
   }
 }
 
-// ─── Types ───────────────────────────────────────────────────────────────────
-
 /** Config snapshot stored in deployment.meta - self-contained build+deploy config. */
 export interface DeploymentConfigSnapshot {
   /** Owning organization — required so server lookups can be org-scoped. */
@@ -183,12 +182,26 @@ export interface DeploymentConfigSnapshot {
    */
   targetServiceIds?: string[];
   /**
+   * Subset of `targetServiceIds` to REFRESH — recreate the container with
+   * fresh env but WITHOUT rebuilding the image (env-only change, code
+   * unchanged). They deploy from their previous image ref. Empty/absent =
+   * every targeted service is rebuilt normally.
+   */
+  refreshServiceIds?: string[];
+  /**
    * Per-deploy opt-in to forward the operator's LOCAL `gh` identity to the
    * remote host for the on-server clone (desktop-only; default off). Drives the
    * HTTPS credential relay in the build pipeline — see `allowRelayFallback`.
    * Nothing is persisted on the remote; the relay closes when the build ends.
    */
   forwardGitCredentials?: boolean;
+  /**
+   * Where the repo is cloned for a docker server deploy: "api-host" (default —
+   * clone on the orchestrator, transfer the context) or "server" (clone on the
+   * build host; desktop forwards creds via the relay, non-desktop ships a
+   * short-lived token). Ignored for cloud; bare always clones on the target.
+   */
+  cloneStrategy?: "api-host" | "server";
 }
 
 export interface BuildAccessInput {
@@ -219,9 +232,9 @@ export interface BuildAccessInput {
    * into the snapshot; the pipeline enforces desktop + server-build gating.
    */
   forwardGitCredentials?: boolean;
+  /** Per-deploy: "api-host" (default) or "server" clone. See snapshot field. */
+  cloneStrategy?: "api-host" | "server";
 }
-
-// ─── Helpers ─────────────────────────────────────────────────────────────────
 
 /** Narrow the free-form `project.runtime_mode` text column (string | null) to
  *  the runtime-isolation union — a validated check instead of an unchecked
@@ -238,7 +251,6 @@ export function buildConfigSnapshot(
 ): DeploymentConfigSnapshot {
   const runtimeImage = resolveRuntimeImage(project);
 
-  // why this needed while the snapshot already wired to project that has org id, doesnt all should have relatiopns
   return {
     // Owning org — needed by every downstream that does an org-scoped
     // lookup (preflight bridge, github installation resolver, runtime
@@ -462,15 +474,13 @@ export function encryptEnvVars(envVars?: Record<string, string>): Record<string,
   return encrypted;
 }
 
-// ─── Shared helpers ──────────────────────────────────────────────────────────
-
 /**
  * Load a deployment + its project, refusing if their organizations don't
  * agree. The calling route's permission middleware already verified the
  * caller is a member of the deployment's org; this is a defense-in-depth
  * check against a deployment ever outliving a project moving orgs.
  */
-async function loadDeployment(deploymentId: string) {
+export async function loadDeployment(deploymentId: string) {
   const dep = await repos.deployment.findById(deploymentId);
   if (!dep) throw new NotFoundError("Deployment", deploymentId);
 
@@ -499,10 +509,6 @@ export async function checkNoActiveBuild(projectId: string) {
 }
 
 /**
- * Create a queued deployment + build session atomically.
- * If the build session insert fails, the deployment is cleaned up.
- */
-/**
  * Detection: the partial unique index uq_deployment_one_active_per_project
  * surfaces this Postgres / pglite error code when two webhook
  * deliveries race to create a deployment for the same project.
@@ -512,6 +518,45 @@ function isActiveDeploymentRace(err: unknown): boolean {
   if (!e) return false;
   if (e.code === "23505") return true; // unique_violation
   return Boolean(e.message?.includes("uq_deployment_one_active_per_project"));
+}
+
+/**
+ * Which enabled services have an env var (project-level or service-scoped)
+ * modified since the active deployment went live — i.e. need an env-only
+ * refresh. A project-level change (serviceId null) affects EVERY service.
+ * Returns null when there's no active deployment/anchor to compare against
+ * (first deploy → forceAll handles it). Values are never read, only
+ * updatedAt, so no decryption is involved.
+ */
+async function resolveEnvDirtyServiceIds(
+  project: Project,
+  environment: string,
+): Promise<Set<string> | null> {
+  if (!project.activeDeploymentId) return null;
+  const active = await repos.deployment.findById(project.activeDeploymentId).catch(() => null);
+  // Anchor on the active deployment's createdAt: any env var touched after it
+  // started is (conservatively) treated as needing a refresh. Biases safe —
+  // once redeployed, the new active's createdAt post-dates the change, so it
+  // won't keep re-refreshing.
+  const anchor = active?.createdAt ?? null;
+  if (!anchor) return null;
+
+  const [meta, services] = await Promise.all([
+    repos.project.listEnvVarChangeMeta(project.id, environment).catch(() => []),
+    repos.service.listByProject(project.id).catch(() => []),
+  ]);
+  const enabledIds = services.filter((s) => s.enabled).map((s) => s.id);
+
+  // A project-level (unscoped) env change touches every service.
+  if (meta.some((m) => m.serviceId === null && m.updatedAt > anchor)) {
+    return new Set(enabledIds);
+  }
+  const perService = new Set(
+    meta
+      .filter((m) => m.serviceId !== null && m.updatedAt > anchor)
+      .map((m) => m.serviceId as string),
+  );
+  return new Set(enabledIds.filter((id) => perService.has(id)));
 }
 
 export async function createQueuedDeployment(opts: {
@@ -537,15 +582,21 @@ export async function createQueuedDeployment(opts: {
   forceAll?: boolean;
   /** Smart per-service targeting — passed through to the executor via meta. */
   serviceIds?: string[];
+  /** Subset of serviceIds to recreate WITHOUT rebuilding (env-only refresh). */
+  refreshServiceIds?: string[];
   /** Changed-file paths traced for this version (file/root tracing). */
   changedPaths?: string[] | null;
   changedPathsTruncated?: boolean;
 }) {
   // Persist the smart-deploy serviceIds onto the snapshot so the
   // executor can find them without re-resolving from request scope.
-  const meta: DeploymentConfigSnapshot = opts.serviceIds && opts.serviceIds.length > 0
-    ? { ...opts.meta, targetServiceIds: opts.serviceIds }
-    : opts.meta;
+  let meta: DeploymentConfigSnapshot = opts.meta;
+  if (opts.serviceIds && opts.serviceIds.length > 0) {
+    meta = { ...meta, targetServiceIds: opts.serviceIds };
+  }
+  if (opts.refreshServiceIds && opts.refreshServiceIds.length > 0) {
+    meta = { ...meta, refreshServiceIds: opts.refreshServiceIds };
+  }
 
   // Version is NOT assigned here. A version number represents a shipped
   // release (a successful deploy of a commit), so it's assigned in onSuccess —
@@ -602,20 +653,8 @@ export async function createQueuedDeployment(opts: {
   return dep;
 }
 
-// ─── SSE streaming (re-export) ───────────────────────────────────────────────
-
 /** Subscribe to live build logs by deployment ID (dep_xxx). */
 export { subscribe as subscribeToBuildSession } from "./session-manager";
-
-// ─── Build access (create deployment with config snapshot) ───────────────────
-
-/**
- * Create a deployment + build session for an existing project.
- * Snapshots project config into deployment.meta,
- * encrypts env vars into deployment.envVars.
- *
- * Project MUST exist before calling this.
- */
 
 /** Resolve a pending pipeline prompt (e.g. port conflict). */
 export async function respondToPrompt(
@@ -642,6 +681,7 @@ export async function requestBuildAccess(ctx: RequestContext, input: BuildAccess
     cloudResourceTier,
     cloudResourceCustom,
     forwardGitCredentials,
+    cloneStrategy,
   } = input;
 
   const project = await repos.project.findById(projectId);
@@ -687,6 +727,25 @@ export async function requestBuildAccess(ctx: RequestContext, input: BuildAccess
   }
   if (requestedServiceMode === "services" && services?.length) {
     snapshot.composeServices = services;
+    // Persist compose services to the canonical service table NOW, at
+    // deploy-request time — not only deep inside the compose pipeline. A build
+    // that FAILS before the pipeline's own sync (clone/prepare error, image
+    // pull, etc.) would otherwise leave the project with ZERO service rows, so
+    // the config-edit wizard (which reads the service table) collapses to
+    // single-app even though the compose config is right here. syncFromCompose
+    // is idempotent and strictly owns compose rows, so filter out monorepo
+    // entries (they'd create ghost compose rows) exactly like the pipeline does.
+    // Best-effort: a persist failure must never block the deploy.
+    const composeOnly = services.filter((s) => serviceKind(s) === "compose");
+    if (composeOnly.length) {
+      await repos.service
+        .syncFromCompose(project.id, composeOnly)
+        .catch((err) =>
+          console.warn(
+            `[requestBuildAccess] failed to persist compose services: ${safeErrorMessage(err)}`,
+          ),
+        );
+    }
   }
   const { useServicePipeline, servicePreflightServices } = await resolveServicePipelineMode(
     project,
@@ -734,6 +793,12 @@ export async function requestBuildAccess(ctx: RequestContext, input: BuildAccess
   // gating before opening the relay, so a forged flag elsewhere is inert.
   if (forwardGitCredentials === true) {
     snapshot.forwardGitCredentials = true;
+  }
+  // Per-deploy clone location. "server" makes a docker deploy clone on the build
+  // host (relay on desktop, token otherwise); the pipeline gates it. Default
+  // "api-host" (clone on the orchestrator + transfer) when unset.
+  if (cloneStrategy === "server" || cloneStrategy === "api-host") {
+    snapshot.cloneStrategy = cloneStrategy;
   }
 
   // Openship Cloud resource tier — only a SERVER-BACKED cloud (Oblien)
@@ -812,211 +877,6 @@ export async function requestBuildAccess(ctx: RequestContext, input: BuildAccess
   };
 }
 
-// ─── Build session status ────────────────────────────────────────────────────
-
-export async function getBuildSessionStatus(deploymentId: string) {
-  const { dep, project } = await loadDeployment(deploymentId);
-
-  const buildSessionRow = await repos.deployment.findBuildSessionByDeploymentId(deploymentId);
-
-  const memSession = sessionManager.getSession(deploymentId);
-  const isActive =
-    memSession != null && !["ready", "failed", "cancelled"].includes(memSession.status);
-
-  const logEntries = isActive
-    ? (memSession?.logs ?? (buildSessionRow?.logs as LogEntry[] | null) ?? [])
-    : ((buildSessionRow?.logs as LogEntry[] | null) ?? memSession?.logs ?? []);
-  // Filter out step-metadata entries - they drive the progress bar, not the terminal
-  const terminalEntries = logEntries
-    .map((entry, eventId) => ({ entry, eventId }))
-    .filter(({ entry }) => !(entry.step && entry.stepStatus));
-  const logsText = terminalEntries.map(({ entry }) => entry.message).join("\n");
-  const structuredLogs = terminalEntries.map(({ entry, eventId }) => ({
-    text: entry.message,
-    time: entry.timestamp,
-    level: entry.level,
-    serviceName: entry.serviceName,
-    rawData: entry.rawData,
-    eventId,
-  }));
-  const lastEventId = (() => {
-    for (let index = logEntries.length - 1; index >= 0; index--) {
-      const entry = logEntries[index];
-      if (!(entry.step && entry.stepStatus)) {
-        return index;
-      }
-    }
-    return undefined;
-  })();
-
-  // In-memory session is real-time truth (updated every phase transition).
-  // DB build-session row only moves queued → building → final, so it's stale during deploy.
-  const effectiveStatus = memSession
-    ? memSession.status
-    : buildSessionRow
-      ? buildSessionRow.status
-      : dep.status;
-
-  // Route state is always resolved live from route rows.
-  const snapshot = dep.meta as DeploymentConfigSnapshot | null;
-  const routeState = await resolveProjectRouteState(project);
-
-  // Resolve the target server's display name (when this deployed to a server),
-  // so the detail UI can show "Server · <name>" rather than a raw id.
-  const targetServer = snapshot?.serverId
-    ? await repos.server.get(snapshot.serverId).catch(() => null)
-    : null;
-
-  // Derive step progress from persisted log entries when no active session
-  let currentStep = 0;
-  let progress = 0;
-  if (isActive) {
-    // Truly active session - frontend gets live progress via SSE, don't override
-    currentStep = undefined as unknown as number;
-    progress = undefined as unknown as number;
-  } else if (effectiveStatus === "ready") {
-    currentStep = 5; // past deploy → Ready terminal (steps: prepare,clone,install,build,deploy,ready)
-    progress = 100;
-  } else {
-    // Scan persisted logs for step events to find where it got to. Indices must
-    // match the session-manager + the frontend STEPS array (prepare prepended).
-    const STEP_INDEX: Record<string, number> = { prepare: 0, clone: 1, install: 2, build: 3, deploy: 4 };
-    const STEP_PROGRESS: Record<string, number> = { prepare: 3, clone: 10, install: 30, build: 55, deploy: 80 };
-    for (const entry of logEntries) {
-      if (entry.step && entry.step in STEP_INDEX) {
-        const idx = STEP_INDEX[entry.step];
-        if (idx >= currentStep) {
-          currentStep = idx;
-          progress = STEP_PROGRESS[entry.step];
-          // If this step completed, advance progress beyond it
-          if (entry.stepStatus === "completed") {
-            progress = STEP_PROGRESS[entry.step] + 10;
-          }
-        }
-      }
-    }
-    // For failed/cancelled, keep progress where it stopped
-  }
-
-  // Per-phase durations for the build-phases panel. The raw log entries (before
-  // the terminal filter) carry each step's running→completed events with
-  // timestamps; pair them per step. Keyed by step name (prepare/clone/…).
-  const phaseDurations: Record<string, number> = {};
-  {
-    const phaseStart: Record<string, number> = {};
-    for (const entry of logEntries) {
-      if (!entry.step || !entry.stepStatus) continue;
-      const t = new Date(entry.timestamp).getTime();
-      if (!Number.isFinite(t)) continue;
-      if (entry.stepStatus === "running") {
-        phaseStart[entry.step] = t;
-      } else if (entry.stepStatus === "completed" && phaseStart[entry.step] != null) {
-        phaseDurations[entry.step] = Math.max(0, t - phaseStart[entry.step]);
-      }
-    }
-  }
-
-  const [deploymentServices, projectServices] = await Promise.all([
-    repos.service.listByDeployment(deploymentId).catch(() => []),
-    repos.service.listByProject(project.id).catch(() => []),
-  ]);
-  const isServiceDeployment =
-    snapshot?.serviceDeploymentMode === "services" ||
-    (
-      snapshot?.serviceDeploymentMode !== "single" &&
-      (
-        !!snapshot?.composeDeployment ||
-        deploymentServices.length > 0 ||
-        projectServices.length > 0 ||
-        isMultiServiceProject(project)
-      )
-    );
-  const projectType = isServiceDeployment
-    ? ("services" as const)
-    : snapshot?.runtimeMode === "docker"
-      ? ("docker" as const)
-      : ("app" as const);
-
-  const composeData =
-    projectType === "services"
-      ? {
-          composeDeployment: snapshot?.composeDeployment ?? null,
-          serviceStatuses: deploymentServices.map((service) => ({
-            serviceId: service.serviceId,
-            status: service.status,
-            containerId: service.containerId,
-            hostPort: service.hostPort,
-            ip: service.ip,
-            imageRef: service.imageRef,
-          })),
-          services: projectServices
-            .filter((service) => service.enabled)
-            .map((service) => ({
-              serviceId: service.id,
-              serviceName: service.name,
-              image: service.image,
-              build: service.build,
-            })),
-        }
-      : {};
-
-  return {
-    success: true,
-    deployment_id: dep.id,
-    project_id: project.id,
-    status: effectiveStatus,
-    is_active: isActive,
-    logs: logsText,
-    logEntries: structuredLogs,
-    lastEventId,
-    config: {
-      repo: project.gitRepo,
-      owner: project.gitOwner,
-      projectName: project.name,
-      framework: snapshot?.framework || project.framework,
-      branch: dep.branch ?? project.gitBranch,
-      // Build/deploy target — shown in Deployment Details. Sourced from the
-      // immutable deployment snapshot so a loaded historical deploy is accurate.
-      buildStrategy: snapshot?.buildStrategy,
-      deployTarget: snapshot?.deployTarget,
-      serverId: snapshot?.serverId,
-      serverName: targetServer?.name ?? targetServer?.sshHost ?? null,
-      publicEndpoints: routeState.publicEndpoints.map((endpoint) => ({
-        id: endpoint.id,
-        ...(endpoint.port !== undefined ? { port: String(endpoint.port) } : {}),
-        ...(endpoint.targetPath ? { targetPath: endpoint.targetPath } : {}),
-        domain: endpoint.domain || "",
-        customDomain: endpoint.customDomain || "",
-        domainType: endpoint.domainType || "free",
-      })),
-      buildCommand: snapshot?.buildCommand,
-      outputDirectory: snapshot?.outputDirectory,
-      installCommand: snapshot?.installCommand,
-      startCommand: snapshot?.startCommand,
-      rootDirectory: snapshot?.rootDirectory,
-      hasServer: snapshot?.hasServer ?? !!snapshot?.startCommand?.trim(),
-      serviceDeploymentMode: snapshot?.serviceDeploymentMode,
-    },
-    progress,
-    currentStep,
-    phaseDurations,
-    screenshots: [],
-    buildDurationMs: buildSessionRow?.durationMs ?? null,
-    buildStartedAt: buildSessionRow?.startedAt?.toISOString() ?? null,
-    failureMessage: effectiveStatus === "failed" ? dep.errorMessage || "" : "",
-    warningMessage:
-      effectiveStatus === "ready" ? snapshot?.composeDeployment?.warningMessage || "" : "",
-    previousActiveDeploymentId: snapshot?.previousActiveDeploymentId ?? null,
-    errorCode:
-      dep.errorMessage?.includes("PORT_IN_USE") || dep.errorMessage?.includes("EADDRINUSE")
-        ? "PORT_IN_USE"
-        : undefined,
-    projectType,
-    ...composeData,
-  };
-}
-
-// ─── Cancel build session ────────────────────────────────────────────────────
 
 export async function cancelBuildSession(deploymentId: string) {
   const { dep, project } = await loadDeployment(deploymentId);
@@ -1067,6 +927,9 @@ export async function cancelBuildSession(deploymentId: string) {
   }
 
   // 4. Persist the cancelled status + close the SSE stream.
+  // INVARIANT: cancel writes the DEPLOYMENT row only — NEVER the project row.
+  // activeDeploymentId (the last successful release) is left untouched, so a
+  // cancelled redeploy has zero effect on the project's live state.
   await repos.deployment.updateStatus(dep.id, "cancelled");
   if (buildSession) {
     await repos.deployment.finishBuildSession(buildSession.id, "cancelled", 0);
@@ -1076,8 +939,6 @@ export async function cancelBuildSession(deploymentId: string) {
 
   return { success: true, message: "Deployment cancelled" };
 }
-
-// ─── Redeploy build session ─────────────────────────────────────────────────
 
 export async function redeployBuildSession(
   ctx: RequestContext,
@@ -1190,8 +1051,6 @@ export async function redeployBuildSession(
   };
 }
 
-// ─── Start build from session ID (direct - no token) ─────────────────────────
-
 export async function startBuild(deploymentId: string) {
   const { dep, project } = await loadDeployment(deploymentId);
 
@@ -1222,8 +1081,6 @@ export async function startBuild(deploymentId: string) {
     project_id: project.id,
   };
 }
-
-// ─── Trigger deployment (internal build pipeline) ────────────────────────────
 
 export async function triggerDeployment(
   ctx: RequestContext,
@@ -1287,6 +1144,14 @@ export async function triggerDeployment(
       meta: DeploymentConfigSnapshot;
       envVars: Record<string, string> | null;
     };
+    /**
+     * REFRESH: re-apply the current runtime env to the active deployment
+     * WITHOUT pulling a new commit or rebuilding. Recreates the env-changed
+     * services (or all enabled if none are dirty) from their EXISTING images.
+     * Reuses the active deployment's commit — never touches git or the image
+     * builder. Dashboard "Refresh" button.
+     */
+    refresh?: boolean;
   },
 ) {
   const project = await repos.project.findById(data.projectId);
@@ -1378,7 +1243,23 @@ export async function triggerDeployment(
   // ── Resolve commit info: fetch HEAD from GitHub if not provided ────
   let commitSha = data.commitSha;
   let commitMessage = data.commitMessage;
-  if (!commitSha) {
+  if (data.refresh) {
+    // Refresh recreates the running containers with current env — it never
+    // pulls new code or builds. Reuse the active deployment's commit if it has
+    // one (for display/versioning), but DON'T require it: a local/compose
+    // project may carry no commit, and refresh doesn't need one. Only require
+    // that something is actually deployed to refresh.
+    const active = project.activeDeploymentId
+      ? await repos.deployment.findById(project.activeDeploymentId).catch(() => null)
+      : null;
+    if (!active) {
+      throw new Error("Nothing to refresh yet — deploy the project first.");
+    }
+    commitSha = active.commitSha ?? commitSha;
+    commitMessage = commitMessage ?? active.commitMessage ?? undefined;
+  }
+  // Fetch HEAD only for a real (build) deploy — a refresh must never touch git.
+  if (!commitSha && !data.refresh) {
     const head = await resolveLatestCommitInfo(ctx, project, branch);
     commitSha = head.commitSha;
     commitMessage = commitMessage ?? head.commitMessage;
@@ -1409,6 +1290,61 @@ export async function triggerDeployment(
     commitShaBefore,
   });
 
+  // ── Env-only refresh: when the router picked a code-changed subset, ALSO
+  //    recreate env-changed services with fresh env but WITHOUT rebuilding.
+  //    Strictly ADDITIVE — it only adds services to the deploy set (never
+  //    removes), so a missed detection can't drop a real rebuild and a false
+  //    positive merely recreates a container. A forceAll deploy (same OR
+  //    different commit) stays a full rebuild — env applies through it, and the
+  //    dedicated Refresh action is the surgical env-only path. Only on the
+  //    smart-redeploy path (not an explicit/forced/reuse deploy). ──
+  let finalForceAll = resolvedForceAll;
+  let finalServiceIds = resolvedServiceIds;
+  let refreshServiceIds: string[] | undefined;
+  if (data.smartRoute && !data.forceAll && !data.serviceIds?.length && !reuse) {
+    const envDirty = await resolveEnvDirtyServiceIds(project, environment);
+    if (envDirty && envDirty.size > 0 && !finalForceAll && finalServiceIds) {
+      // Code-changed subset + env-only services → deploy the union; the
+      // env-only ones (not code-changed) refresh without a rebuild.
+      const codeChanged = new Set(finalServiceIds);
+      refreshServiceIds = [...envDirty].filter((id) => !codeChanged.has(id));
+      finalServiceIds = [...new Set([...finalServiceIds, ...envDirty])];
+    }
+  }
+
+  // ── Refresh override: recreate services from their existing images with
+  //    current env, no build/clone. Targets env-changed services (respects a
+  //    running DB when only an app service's env changed); falls back to all
+  //    enabled so the button always re-applies config. Every targeted service
+  //    is ALSO a refresh service → excluded from the build → empty buildable →
+  //    the build phase (and its clone) is skipped entirely. ──
+  if (data.refresh) {
+    const enabledIds = (await repos.service.listByProject(project.id).catch(() => []))
+      .filter((s) => s.enabled)
+      .map((s) => s.id);
+    // Target precedence: explicit serviceIds (per-service refresh from the UI)
+    // → env-changed services (surgical, leaves a running DB alone) → all
+    // enabled (single-app, or a manual "refresh everything").
+    let target: string[];
+    if (data.serviceIds && data.serviceIds.length > 0) {
+      target = data.serviceIds.filter((id) => enabledIds.includes(id));
+    } else {
+      const envDirty = await resolveEnvDirtyServiceIds(project, environment);
+      target = envDirty && envDirty.size > 0 ? [...envDirty] : enabledIds;
+    }
+    // An empty target must NOT fall through: createQueuedDeployment only writes
+    // targetServiceIds/refreshServiceIds when non-empty, so an empty set would
+    // leave forceAll=false with no subset → the compose build treats it as
+    // "build everything" and re-clones — the exact opposite of a refresh. Fail
+    // loudly instead.
+    if (target.length === 0) {
+      throw new Error("Nothing to refresh — no enabled services to re-apply config to.");
+    }
+    finalForceAll = false;
+    finalServiceIds = target;
+    refreshServiceIds = target;
+  }
+
   const dep = await createQueuedDeployment({
     projectId: project.id,
     organizationId: project.organizationId,
@@ -1422,8 +1358,9 @@ export async function triggerDeployment(
     envVars: encryptedEnvVars,
     rollbackStrategy,
     commitShaBefore,
-    forceAll: resolvedForceAll,
-    serviceIds: resolvedServiceIds,
+    forceAll: finalForceAll,
+    serviceIds: finalServiceIds,
+    refreshServiceIds,
     changedPaths: resolvedChangedPaths ?? null,
   });
 

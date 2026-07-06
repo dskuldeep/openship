@@ -49,6 +49,26 @@ export async function listDomains(ctx: RequestContext, projectId: string) {
   return repos.domain.listByProject(projectId);
 }
 
+// ─── Set primary ───────────────────────────────────────────────────────────────
+
+/**
+ * Make a domain the project's primary. Primary is the project's canonical
+ * hostname — what favicon detection, analytics, and the dashboard's project
+ * link resolve to (getPrimaryByProject). setPrimary unsets any prior primary
+ * for the project and marks this one, so exactly one row stays primary.
+ * Survives redeploys: per-service route registration preserves an existing
+ * isPrimary (routing-domains), and project-route sync only touches
+ * project-level (serviceId-null) rows.
+ */
+export async function setPrimaryDomain(ctx: RequestContext, domainId: string) {
+  const domain = await repos.domain.findById(domainId);
+  if (!domain) throw new NotFoundError("Domain", domainId);
+  const project = await repos.project.findById(domain.projectId);
+  assertResourceInOrg(project, "Project", ctx.organizationId, domain.projectId);
+  await repos.domain.setPrimary(domain.projectId, domainId);
+  return { ...domain, isPrimary: true };
+}
+
 // ─── Add ─────────────────────────────────────────────────────────────────────
 
 export async function addDomain(ctx: RequestContext, data: TAddDomainBody) {

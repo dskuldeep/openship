@@ -24,7 +24,7 @@ import {
   isMultiServiceRuntime,
 } from "@repo/adapters";
 import { platform } from "../../lib/controller-helpers";
-import { internalApiUrl, runtimeTarget } from "../../config";
+import { webhookProxyTarget } from "../../config";
 import { resolveDeploymentRuntime, resolveDeploymentPlatform } from "../../lib/deployment-runtime";
 import { syncProjectToServerManifest } from "../../lib/openship-manifest-sync";
 import { ensureManagedEdgeProxy } from "../../lib/managed-edge-proxy";
@@ -41,14 +41,18 @@ import { resolveBuildGitToken } from "../github/clone-auth";
 import { openDeployRelay } from "../../lib/git-forwarding";
 import { resolveOrgOwner } from "../../lib/org-actor";
 import {
-  createCheckRun,
-  updateCheckRun,
-} from "../github/github.service";
+  preCreateServiceDeployments,
+  emitServiceCheckRun,
+  emitInitialServiceChecks,
+  rollupDeploymentStatus,
+} from "./service-checks";
 import { firePreDeployBackups } from "../backups/triggers/pre-deploy";
 import { buildBackgroundContext } from "../../lib/request-context";
 import * as sessionManager from "./session-manager";
 import { onFailure, onSuccess, onCancelled, setDeploymentStatus, type LifecycleContext } from "./deployment-lifecycle";
 import { createBuildConfig } from "./build-config";
+import { resolveClonePlan } from "./clone-plan";
+import { collapseTerminalLogs } from "./terminal-logs";
 import {
   executeComposePipeline,
   resolveProjectServicePreflightServices,
@@ -60,81 +64,6 @@ import {
 } from "../domains/project-route.service";
 import { type DeploymentConfigSnapshot } from "./build.service";
 import * as settingsService from "../settings/settings.service";
-
-// ─── Terminal output collapsing ──────────────────────────────────────────────
-
-/**
- * Collapse raw log entries into their final terminal-rendered state.
- *
- * During live streaming, xterm handles \r (carriage return) to overwrite lines
- * in-place (e.g., git progress "Counting objects:  42%\r...100%").
- * When persisting to DB we don't want all intermediate lines - just the final
- * rendered result, as a terminal would show.
- *
- * Step events (entries with `step` field) pass through unchanged - they're
- * structured metadata for the stepper UI, not terminal output.
- */
-function collapseTerminalLogs(entries: LogEntry[]): LogEntry[] {
-  const result: LogEntry[] = [];
-  // Virtual line buffer - simulates one terminal line
-  let currentLine = "";
-  let currentLevel: LogEntry["level"] = "info";
-  let currentTimestamp = "";
-  let currentServiceName: string | undefined;
-
-  const flushLine = () => {
-    const trimmed = currentLine.trimEnd();
-    if (trimmed) {
-      result.push({
-        timestamp: currentTimestamp,
-        message: trimmed,
-        level: currentLevel,
-        serviceName: currentServiceName,
-      });
-    }
-    currentLine = "";
-  };
-
-  for (const entry of entries) {
-    // Step events pass through as-is
-    if (entry.step) {
-      flushLine();
-      result.push(entry);
-      continue;
-    }
-
-    if (currentLine && entry.serviceName !== currentServiceName) {
-      flushLine();
-    }
-
-    const text = entry.message;
-    currentLevel = entry.level;
-    currentTimestamp = entry.timestamp;
-    currentServiceName = entry.serviceName;
-
-    for (let i = 0; i < text.length; i++) {
-      const ch = text[i];
-      if (ch === "\r") {
-        // Check for \r\n (treat as plain newline)
-        if (i + 1 < text.length && text[i + 1] === "\n") {
-          flushLine();
-          i++; // skip the \n
-        } else {
-          // Bare \r - overwrite: reset current line (don't flush)
-          currentLine = "";
-        }
-      } else if (ch === "\n") {
-        flushLine();
-      } else {
-        currentLine += ch;
-      }
-    }
-  }
-
-  // Flush any remaining content
-  flushLine();
-  return result;
-}
 
 function buildScopedEnvVars(
   envVars: Record<string, string>,
@@ -294,214 +223,6 @@ async function markDeploymentFailedFromOutside(deploymentId: string, error: unkn
   }
 }
 
-// ─── Smart per-service fan-out helpers ──────────────────────────────────────
-
-/**
- * Pre-create `service_deployment` rows for SKIPPED services.
- *
- * For services in `targetServiceIds`, the compose pipeline creates
- * its own per-service rows during deploy (status patches reflect
- * build/deploy progress). For services NOT in the target list — i.e.
- * intentionally unchanged — the compose pipeline never runs, so this
- * helper inserts the `skipped` row up front. That keeps the fan-out
- * record on the deployment complete from the moment building starts.
- *
- * When `forceAll=true` or no target list is given, every enabled
- * service is considered targeted; we return without inserting.
- *
- * Returns ALL services (targeted + skipped) keyed by service id so
- * the caller can drive Checks API events.
- */
-async function preCreateServiceDeployments(
-  deploymentId: string,
-  projectId: string,
-  opts: {
-    targetServiceIds?: string[];
-    forceAll: boolean;
-  },
-): Promise<Map<string, { id: string | null; serviceId: string; serviceName: string; targeted: boolean }>> {
-  const services = await repos.service.listByProject(projectId).catch(() => []);
-  const enabled = services.filter((s) => s.enabled);
-  const map = new Map<string, { id: string | null; serviceId: string; serviceName: string; targeted: boolean }>();
-  if (enabled.length === 0) return map;
-
-  const targetSet = opts.targetServiceIds && opts.targetServiceIds.length > 0
-    ? new Set(opts.targetServiceIds)
-    : null;
-
-  // Compute (targeted? per service) up front so the caller can drive
-  // per-service Checks events even before the compose pipeline runs.
-  for (const svc of enabled) {
-    const targeted = opts.forceAll || !targetSet || targetSet.has(svc.id);
-    map.set(svc.id, {
-      id: null,
-      serviceId: svc.id,
-      serviceName: svc.name,
-      targeted,
-    });
-  }
-
-  // Only insert SKIPPED rows here — targeted rows are created by the
-  // downstream compose deploy path, which still owns its own writes.
-  const skippedRows = enabled
-    .filter((svc) => {
-      const entry = map.get(svc.id);
-      return entry ? !entry.targeted : false;
-    })
-    .map((svc) => ({
-      deploymentId,
-      serviceId: svc.id,
-      serviceName: svc.name,
-      status: "skipped" as const,
-      reason: "unchanged",
-      reasonSkipped: "unchanged",
-    }));
-
-  if (skippedRows.length > 0) {
-    const inserted = await repos.serviceDeployment.bulkCreate(skippedRows);
-    for (const row of inserted) {
-      const existing = map.get(row.serviceId);
-      if (existing) existing.id = row.id;
-    }
-  }
-
-  return map;
-}
-
-/**
- * GitHub Checks API per-service hook.
- *
- * Best-effort: any failure is logged but never blocks the deploy. We
- * skip entirely when the project isn't backed by GitHub or when there
- * is no `commit_sha` (which would make `head_sha` invalid).
- */
-async function emitServiceCheckRun(opts: {
-  project: Project;
-  dep: Deployment;
-  serviceDeploymentId: string;
-  serviceName: string;
-  phase: "start" | "complete";
-  conclusion?: "success" | "failure" | "cancelled" | "neutral";
-  output?: { title: string; summary: string };
-}): Promise<void> {
-  const { project, dep, serviceDeploymentId, serviceName, phase, conclusion, output } = opts;
-  if (!project.gitOwner || !project.gitRepo || !dep.commitSha) return;
-
-  const orgMembers = await repos.member
-    .listByOrganization(dep.organizationId)
-    .catch(() => [] as Array<{ userId: string }>);
-  const actorUserId = orgMembers[0]?.userId;
-  if (!actorUserId) return;
-  const actorCtx = buildBackgroundContext({
-    userId: actorUserId,
-    organizationId: dep.organizationId,
-    label: "build:check-run",
-  });
-
-  if (phase === "start") {
-    const result = await createCheckRun(actorCtx, project.gitOwner, project.gitRepo, {
-      name: `build:${serviceName}`,
-      headSha: dep.commitSha,
-      status: "in_progress",
-      detailsUrl: `${runtimeTarget.dashboard.replace(/\/$/, "")}/build/${dep.id}`,
-    });
-    if (result?.id) {
-      await repos.serviceDeployment
-        .update(serviceDeploymentId, {
-          checkRunId: result.id,
-          checkRunUrl: result.htmlUrl,
-        })
-        .catch(() => {});
-    }
-    return;
-  }
-
-  // phase === "complete"
-  const sd = await repos.serviceDeployment.findById(serviceDeploymentId).catch(() => null);
-  if (sd?.checkRunId) {
-    await updateCheckRun(actorCtx, project.gitOwner, project.gitRepo, sd.checkRunId, {
-      status: "completed",
-      conclusion: conclusion ?? "neutral",
-      output,
-    });
-  } else if (conclusion === "neutral") {
-    // Skipped services were never started — create-and-complete in one
-    // call so they still show up as a `neutral` check on the PR.
-    const result = await createCheckRun(actorCtx, project.gitOwner, project.gitRepo, {
-      name: `build:${serviceName}`,
-      headSha: dep.commitSha,
-      status: "completed",
-      conclusion,
-      detailsUrl: `${runtimeTarget.dashboard.replace(/\/$/, "")}/build/${dep.id}`,
-      output: output ?? { title: "Skipped — no changes", summary: "Files under this service's root were unchanged." },
-    });
-    if (result?.id) {
-      await repos.serviceDeployment
-        .update(serviceDeploymentId, {
-          checkRunId: result.id,
-          checkRunUrl: result.htmlUrl,
-        })
-        .catch(() => {});
-    }
-  }
-}
-
-/**
- * Emit the initial per-service GitHub Checks for a fanned-out deploy:
- * targeted services get an `in_progress` "start" check, non-targeted ones
- * a neutral "skipped" check — so the PR check list is complete the moment
- * the deploy starts. Best-effort; the returned check_run_id is persisted
- * so the later `complete` emit patches the same Check.
- */
-async function emitInitialServiceChecks(
-  serviceFanOut: Awaited<ReturnType<typeof preCreateServiceDeployments>>,
-  project: Project,
-  dep: Deployment,
-): Promise<void> {
-  for (const entry of serviceFanOut.values()) {
-    if (!entry.id) continue;
-    if (entry.targeted) {
-      await emitServiceCheckRun({
-        project,
-        dep,
-        serviceDeploymentId: entry.id,
-        serviceName: entry.serviceName,
-        phase: "start",
-      }).catch(() => {});
-    } else {
-      await emitServiceCheckRun({
-        project,
-        dep,
-        serviceDeploymentId: entry.id,
-        serviceName: entry.serviceName,
-        phase: "complete",
-        conclusion: "neutral",
-        output: { title: "Skipped — no changes", summary: "Files under this service's root were unchanged." },
-      }).catch(() => {});
-    }
-  }
-}
-
-/**
- * Roll up per-service results into the project-level deployment status.
- *
- *   - all `success` (or `skipped`)          → `ready`
- *   - mix of `success` and `failure`        → `partial_failure`
- *   - all `failure`                         → `failed`
- *
- * `skipped` rows are not counted as failures — they're intentional.
- */
-function rollupDeploymentStatus(
-  perService: Array<{ status: string }>,
-): "ready" | "partial_failure" | "failed" {
-  const real = perService.filter((s) => s.status !== "skipped");
-  if (real.length === 0) return "ready";
-  const successes = real.filter((s) => s.status === "success").length;
-  const failures = real.filter((s) => s.status === "failure" || s.status === "cancelled").length;
-  if (failures === 0) return "ready";
-  if (successes === 0) return "failed";
-  return "partial_failure";
-}
 
 /**
  * Hand the previous-active deployment to the rollback orchestrator: it
@@ -604,13 +325,10 @@ async function finalizeComposeDeploy(opts: {
   await archivePreviousDeployment(dep, project, logger);
 }
 
-// ─── Build & Deploy pipeline (private) ───────────────────────────────────────
-
 async function executeBuildAndDeploy(project: Project, dep: Deployment, buildSessionId: string) {
   const plat = platform();
   let { runtime, routing, ssl, system } = plat;
 
-  // ── Read config snapshot early so we can resolve the runtime ──────
   const snapshot = dep.meta as DeploymentConfigSnapshot | null;
   if (!snapshot) {
     throw new Error("Deployment has no config snapshot (meta is empty)");
@@ -631,7 +349,6 @@ async function executeBuildAndDeploy(project: Project, dep: Deployment, buildSes
   /** Collapsed logs for DB persistence - resolves \r overwrites to final state. */
   const persistLogs = () => collapseTerminalLogs(logs);
 
-  // ── Lifecycle context - shared across all phases ───────────────────
   const provisioned: { imageRef?: string } = {};
   const ctx: LifecycleContext = {
     runtime,
@@ -643,7 +360,6 @@ async function executeBuildAndDeploy(project: Project, dep: Deployment, buildSes
   };
 
   try {
-    // ── Resolve the full execution platform from deployment snapshot ──
     const resolved = await resolveDeploymentPlatform(snapshot, {
       organizationId: dep.organizationId,
       basePlatform: plat,
@@ -671,14 +387,12 @@ async function executeBuildAndDeploy(project: Project, dep: Deployment, buildSes
         }\n`,
     );
 
-    // ── Build phase ──────────────────────────────────────────────────
     await repos.deployment.updateBuildSession(buildSessionId, {
       status: "building",
       startedAt: new Date(),
     });
     await setDeploymentStatus(dep.id, "building");
 
-    // ── Smart per-service fan-out ────────────────────────────────────
     // Pre-create service_deployment rows so the dashboard sees a
     // complete fan-out even before any service starts building. Rows
     // for targeted services start as `pending`; everyone else is
@@ -771,28 +485,28 @@ async function executeBuildAndDeploy(project: Project, dep: Deployment, buildSes
     // multi-service builds (whose clone path differs).
     const useServicePipeline = (await resolveServicePipelineMode(project, snapshot)).useServicePipeline;
 
-    // Desktop git credential relay is eligible ONLY for a single-app build that
-    // clones ON the remote host: effectiveTarget=server + the bare runtime
-    // (runBuildPipeline clones via the executor) + server strategy. Docker
-    // builds clone locally (token never leaves the orchestrator) and cloud
-    // builds run in the workspace — neither needs/uses the relay.
-    //
-    // Point-of-use, off by default: the operator opts in PER DEPLOY (the deploy
-    // flow's "Forward my git credentials" checkbox → snapshot.forwardGitCredentials).
-    // Desktop-only is enforced here too (defense-in-depth — never honor a forged
-    // flag on a non-desktop host; getLocalGhToken's CLOUD_MODE floor backs it up).
-    let allowRelayFallback = false;
-    if (
-      plat.target === "desktop" &&
-      snapshot.forwardGitCredentials === true &&
-      resolved.effectiveTarget === "server" &&
-      resolved.serverId &&
-      runtime.name === "bare" &&
-      buildStrategy === "server" &&
-      !useServicePipeline
-    ) {
-      allowRelayFallback = true;
-    }
+    // "Clone on the server" — clone the repo directly on the remote build host
+    // instead of cloning on the orchestrator and transferring the context. The
+    // BARE runtime always clones on the target; DOCKER (incl. services) does so
+    // only when the deploy opted in (snapshot.cloneStrategy === "server"). Cloud
+    // builds run inside the workspace and never apply.
+    // Single source of truth for the clone decision — shared with preflight via
+    // resolveClonePlan so the two can never disagree (the drift that let preflight
+    // pass an api-host clone the pipeline then rejected for a remote token). It
+    // decides where the clone runs, the credential purpose that follows from that,
+    // and desktop-relay eligibility. The desktop relay (reverse tunnel; nothing
+    // persisted) is opted into per deploy via snapshot.forwardGitCredentials.
+    const clonePlan = resolveClonePlan({
+      effectiveTarget: resolved.effectiveTarget,
+      serverId: resolved.serverId,
+      runtimeIsBare: runtime.name === "bare",
+      cloneStrategy: snapshot.cloneStrategy,
+      buildStrategy,
+      isDesktop: plat.target === "desktop",
+      forwardGitCredentials: snapshot.forwardGitCredentials,
+    });
+    const cloneOnServer = clonePlan.runsOnServer;
+    const allowRelayFallback = clonePlan.relayEligible;
 
     const gitCred = await resolveBuildGitToken({
       ctx: buildBackgroundContext({
@@ -803,9 +517,32 @@ async function executeBuildAndDeploy(project: Project, dep: Deployment, buildSes
       projectId: project.id,
       owner: project.gitOwner ?? undefined,
       repo: project.gitRepo ?? undefined,
-      buildStrategy,
+      buildStrategy: clonePlan.cloneBuildStrategy,
       allowRelayFallback,
+      // Docker clone-on-server can degrade to an api-host clone, so resolve
+      // gracefully (a LOCAL fallback credential, flagged apiHostFallback) instead
+      // of hard-failing at token resolution after the server is provisioned.
+      allowApiHostFallback: clonePlan.dockerClonesOnServer,
     });
+
+    // Clone-on-server needs a SHIPPABLE credential that can travel to the build
+    // host: the desktop relay (gitCred.relay) or an App/PAT token (gitCred.token
+    // WITHOUT apiHostFallback). An apiHostFallback token is a LOCAL credential for
+    // cloning on the orchestrator — NOT shippable — so it does not qualify. When
+    // no shippable credential exists, fall back to cloning on the API host and
+    // transferring the context — warn, never hard-fail. (The BARE runtime always
+    // clones on the target and is gated by preflight separately, so this fallback
+    // only changes DOCKER behavior.)
+    const cloneCredentialAvailable =
+      gitCred.relay === true || (!!gitCred.token && !gitCred.apiHostFallback);
+    const effectiveCloneOnServer =
+      cloneOnServer && (runtime.name === "bare" || cloneCredentialAvailable);
+    if (cloneOnServer && runtime.name !== "bare" && !cloneCredentialAvailable) {
+      logger.log(
+        "Clone-on-server was requested, but no git credential can reach the build host (no relay, no token). Falling back to cloning on the API host and transferring the build context.",
+        "warn",
+      );
+    }
 
     // Monorepo sub-app rows (kind="monorepo") fan out through the standard
     // compose pipeline below - each gets its own image, container, and
@@ -821,6 +558,43 @@ async function executeBuildAndDeploy(project: Project, dep: Deployment, buildSes
       resources: buildResources,
       gitToken: gitCred.token,
     });
+    // When opted in, the runtime clones on the remote build host instead of the
+    // orchestrator transferring the context. The credential arrives either via
+    // the relay (gitCredentialHelperPath, set once the relay is open) or the
+    // short-lived token already on buildConfig.gitToken.
+    buildConfig.cloneOnServer = effectiveCloneOnServer;
+
+    // Desktop git-credential relay opener, shared by the single-app and compose
+    // paths. Opens the reverse tunnel + remote helper (nothing persisted on the
+    // build host); the caller closes it in a `finally` the moment the build (and
+    // its clone) finishes. Returns null when no relay was requested.
+    const openRelayIfNeeded = async (): Promise<{
+      scriptPath: string;
+      close: () => Promise<void>;
+    } | null> => {
+      if (!gitCred.relay) return null;
+      if (!targetExecutor || !resolved.serverId) {
+        throw new Error(
+          "Git credential forwarding is enabled, but no SSH executor is available for this server.",
+        );
+      }
+      const relay = await openDeployRelay({
+        serverId: resolved.serverId,
+        executor: targetExecutor,
+        sessionId: buildSessionId,
+        // Repo-pin the relay to exactly this deploy's repo (when known) so it
+        // never vends creds for any other repo. Absent owner/repo (e.g. a
+        // local-path project) degrades to host-pin only.
+        expectedOwner: project.gitOwner ?? undefined,
+        expectedRepo: project.gitRepo ?? undefined,
+      });
+      if (!relay) {
+        throw new Error(
+          "Git credential forwarding is enabled for this server, but its SSH auth method can't host the credential relay. Use key or password auth for this server, install the GitHub App, or add a per-project token.",
+        );
+      }
+      return relay;
+    };
 
     // Pre-deploy backups — fire for ALL deploy modes (single-app, static-edge,
     // AND compose) before any teardown, so a destructive cutover never runs
@@ -856,22 +630,33 @@ async function executeBuildAndDeploy(project: Project, dep: Deployment, buildSes
         await repos.service.syncFromCompose(project.id, composeOnly);
       }
 
-      await executeComposePipeline({
-        project,
-        dep,
-        runtime,
-        routing,
-        ssl,
-        usesManagedRouting,
-        logger,
-        ctx,
-        snapshot,
-        buildSessionId,
-        buildEnvVars: buildEnv.envVars,
-        buildResources,
-        runtimeResources: prodResources,
-        gitToken: gitCred.token,
-      });
+      // Clone-on-server for compose: open one repo-pinned relay for the whole
+      // fan-out (all services share the same repo), thread its helper path into
+      // every service buildConfig, and close it once the pipeline settles.
+      const composeRelay = await openRelayIfNeeded();
+      try {
+        await executeComposePipeline({
+          project,
+          dep,
+          runtime,
+          routing,
+          ssl,
+          system,
+          usesManagedRouting,
+          logger,
+          ctx,
+          snapshot,
+          buildSessionId,
+          buildEnvVars: buildEnv.envVars,
+          buildResources,
+          runtimeResources: prodResources,
+          gitToken: gitCred.token,
+          gitCredentialHelperPath: composeRelay?.scriptPath,
+          cloneOnServer: effectiveCloneOnServer,
+        });
+      } finally {
+        if (composeRelay) await composeRelay.close().catch(() => {});
+      }
 
       // Roll per-service results up into the project status, emit
       // per-service Checks, and archive the previous deployment.
@@ -899,28 +684,8 @@ async function executeBuildAndDeploy(project: Project, dep: Deployment, buildSes
     // tunnel + remote helper) right before the build so the clone fetches the
     // gh identity on demand — nothing persisted on the build host — and tear it
     // down in `finally` the moment the build (and its clone) finishes.
-    let deployRelay: { scriptPath: string; close: () => Promise<void> } | null = null;
-    if (gitCred.relay) {
-      if (!targetExecutor || !resolved.serverId) {
-        throw new Error(
-          "Git credential forwarding is enabled, but no SSH executor is available for this server.",
-        );
-      }
-      deployRelay = await openDeployRelay({
-        serverId: resolved.serverId,
-        executor: targetExecutor,
-        sessionId: buildSessionId,
-        // Repo-pin the relay to exactly this deploy's repo (when known) so it
-        // never vends creds for any other repo. Absent owner/repo (e.g. a
-        // local-path project) degrades to host-pin only.
-        expectedOwner: project.gitOwner ?? undefined,
-        expectedRepo: project.gitRepo ?? undefined,
-      });
-      if (!deployRelay) {
-        throw new Error(
-          "Git credential forwarding is enabled for this server, but its SSH auth method can't host the credential relay. Use key or password auth for this server, install the GitHub App, or add a per-project token.",
-        );
-      }
+    const deployRelay = await openRelayIfNeeded();
+    if (deployRelay) {
       buildConfig.gitCredentialHelperPath = deployRelay.scriptPath;
     }
 
@@ -952,7 +717,6 @@ async function executeBuildAndDeploy(project: Project, dep: Deployment, buildSes
       return;
     }
 
-    // ── Deploy phase ─────────────────────────────────────────────────
     await setDeploymentStatus(dep.id, "deploying", {
       extra: { imageRef: buildResult.imageRef, buildDurationMs: buildResult.durationMs },
     });
@@ -990,8 +754,6 @@ async function executeBuildAndDeploy(project: Project, dep: Deployment, buildSes
     await onFailure(ctx, message);
   }
 }
-
-// ─── Deploy phases ───────────────────────────────────────────────────────────
 
 interface DeployPhaseInputs {
   ctx: LifecycleContext;
@@ -1206,7 +968,6 @@ async function executeServerDeploy(phase: DeployPhaseInputs): Promise<void> {
         .catch(() => runtime)
     : runtime;
 
-  // ── Plan + persist this deploy's routes ────────────────────────────
   // buildProjectRouteDomains turns the project's public endpoints (and
   // existing domain rows) into concrete routes. We persist a domain
   // record for each up front because SSL provisioning inside
@@ -1331,7 +1092,7 @@ async function executeServerDeploy(phase: DeployPhaseInputs): Promise<void> {
       routeOptions: project.webhookDomain
         ? {
             webhookDomain: project.webhookDomain,
-            webhookProxy: `${internalApiUrl}/api/webhooks/`,
+            webhookProxy: webhookProxyTarget,
           }
         : undefined,
       promptUser: (prompt) => sessionManager.promptUser(dep.id, prompt),

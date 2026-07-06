@@ -29,6 +29,7 @@ import {
   HeartPulse,
   Send,
   Settings,
+  DatabaseBackup,
   type LucideIcon,
 } from "lucide-react";
 import type { MailSetupStatus } from "@/lib/api";
@@ -39,6 +40,7 @@ import { MailboxesTab } from "./mailboxes-tab";
 import { DnsTab } from "./dns-tab";
 import { HealthTab } from "./health-tab";
 import { TestTab } from "./test-tab";
+import { BackupTab } from "./backup-tab";
 import { AdvancedTab } from "./advanced-tab";
 import { WelcomeModal } from "./welcome-modal";
 import { ReputationBanner } from "./reputation-banner";
@@ -49,6 +51,8 @@ interface MailAdminPanelProps {
   status: MailSetupStatus;
   serverId: string;
   onRefresh: () => void;
+  /** Called after the server is removed from the mail registry (DB-only). */
+  onForgotten: () => void;
 }
 
 type TabKey =
@@ -58,6 +62,7 @@ type TabKey =
   | "dns"
   | "health"
   | "test"
+  | "backup"
   | "advanced";
 
 interface TabDef {
@@ -73,12 +78,13 @@ const TABS: TabDef[] = [
   { key: "dns", label: "DNS", icon: FileText },
   { key: "health", label: "Health", icon: HeartPulse },
   { key: "test", label: "Test", icon: Send },
+  { key: "backup", label: "Backup", icon: DatabaseBackup },
   { key: "advanced", label: "Advanced", icon: Settings },
 ];
 
 const VALID_TABS: TabKey[] = TABS.map((t) => t.key);
 
-export function MailAdminPanel({ status, serverId, onRefresh }: MailAdminPanelProps) {
+export function MailAdminPanel({ status, serverId, onRefresh, onForgotten }: MailAdminPanelProps) {
   const router = useRouter();
   const searchParams = useSearchParams();
   const primaryDomain = status.domain ?? "";
@@ -160,14 +166,24 @@ export function MailAdminPanel({ status, serverId, onRefresh }: MailAdminPanelPr
             onSelectDomain={(d) => setQuery({ domain: d })}
           />
         )}
-        {tab === "dns" && <DnsTab status={status} />}
+        {tab === "dns" && (
+          <DnsTab
+            status={status}
+            serverId={serverId}
+            primaryDomain={primaryDomain}
+            selectedDomain={selectedDomain}
+            onSelectDomain={(d) => setQuery({ domain: d })}
+          />
+        )}
         {tab === "health" && <HealthTab serverId={serverId} />}
         {tab === "test" && <TestTab serverId={serverId} />}
+        {tab === "backup" && <BackupTab serverId={serverId} domain={primaryDomain} />}
         {tab === "advanced" && (
           <AdvancedTab
             status={status}
             serverId={serverId}
             onChanged={onRefresh}
+            onForgotten={onForgotten}
           />
         )}
       </div>

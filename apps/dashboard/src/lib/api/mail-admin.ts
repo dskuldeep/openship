@@ -10,6 +10,33 @@
 import { api } from "./client";
 import { endpoints } from "./endpoints";
 import type { DnsRecords, DnsRecord } from "./mail";
+import type { BackupRun } from "./backups";
+
+// ─── Mail backup (plugs into the general backup system) ──────────────────────
+
+/** A mail-server backup policy. Source columns (projectId/serviceId) are
+ *  null; `mailServerId` + `payloadConfig.mail` flags identify it. */
+export interface MailBackupPolicy {
+  id: string;
+  destinationId: string;
+  enabled: boolean;
+  cronExpression: string | null;
+  retainCount: number | null;
+  retainDays: number | null;
+  payloadKind: string;
+  payloadConfig: {
+    mail?: { messageData?: boolean; keys?: boolean };
+  } & Record<string, unknown>;
+}
+
+export interface SaveMailBackupPolicyInput {
+  destinationId: string;
+  messageData?: boolean;
+  keys?: boolean;
+  cronExpression?: string | null;
+  retainCount?: number | null;
+  retainDays?: number | null;
+}
 
 // ─── Domains ─────────────────────────────────────────────────────────────────
 
@@ -226,8 +253,33 @@ export const mailAdminApi = {
       api.get<MailServerStats>(endpoints.mail.admin.stats(serverId)),
   },
   dns: {
-    scan: (serverId: string) =>
-      api.get<DnsScanResult>(endpoints.mail.admin.dnsScan(serverId)),
+    /**
+     * Live public-DNS scan. Pass `domain` to scope the check to an
+     * additional domain (MX/SPF/DKIM?/DMARC only); omit for the primary
+     * install domain (full record set incl. A/AAAA/PTR).
+     */
+    scan: (serverId: string, domain?: string) =>
+      api.get<DnsScanResult>(
+        domain
+          ? `${endpoints.mail.admin.dnsScan(serverId)}?domain=${encodeURIComponent(domain)}`
+          : endpoints.mail.admin.dnsScan(serverId),
+      ),
+  },
+  backup: {
+    /** The mail server's backup policy, or null if none yet. */
+    getPolicy: (serverId: string) =>
+      api.get<{ policy: MailBackupPolicy | null }>(
+        endpoints.mail.admin.backupPolicy(serverId),
+      ),
+    /** Create or update the mail server's backup policy. */
+    savePolicy: (serverId: string, body: SaveMailBackupPolicyInput) =>
+      api.post<{ policy: MailBackupPolicy }>(
+        endpoints.mail.admin.backupPolicy(serverId),
+        body,
+      ),
+    /** This mail server's backup runs (most recent first). */
+    listRuns: (serverId: string) =>
+      api.get<{ runs: BackupRun[] }>(endpoints.mail.admin.backupRuns(serverId)),
   },
   testEmail: {
     /**

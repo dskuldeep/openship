@@ -34,7 +34,7 @@
 
 import type { RuntimeAdapter } from "./runtime/types";
 import type { RoutingProvider, SslProvider } from "./infra/types";
-import type { CommandExecutor, SshConfig } from "./types";
+import type { CommandExecutor, SshConfig, ProvisionLock } from "./types";
 import type { SetupStateStore } from "./system/state";
 import type { InstallerConfig } from "./system/types";
 import type { SystemManager } from "./system/setup";
@@ -111,6 +111,13 @@ export interface PlatformConfig {
   stateStore?: SetupStateStore;
   /** Pre-collected installer configuration (ACME email, domain, etc.) */
   installerConfig?: InstallerConfig;
+  /**
+   * Serializes server-scoped provisioning across concurrent deploys (self-hosted
+   * only). The API injects an in-process mutex + Postgres advisory lock keyed by
+   * the target server, so two deploys never race apt/dpkg, the openresty unit +
+   * config, docker networks, or the setup-state file. Omitted → no serialization.
+   */
+  provisionLock?: ProvisionLock;
 }
 
 /**
@@ -219,8 +226,10 @@ async function createInfraProvider(
   const { detectOpenRestyPaths, ensureOpenRestyConfig } = await import("./infra/openresty-lua");
   const paths = await detectOpenRestyPaths(executor);
 
-  // Idempotent - ensures sites-enabled dir + include directive exist
-  await ensureOpenRestyConfig(executor, paths);
+  // Idempotent, but writes the SHARED nginx.conf (grep||sed). Concurrent deploys
+  // would race the non-atomic edit and lose/duplicate the include — serialize it.
+  const ensureConfig = () => ensureOpenRestyConfig(executor, paths);
+  await (config.provisionLock ? config.provisionLock.run(ensureConfig) : ensureConfig());
 
   const { NginxProvider } = await import("./infra/nginx");
   const nginx = new NginxProvider({ paths, ...config.nginx, executor });
@@ -245,6 +254,7 @@ async function createSelfHostedPlatform(config: PlatformConfig): Promise<Platfor
     executor,
     stateStore: config.stateStore,
     installerConfig: config.installerConfig,
+    provisionLock: config.provisionLock,
   });
 
   // Runtime
@@ -254,7 +264,7 @@ async function createSelfHostedPlatform(config: PlatformConfig): Promise<Platfor
     runtime = new BareRuntime({ ...config.bare, executor, systemManager: system });
   } else {
     const { DockerRuntime } = await import("./runtime/docker");
-    runtime = new DockerRuntime(config.docker, system);
+    runtime = new DockerRuntime(config.docker, system, config.provisionLock);
   }
 
   // Infrastructure - runtime implies the reverse proxy

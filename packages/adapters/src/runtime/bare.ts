@@ -118,6 +118,13 @@ export class BareRuntime implements RuntimeAdapter {
     this.systemManager = opts?.systemManager ?? null;
   }
 
+  /** The underlying command executor (local or SSH). Exposed so the
+   *  backup subsystem's bare executor can stream commands over the same
+   *  connection (mirrors how DockerRuntime exposes its client). */
+  get commandExecutor(): CommandExecutor {
+    return this.executor;
+  }
+
   /** Get or lazily initialise the process supervisor. */
   private async supervisor(): Promise<ProcessSupervisor> {
     if (this._supervisor) return this._supervisor;

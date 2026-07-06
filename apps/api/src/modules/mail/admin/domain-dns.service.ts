@@ -21,7 +21,7 @@
  */
 
 import { sshManager } from "../../../lib/ssh-manager";
-import { readState, writeState, type MailServerState } from "../mail-state";
+import { readState, mutateState } from "../mail-state";
 import type { DnsRecordSet, AdditionalDomainDns } from "../mail-state";
 import { buildSpfValue } from "../mail.service";
 
@@ -105,23 +105,23 @@ export async function recordDomainDns(
   postmasterPassword?: string,
 ): Promise<void> {
   await sshManager.withExecutor(serverId, async (exec) => {
-    const state = await readState(exec);
-    if (!state) {
+    const result = await mutateState(exec, serverId, (state) => ({
+      ...state,
+      additionalDomains: {
+        ...(state.additionalDomains ?? {}),
+        [domain]: {
+          records,
+          acknowledgedAt: null,
+          createdAt: new Date().toISOString(),
+          ...(postmasterPassword ? { postmasterPassword } : {}),
+        },
+      },
+    }));
+    if (!result) {
       throw new Error(
         "Mail state file not found - can't record DNS records for new domain.",
       );
     }
-    const additionalDomains: Record<string, AdditionalDomainDns> = {
-      ...(state.additionalDomains ?? {}),
-      [domain]: {
-        records,
-        acknowledgedAt: null,
-        createdAt: new Date().toISOString(),
-        ...(postmasterPassword ? { postmasterPassword } : {}),
-      },
-    };
-    const next: MailServerState = { ...state, additionalDomains };
-    await writeState(exec, next);
   });
 }
 
@@ -152,27 +152,23 @@ export async function acknowledgeDomainDns(
   domain: string,
 ): Promise<void> {
   await sshManager.withExecutor(serverId, async (exec) => {
-    const state = await readState(exec);
-    if (!state) {
+    const result = await mutateState(exec, serverId, (state) => {
+      const existing = state.additionalDomains?.[domain];
+      if (!existing) {
+        throw new Error(`No saved DNS state for ${domain}`);
+      }
+      if (existing.acknowledgedAt) return state; // already acknowledged — no change
+      return {
+        ...state,
+        additionalDomains: {
+          ...state.additionalDomains,
+          [domain]: { ...existing, acknowledgedAt: new Date().toISOString() },
+        },
+      };
+    });
+    if (!result) {
       throw new Error("Mail state file not found.");
     }
-    const existing = state.additionalDomains?.[domain];
-    if (!existing) {
-      throw new Error(`No saved DNS state for ${domain}`);
-    }
-    if (existing.acknowledgedAt) return;
-
-    const next: MailServerState = {
-      ...state,
-      additionalDomains: {
-        ...state.additionalDomains,
-        [domain]: {
-          ...existing,
-          acknowledgedAt: new Date().toISOString(),
-        },
-      },
-    };
-    await writeState(exec, next);
   });
 }
 
@@ -185,11 +181,11 @@ export async function deleteDomainDns(
   domain: string,
 ): Promise<void> {
   await sshManager.withExecutor(serverId, async (exec) => {
-    const state = await readState(exec);
-    if (!state || !state.additionalDomains?.[domain]) return;
-    const { [domain]: _, ...rest } = state.additionalDomains;
-    const next: MailServerState = { ...state, additionalDomains: rest };
-    await writeState(exec, next);
+    await mutateState(exec, serverId, (state) => {
+      if (!state.additionalDomains?.[domain]) return state;
+      const { [domain]: _, ...rest } = state.additionalDomains;
+      return { ...state, additionalDomains: rest };
+    });
   });
 }
 

@@ -1,6 +1,6 @@
 "use client";
 
-import React, { useState, useCallback, useEffect, useRef } from "react";
+import React, { useState, useCallback, useEffect, useRef, useMemo } from "react";
 import { Terminal, Server } from "lucide-react";
 import { useSearchParams, useRouter } from "next/navigation";
 import { useProjectSettings } from "@/context/ProjectSettingsContext";
@@ -8,6 +8,7 @@ import { TerminalLogs } from "./logs/TerminalLogs";
 import { ServerLogs } from "./logs/ServerLogs";
 import { LogsActions } from "./logs/LogsActions";
 import { endpoints } from "@/lib/api/endpoints";
+import { sortServicesByPublicFirst } from "@/lib/api/services";
 
 type LogsTab = "terminal" | "server";
 
@@ -43,7 +44,11 @@ export const LogsSettings = () => {
   // if the URL param is missing or stale.
   const [selectedServiceId, setSelectedServiceId] = useState<string | null>(serviceIdFromUrl);
   const urlDeepLinkAppliedRef = useRef(false);
-  const services = servicesData.services;
+  // Public (exposed) services lead the target picker — the ones users browse to.
+  const services = useMemo(
+    () => sortServicesByPublicFirst(servicesData.services),
+    [servicesData.services],
+  );
   const servicesLoading = servicesData.isLoading;
   const servicesLoaded = !servicesData.isLoading;
   const hasServices = services.length > 0;
@@ -89,26 +94,33 @@ export const LogsSettings = () => {
     }
   }, [hasResolvedLogTargets, canShowLogs, canShowTerminal]);
 
-  // Apply `?service=X` once services are loaded: force the Terminal tab,
-  // pin the selection, then strip the param from the URL so a refresh
-  // doesn't re-trigger the deep-link logic indefinitely.
+  // Apply `?service=X` once services are loaded: force the Terminal tab and pin
+  // the selection. The param is KEPT in the URL (synced below) so the runtime-log
+  // filter is visible, survives a refresh, and is shareable — rather than being
+  // stripped the moment it's applied.
   useEffect(() => {
     if (urlDeepLinkAppliedRef.current) return;
     if (!serviceIdFromUrl || servicesLoading) return;
-    const match = services.find((s) => s.id === serviceIdFromUrl);
-    if (!match) {
-      // Service was deleted or doesn't belong to this project - clear the
-      // stale param and let auto-pick take over.
-      urlDeepLinkAppliedRef.current = true;
-      router.replace(`/projects/${id}/logs`);
-      return;
-    }
     urlDeepLinkAppliedRef.current = true;
+    const match = services.find((s) => s.id === serviceIdFromUrl);
+    // Stale/foreign id → leave selection to auto-pick; the sync effect clears
+    // the bad param once a real target is chosen.
+    if (!match) return;
     hasSelectedTabRef.current = true;
     setActiveTab("terminal");
     setSelectedServiceId(match.id);
-    router.replace(`/projects/${id}/logs`);
-  }, [serviceIdFromUrl, services, servicesLoading, router, id]);
+  }, [serviceIdFromUrl, services, servicesLoading]);
+
+  // Keep the URL's `?service=` param in sync with the selected service so the
+  // filter is a real, shareable, refresh-safe query param (null = project
+  // runtime → no param). Guarded so we only replace when it actually changed.
+  useEffect(() => {
+    if (servicesLoading) return;
+    const current = searchParams.get("service");
+    if ((selectedServiceId ?? null) === (current ?? null)) return;
+    const qs = selectedServiceId ? `?service=${encodeURIComponent(selectedServiceId)}` : "";
+    router.replace(`/projects/${id}/logs${qs}`, { scroll: false });
+  }, [selectedServiceId, servicesLoading, searchParams, id, router]);
 
   const switchTab = useCallback(
     (tab: LogsTab) => {

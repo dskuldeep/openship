@@ -196,7 +196,7 @@ const DeploymentProcessing: React.FC<DeploymentProcessingProps> = ({ onRedeploy 
   const hasWarning = deploymentStatus === "ready" && !!state.warningMessage;
 
   return (
-    <div className="min-h-screen bg-background mx-auto md:px-12">
+    <div className="min-h-screen bg-background max-w-[1600px] mx-auto px-4 sm:px-6 lg:px-8">
       {/* Header */}
       <div className="bg-background">
         <div className="py-5 relative">

@@ -8,7 +8,8 @@ import { type Service } from "@/lib/api/services";
 import { useModal } from "@/context/ModalContext";
 import { useToast } from "@/context/ToastContext";
 import { useRouter } from "next/navigation";
-import { Rocket } from "lucide-react";
+import { Rocket, ChevronDown, RefreshCw, Layers } from "lucide-react";
+import DropdownMenu from "@/components/ui/DropdownMenu";
 import WarningCallout from "@/components/shared/WarningCallout";
 
 export const Deployments = () => {
@@ -66,23 +67,29 @@ export const Deployments = () => {
    * so it rebuilds every service (a no-op for single-app projects). On success
    * we land on the build screen for the new version.
    */
-  const runRedeploy = React.useCallback(async (mode: "smart" | "all" = "smart") => {
+  const runRedeploy = React.useCallback(async (mode: "smart" | "all" | "refresh" = "smart") => {
     if (!projectData?.id) return;
+    setIsRedeploying(true); // drive the loading state for menu paths too
     try {
-      const res = await deployApi.trigger(
+      const body =
         mode === "all"
           ? { projectId: projectData.id, forceAll: true }
-          : { projectId: projectData.id, smartRoute: true },
-      );
+          : mode === "refresh"
+            ? { projectId: projectData.id, refresh: true }
+            : { projectId: projectData.id, smartRoute: true };
+      const res = await deployApi.trigger(body);
       const newId = res?.data?.deployment?.id;
       router.push(newId ? `/build/${newId}` : `/projects/${projectData.id}/deployments`);
     } catch (error) {
       console.error("Redeploy failed:", error);
       showToast(
-        "Could not start redeployment. Check the deployment log for details.",
+        mode === "refresh"
+          ? "Could not refresh the deployment. Check the deployment log for details."
+          : "Could not start redeployment. Check the deployment log for details.",
         "error",
         "Error",
       );
+      setIsRedeploying(false); // success navigates away; only clear on failure
     }
   }, [projectData?.id, router, showToast]);
 
@@ -221,19 +228,9 @@ export const Deployments = () => {
             </div>
           </div>
 
-          <div className="flex flex-col gap-2 sm:flex-row">
-            {/* Rebuild all — bypasses per-service change detection (use after a
-                config/env change, or when smart routing missed something). */}
-            {hasMultipleServices && (
-              <button
-                onClick={() => runRedeploy("all")}
-                disabled={isRedeploying}
-                title="Rebuild every service at the latest commit"
-                className="inline-flex items-center justify-center rounded-xl border border-border/60 bg-muted/30 px-4 py-2.5 text-sm font-medium text-foreground transition-colors hover:bg-muted/50 disabled:cursor-not-allowed disabled:opacity-50"
-              >
-                Rebuild all
-              </button>
-            )}
+          {/* Primary action + a caret menu for the variants — one clean
+              control instead of three competing buttons. */}
+          <div className="flex items-center gap-2 shrink-0">
             <button
               onClick={handleRedeploy}
               disabled={isRedeploying}
@@ -241,6 +238,30 @@ export const Deployments = () => {
             >
               {isRedeploying ? "Deploying..." : "Redeploy Project"}
             </button>
+            <DropdownMenu
+              align="right"
+              disabled={isRedeploying}
+              triggerClassName="inline-flex items-center justify-center rounded-xl border border-border/60 bg-muted/30 p-2.5 text-muted-foreground transition-colors hover:bg-muted/50 hover:text-foreground disabled:cursor-not-allowed disabled:opacity-50"
+              trigger={<ChevronDown className="size-4" />}
+              actions={[
+                {
+                  id: "refresh",
+                  label: "Refresh env",
+                  icon: <RefreshCw className="size-4" />,
+                  onClick: () => runRedeploy("refresh"),
+                },
+                ...(hasMultipleServices
+                  ? [
+                      {
+                        id: "rebuild",
+                        label: "Rebuild all",
+                        icon: <Layers className="size-4" />,
+                        onClick: () => runRedeploy("all"),
+                      },
+                    ]
+                  : []),
+              ]}
+            />
           </div>
         </div>
       </div>

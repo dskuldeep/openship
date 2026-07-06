@@ -456,6 +456,15 @@ export const mailApi = {
     api.post<{ ok: boolean }>(endpoints.mail.resetSetup, { serverId }),
 
   /**
+   * Stop managing a mail server: drops only the mail_servers DB row so
+   * /emails stops listing it. The mail stack + on-server state file are
+   * left intact, so it can be re-adopted later via scan + adopt. Use to
+   * clear a stale/corrupted registry entry.
+   */
+  forget: (serverId: string) =>
+    api.delete<{ ok: boolean }>(endpoints.mail.forgetServer(serverId)),
+
+  /**
    * Mark DNS records as configured for a (server, domain) session - releases
    * the install past the DKIM hold step. The caller should follow this with
    * a `streamSetup(..., startStep = resumeStep)` to actually resume.

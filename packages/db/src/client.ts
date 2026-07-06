@@ -3,6 +3,7 @@ import { resolve, dirname, join } from "path";
 import { fileURLToPath } from "url";
 import type { NodePgDatabase } from "drizzle-orm/node-postgres";
 import type { PgliteDatabase } from "drizzle-orm/pglite";
+import type { Pool } from "pg";
 import * as schema from "./schema";
 
 // ─── Types ───────────────────────────────────────────────────────────────────
@@ -22,6 +23,20 @@ let _driver: Driver;
 
 export function getDriver(): Driver {
   return _driver;
+}
+
+/**
+ * The raw node-postgres Pool, exposed so `withAdvisoryLock` can hold a
+ * session-level lock on a dedicated connection. Only set for the `pg` driver;
+ * PGlite has no pool (and doesn't need cross-process locking).
+ */
+let _pgPool: Pool | undefined;
+
+export function getPgPool(): Pool {
+  if (!_pgPool) {
+    throw new Error("Postgres pool is unavailable (active driver is not 'pg')");
+  }
+  return _pgPool;
 }
 
 // ─── Resolved paths ─────────────────────────────────────────────────────────
@@ -121,6 +136,7 @@ async function createPgClient(url: string): Promise<Database> {
     idleTimeoutMillis: 30_000,
     connectionTimeoutMillis: 5_000,
   });
+  _pgPool = pool;
   const db = drizzle(pool, { schema });
 
   // Run pending migrations
