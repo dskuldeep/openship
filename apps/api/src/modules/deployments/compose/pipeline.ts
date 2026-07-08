@@ -27,6 +27,7 @@ import type { BuildConfigSnapshotLike } from "../build-config";
 import {
   cleanupBuildArtifact,
   onFailure,
+  onReconciling,
   onSuccess,
   setDeploymentStatus,
   type LifecycleContext,
@@ -150,6 +151,21 @@ export async function executeComposePipeline(opts: ComposePipelineOpts): Promise
         }
       : undefined,
   });
+
+  // RECONCILING: the connection dropped after some containers started, so the
+  // outcome is unknown. Must be handled BEFORE the `failed` branch and must NOT
+  // go through onFailure (which destroys containers) — the containers may be
+  // running fine. Persist `reconciling` and leave the images in place (reconcile
+  // may confirm ready; cleaning up now would hit the same dead connection).
+  if (composeResult.status === "reconciling") {
+    const primary = composeResult.services.find((s) => s.containerId);
+    await onReconciling(ctx, {
+      containerId: primary?.containerId,
+      warningMessage:
+        composeResult.warning ?? "Connection lost during deploy — verifying remote state.",
+    });
+    return;
+  }
 
   if (composeResult.status === "failed") {
     for (const [serviceId, imageRef] of composeBuild.builtImageRefs) {

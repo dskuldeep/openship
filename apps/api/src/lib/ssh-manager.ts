@@ -33,6 +33,7 @@ import { repos } from "@repo/db";
 import {
   createExecutor,
   isRetryableRemoteConnectionError,
+  probeTcp,
   type CommandExecutor,
   type SshConfig,
 } from "@repo/adapters";
@@ -313,6 +314,37 @@ export class SshConnectionManager {
   /** Whether there's an active connection for a given server. */
   isConnected(serverId: string): boolean {
     return this.servers.has(serverId);
+  }
+
+  /**
+   * Cheap reachability check that never establishes or caches an SSH session.
+   * This is the single source of truth for "can we reach this server right
+   * now" — delete/reconcile use it to fast-fail an unreachable host in ~2.5s
+   * instead of paying the 15-20s SSH connect timeout per resource.
+   *
+   *   - live cached connection  → reachable (don't disturb it).
+   *   - breaker in cooldown      → unreachable, WITHOUT any connection attempt
+   *                                (the "no avoidable connection" fast path).
+   *   - otherwise                → a bounded TCP probe to the SSH port; the
+   *                                result feeds the same breaker the executor
+   *                                paths use, so a sick box trips it even though
+   *                                cleanup execs bypass `withExecutor`.
+   *
+   * Reuses `repos.server.get` — the same config source `connect()` uses — so
+   * there is no second notion of server connectivity.
+   */
+  async probeReachable(serverId: string, timeoutMs = 2500): Promise<boolean> {
+    if (this.destroyed) return false;
+    if (this.servers.has(serverId)) return true;
+    if (this.cooldownRemaining(serverId) > 0) return false;
+
+    const server = await repos.server.get(serverId).catch(() => undefined);
+    if (!server?.sshHost) return false;
+
+    const ok = await probeTcp(server.sshHost, server.sshPort ?? 22, timeoutMs);
+    if (ok) this.recordSuccess(serverId);
+    else this.recordFailure(serverId);
+    return ok;
   }
 
   /**

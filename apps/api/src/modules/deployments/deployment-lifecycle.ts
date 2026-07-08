@@ -100,6 +100,44 @@ export async function setDeploymentStatus(
   );
 }
 
+/**
+ * INDETERMINATE completion: the connection to the server dropped after
+ * container(s) started, so we can neither confirm success nor declare failure.
+ *
+ * Persist `reconciling` and finish the build stream — but, unlike onFailure,
+ * DO NOT destroy the build artifact or the service containers (they may be
+ * running perfectly) and DO NOT advance the project's active pointer
+ * (forward-only: only a confirmed success advances it). A later
+ * `reconcileDeployment` reads the true remote state and settles this to
+ * ready / partial_failure / failed.
+ */
+export async function onReconciling(
+  ctx: LifecycleContext,
+  result: { containerId?: string; warningMessage?: string; durationMs?: number },
+): Promise<void> {
+  const { dep, buildSessionId, persistLogs } = ctx;
+
+  if (result.containerId) {
+    await repos.deployment.setContainerId(dep.id, result.containerId).catch(() => {});
+  }
+
+  const collapsed = persistLogs();
+  await repos.deployment.updateStatus(dep.id, "reconciling", { errorMessage: null });
+  // The build stream is finished; the SSE layer has no "reconciling", so close
+  // it as "ready" with a warning. The dashboard reads the DB row's `reconciling`
+  // status for the actual state (same split as partial_failure).
+  await repos.deployment.finishBuildSession(
+    buildSessionId,
+    "ready",
+    result.durationMs ?? 0,
+    collapsed,
+  );
+  sessionManager.updateStatus(dep.id, "ready", {
+    warningMessage:
+      result.warningMessage ?? "Connection lost during deploy — verifying remote state.",
+  });
+}
+
 export async function onFailure(
   ctx: LifecycleContext,
   error?: string,

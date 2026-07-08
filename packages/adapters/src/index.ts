@@ -122,7 +122,9 @@ export {
   isRemoteConnectionError,
   isRetryableRemoteConnectionError,
   isSshAuthError,
+  isRuntimeNotFoundError,
 } from "./system/errors";
+export { probeTcp } from "./system/reachability";
 
 export { LocalExecutor, SshExecutor, SystemSshExecutor, createExecutor } from "./system/executor";
 

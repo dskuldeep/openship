@@ -140,6 +140,17 @@ export const getStatusConfig = (status: string) => {
         borderColor: "border-border/50",
         label: "Rejected",
       };
+    case "reconciling":
+      // Connection to the server dropped after container(s) started — the
+      // outcome is being verified against the live host. Not a failure; the
+      // status resolves to deployed/failed once the host is reachable.
+      return {
+        icon: 'loading-51-1663582768.png',
+        color: "var(--color-amber-500)",
+        bgColor: "bg-amber-500/10",
+        borderColor: "border-amber-500/20",
+        label: "Verifying",
+      };
     default:
       return {
         icon: 'circle%20clock-39-1658435834.png',

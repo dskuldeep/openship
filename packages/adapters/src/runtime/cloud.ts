@@ -64,6 +64,7 @@ import { runLocalBuild } from "./local-build";
 import { transferLocalDirectory } from "./transfer";
 import { checkGit } from "../system/checks";
 import { installGit } from "../system/installer";
+import { isRuntimeNotFoundError } from "../system/errors";
 import { STACKS, TRANSFER_EXCLUDES, SYSTEM, safeErrorMessage, type StackId, type StackDefinition, type ComposeAdvanced } from "@repo/core";
 
 type CloudWorkspaceRuntime = Awaited<ReturnType<WorkspaceHandle["runtime"]>>;
@@ -1629,16 +1630,26 @@ fi`;
   }
 
   async destroy(containerId: string): Promise<void> {
-    if (containerId.startsWith(PAGE_CONTAINER_PREFIX)) {
-      const slug = containerId.slice(5);
-      if (this.adminProxy?.deletePage) {
-        await this.adminProxy.deletePage(slug);
+    try {
+      if (containerId.startsWith(PAGE_CONTAINER_PREFIX)) {
+        const slug = containerId.slice(5);
+        if (this.adminProxy?.deletePage) {
+          await this.adminProxy.deletePage(slug);
+        } else {
+          await this.client.pages.delete(slug);
+        }
       } else {
-        await this.client.pages.delete(slug);
+        await this.ws(containerId).delete();
+        this.builtArtifacts.delete(containerId);
       }
-    } else {
-      await this.ws(containerId).delete();
-      this.builtArtifacts.delete(containerId);
+    } catch (err) {
+      // Idempotent: already gone on Oblien is a successful teardown (matches
+      // DockerRuntime.destroy swallowing 404). A real error still propagates.
+      if (isRuntimeNotFoundError(err)) {
+        this.builtArtifacts.delete(containerId);
+        return;
+      }
+      throw err;
     }
   }
 
@@ -1772,7 +1783,18 @@ fi`;
   // ── Observability ──────────────────────────────────────────────────────
 
   async getContainerInfo(containerId: string): Promise<ContainerInfo> {
-    const data = await this.ws(containerId).get();
+    let data: Awaited<ReturnType<ReturnType<typeof this.ws>["get"]>>;
+    try {
+      data = await this.ws(containerId).get();
+    } catch (err) {
+      // ABSENT: the workspace was deleted on Openship Cloud out-of-band →
+      // report `missing` (drift). A transient Oblien/network error is NOT a
+      // 404 and propagates so callers can tell "gone" from "can't reach".
+      if (isRuntimeNotFoundError(err)) {
+        return { containerId, status: "missing" };
+      }
+      throw err;
+    }
 
     const statusMap: Record<string, ContainerStatus> = {
       running: "running",

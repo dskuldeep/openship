@@ -1,6 +1,7 @@
 export { user, session, account, verification } from "./auth";
 export { organization, member, invitation } from "./organization";
 export { auditEvent } from "./audit-event";
+export { orphanedResource } from "./orphaned-resource";
 export { resourceGrant } from "./resource-grant";
 export { invitationPendingGrant } from "./invitation-pending-grant";
 export { gitInstallation } from "./github";

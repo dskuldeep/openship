@@ -9,6 +9,7 @@ import { param } from "../../lib/controller-helpers";
 import { getRequestContext } from "../../lib/request-context";
 import { permission } from "../../lib/permission";
 import * as deploymentService from "./deployment.service";
+import { triggerReconcile } from "./reconcile.service";
 import * as buildService from "./build.service";
 import * as buildStatusService from "./build-status.service";
 import * as sslService from "./ssl.service";
@@ -90,6 +91,10 @@ export async function getById(c: Context) {
   const id = param(c, "id");
   await permission.assert(getRequestContext(c), { resourceType: "deployment", resourceId: id, action: "read" });
   const dep = await deploymentService.getDeployment(id, ctx.organizationId);
+  // On-demand reconcile: opening a `reconciling` deployment kicks off a
+  // verification against the live host (deduped, fire-and-forget). The current
+  // row is returned as-is; the resolved status arrives via the next poll/SSE.
+  if (dep?.status === "reconciling") triggerReconcile(id);
   return c.json({ data: dep });
 }
 

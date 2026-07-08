@@ -17,7 +17,12 @@ export type ServiceDeploymentStatus =
   | "success"
   | "failure"
   | "skipped"
-  | "cancelled";
+  | "cancelled"
+  /** Container started but the connection dropped before we could confirm —
+   *  awaiting reconciliation. */
+  | "indeterminate"
+  /** The container is gone on the host (deleted out-of-band) — drift. */
+  | "missing";
 
 // ─── Repository ──────────────────────────────────────────────────────────────
 

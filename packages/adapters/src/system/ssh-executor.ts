@@ -96,16 +96,28 @@ export class SshExecutor implements CommandExecutor {
     return msg.includes("channel open failure") || msg.includes("open failed");
   }
 
-  async exec(command: string, opts?: { timeout?: number }): Promise<string> {
+  /**
+   * Run an operation, and if it fails opening an SSH channel on a half-dead
+   * cached connection ("Channel open failure: open failed" — common after the
+   * idle timeout drops the socket), drop the connection and retry ONCE on a
+   * fresh one. This is why `exec` survives a stale connection; the SFTP-based
+   * ops (writeFile/readFile/exists) must go through it too, or a deploy's route
+   * write fails spuriously and only succeeds on a manual redeploy.
+   */
+  private async withChannelRetry<T>(fn: () => Promise<T>): Promise<T> {
     try {
-      return await this._exec(command, opts);
+      return await fn();
     } catch (err) {
       if (SshExecutor.isChannelError(err)) {
         this.resetConnection();
-        return this._exec(command, opts);
+        return fn();
       }
       throw err;
     }
+  }
+
+  async exec(command: string, opts?: { timeout?: number }): Promise<string> {
+    return this.withChannelRetry(() => this._exec(command, opts));
   }
 
   /** Prefix applied to every SSH command - keeps dpkg non-interactive. */
@@ -203,30 +215,36 @@ export class SshExecutor implements CommandExecutor {
       // Best effort
     }
 
-    const sftp = await this.sftp();
-    return new Promise((resolve, reject) => {
-      sftp.writeFile(path, content, { encoding: "utf-8" }, (err) => {
-        if (err) reject(err);
-        else resolve();
+    return this.withChannelRetry(async () => {
+      const sftp = await this.sftp();
+      return new Promise<void>((resolve, reject) => {
+        sftp.writeFile(path, content, { encoding: "utf-8" }, (err) => {
+          if (err) reject(err);
+          else resolve();
+        });
       });
     });
   }
 
   async readFile(path: string): Promise<string> {
-    const sftp = await this.sftp();
-    return new Promise((resolve, reject) => {
-      sftp.readFile(path, { encoding: "utf-8" }, (err, data) => {
-        if (err) reject(err);
-        else resolve(data.toString());
+    return this.withChannelRetry(async () => {
+      const sftp = await this.sftp();
+      return new Promise<string>((resolve, reject) => {
+        sftp.readFile(path, { encoding: "utf-8" }, (err, data) => {
+          if (err) reject(err);
+          else resolve(data.toString());
+        });
       });
     });
   }
 
   async exists(path: string): Promise<boolean> {
-    const sftp = await this.sftp();
-    return new Promise((resolve) => {
-      sftp.stat(path, (err) => {
-        resolve(!err);
+    return this.withChannelRetry(async () => {
+      const sftp = await this.sftp();
+      return new Promise<boolean>((resolve) => {
+        sftp.stat(path, (err) => {
+          resolve(!err);
+        });
       });
     });
   }

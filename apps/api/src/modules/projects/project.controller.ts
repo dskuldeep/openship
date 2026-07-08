@@ -420,6 +420,10 @@ export async function remove(c: Context) {
   await permission.assert(getRequestContext(c), { resourceType: "project", resourceId: id, action: "admin" });
 
   const force = c.req.query("force") === "true";
+  // Orphan-and-drop even when a resource on a REACHABLE server won't destroy
+  // (a persistent real error). Unreachable-server resources are ALWAYS orphaned
+  // regardless — that's the enforced delete.
+  const forceOrphan = c.req.query("forceOrphan") === "true";
   // Body is still accepted for wipeVolumes (dashboard sends JSON), but
   // optional — query overrides body when both are present.
   let bodyWipeVolumes: boolean | undefined;
@@ -501,6 +505,7 @@ export async function remove(c: Context) {
   // ── Run the atomic teardown. ──────────────────────────────────────
   const result = await projectTeardown.teardownProject(ctx, id, {
     force,
+    forceOrphan,
     wipeVolumes,
   });
 
@@ -570,14 +575,17 @@ export async function remove(c: Context) {
     );
   }
 
-  // Row still around — teardown couldn't complete. 409 so the caller
-  // can retry (the deletion_in_progress flag is already cleared by the
-  // teardown failure path).
+  // Row still around — teardown couldn't complete. This is now ONLY the
+  // "reachable server but destroy kept failing" case (unreachable resources are
+  // orphaned and the row drops). 409 so the caller can retry, and
+  // `canForceOrphan` tells the dashboard it may offer a force-orphan delete
+  // that records the leaked resources for GC and drops the row anyway.
   if (!result.rowDeleted) {
     return c.json(
       {
         ok: false,
         code: "PROJECT_TEARDOWN_FAILED",
+        canForceOrphan: true,
         message: result.unrecoverable[0]?.error ?? "Teardown failed",
         steps: result.steps,
         unrecoverable: result.unrecoverable,
@@ -590,6 +598,10 @@ export async function remove(c: Context) {
     ok: true,
     message: "deleted",
     steps: result.steps,
+    // Resources that couldn't be reached at delete time — recorded for GC to
+    // reclaim once the server is back. Drives the "will be cleaned up when the
+    // server is reachable" toast. Empty on a fully-clean delete.
+    orphaned: result.orphaned,
   });
 }
 

@@ -60,6 +60,22 @@ function getServiceStatusChipConfig(
         textClass: "text-blue-600 dark:text-blue-400",
         dotClass: "bg-blue-500",
       };
+    case "missing":
+      // Drift: the container was removed on the host out-of-band.
+      return {
+        label: "Removed on host",
+        bgClass: "bg-orange-500/10",
+        textClass: "text-orange-600 dark:text-orange-400",
+        dotClass: "bg-orange-500",
+      };
+    case "indeterminate":
+      // Started but unverified — connection dropped mid-deploy.
+      return {
+        label: "Verifying",
+        bgClass: "bg-amber-500/10",
+        textClass: "text-amber-600 dark:text-amber-400",
+        dotClass: "bg-amber-500",
+      };
     case "pending":
     default:
       return {

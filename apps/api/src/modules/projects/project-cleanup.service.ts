@@ -22,6 +22,7 @@ import {
 } from "../../lib/deployment-runtime";
 import { resolveOrgCloudUserId } from "../../lib/cloud/transport";
 import { buildServiceRouteDomain } from "../../lib/routing-domains";
+import { createReachabilityProbe } from "../../lib/server-reachability";
 
 /** Hard ceiling on a docker-over-SSH volume inspect during manifest/preview.
  *  These calls `.catch(() => [])` on ERROR, but a half-open SSH socket never
@@ -55,6 +56,12 @@ export interface CleanupResource {
   label: string;
   /** The runtime to use for destroy/removeImage/removeVolume - null for routes. */
   runtime: RuntimeAdapter | null;
+  /** Server the resource lives on (set on `unreachable` items) — carried into
+   *  the orphaned_resource row so GC can probe + reclaim it later. */
+  serverId?: string;
+  /** Runtime mode (docker | bare | cloud) for the orphaned_resource row so GC
+   *  resolves the right adapter. Set on `unreachable` items. */
+  runtimeMode?: string;
 }
 
 export interface CleanupManifest {
@@ -95,7 +102,7 @@ export interface CollectManifestOptions {
 export interface CleanupResult {
   total: number;
   succeeded: number;
-  failed: { ref: string; label: string; error: string }[];
+  failed: { ref: string; label: string; error: string; type: CleanupResource["type"] }[];
 }
 
 // ─── Manifest Collectors ─────────────────────────────────────────────────────
@@ -114,6 +121,27 @@ export async function collectProjectManifest(
   const seenContainers = new Set<string>();
   const seenVolumes = new Set<string>();
   const dockerRuntimes = new Set<DockerRuntime>();
+  // Op-scoped reachability memo (single source: sshManager). Lets us fast-fail
+  // an unreachable server in ~2.5s instead of hanging on SSH connect timeouts.
+  const reachProbe = createReachabilityProbe();
+
+  const pushUnreachable = (
+    containerId: string,
+    serverId: string,
+    runtimeMode: string | undefined,
+    labelPrefix: string,
+  ) => {
+    if (seenContainers.has(containerId)) return;
+    seenContainers.add(containerId);
+    resources.push({
+      type: "unreachable",
+      ref: containerId,
+      serverId,
+      runtimeMode,
+      label: `${labelPrefix} ${containerId.slice(0, 12)} (server unreachable)`,
+      runtime: null,
+    });
+  };
 
   const pushContainer = (containerId: string, runtime: RuntimeAdapter, labelPrefix: string) => {
     if (seenContainers.has(containerId)) return;
@@ -157,6 +185,34 @@ export async function collectProjectManifest(
   const seenImages = new Set<string>();
 
   for (const dep of allDeps) {
+    // Fast-fail: if this deployment targets a server that's UNREACHABLE right
+    // now, do NOT resolve/exec against it — that's the source of the ~81s
+    // delete hang (each container destroy waits out a 15-20s SSH timeout).
+    // Record its containers as `unreachable` so teardown orphans them for GC
+    // and the delete still completes. Skip entirely if the server was removed.
+    {
+      const meta = (dep.meta ?? {}) as DeploymentMeta;
+      const serverId = meta.serverId;
+      if (serverId && !(await reachProbe.isReachable(serverId))) {
+        const serverStillExists = Boolean(
+          await repos.server.getInOrganization(serverId, dep.organizationId).catch(() => null),
+        );
+        if (serverStillExists) {
+          const mode = meta.runtimeMode;
+          const serviceRows = await repos.service.listByDeployment(dep.id).catch(() => []);
+          for (const sd of serviceRows) {
+            if (sd.containerId) pushUnreachable(sd.containerId, serverId, mode, "service container");
+          }
+          if (dep.containerId) pushUnreachable(dep.containerId, serverId, mode, "deployment container");
+        } else {
+          console.warn(
+            `[cleanup] skipping deployment ${dep.id} — server ${serverId} removed from org`,
+          );
+        }
+        continue;
+      }
+    }
+
     let runtime: RuntimeAdapter;
     try {
       ({ runtime } = await resolveDeploymentRuntime(dep));
@@ -602,6 +658,7 @@ export async function executeCleanup(
           ref: resource.ref,
           label: resource.label,
           error: safeErrorMessage(reason.reason),
+          type: resource.type,
         });
       }
     }

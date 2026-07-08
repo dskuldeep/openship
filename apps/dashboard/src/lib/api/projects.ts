@@ -163,16 +163,30 @@ export const projectsApi = {
    *  Default is false: data survives so the user can recover.
    *  `force=true` cancels in-flight deployments / backups / restores
    *  before tearing down; default refuses with 409 when active work
-   *  exists so the user can wait or cancel. */
+   *  exists so the user can wait or cancel.
+   *  `forceOrphan=true` drops the row even when a resource on a REACHABLE
+   *  server keeps failing to destroy (records it for GC). Resources on an
+   *  UNREACHABLE server are always orphaned regardless — enforced delete. */
   delete: (
     id: string | number,
-    body: { deleteApp?: boolean; wipeVolumes?: boolean; force?: boolean } = {},
+    body: {
+      deleteApp?: boolean;
+      wipeVolumes?: boolean;
+      force?: boolean;
+      forceOrphan?: boolean;
+    } = {},
   ) => {
-    const { force, ...rest } = body;
-    const path = force
-      ? `${endpoints.projects.item(id)}?force=true`
-      : endpoints.projects.item(id);
-    return api.delete<any>(path, { body: rest });
+    const { force, forceOrphan, ...rest } = body;
+    const query = new URLSearchParams();
+    if (force) query.set("force", "true");
+    if (forceOrphan) query.set("forceOrphan", "true");
+    const qs = query.toString();
+    const path = qs ? `${endpoints.projects.item(id)}?${qs}` : endpoints.projects.item(id);
+    // Teardown destroys containers/images/volumes over SSH (round-trips + per-
+    // resource server-side timeouts) — far longer than the 15s default. A short
+    // client timeout aborts the fetch mid-teardown (server still finishes, so
+    // the project vanishes) and surfaces a spurious AbortError.
+    return api.delete<any>(path, { body: rest, timeout: 120_000 });
   },
 
   /** Read-only snapshot of what `delete(id)` will remove - services and their

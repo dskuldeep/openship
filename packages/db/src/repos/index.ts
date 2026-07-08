@@ -110,6 +110,11 @@ export { createMemberRepo, type Member, type MemberRole } from "./member.repo";
 export { createInvitationRepo, type Invitation } from "./invitation.repo";
 export { createAuditEventRepo, type AuditEvent, type NewAuditEvent } from "./audit-event.repo";
 export {
+  createOrphanedResourceRepo,
+  type OrphanedResource,
+  type NewOrphanedResource,
+} from "./orphaned-resource.repo";
+export {
   createResourceGrantRepo,
   type ResourceGrant,
   type Permission,
@@ -176,6 +181,7 @@ import {
 import { createMemberRepo } from "./member.repo";
 import { createInvitationRepo } from "./invitation.repo";
 import { createAuditEventRepo } from "./audit-event.repo";
+import { createOrphanedResourceRepo } from "./orphaned-resource.repo";
 import { createResourceGrantRepo } from "./resource-grant.repo";
 import { createInvitationPendingGrantRepo } from "./invitation-pending-grant.repo";
 import { createOrganizationRepo } from "./organization.repo";
@@ -226,6 +232,7 @@ export const repos = {
   member: createMemberRepo(db),
   invitation: createInvitationRepo(db),
   auditEvent: createAuditEventRepo(db),
+  orphanedResource: createOrphanedResourceRepo(db),
   resourceGrant: createResourceGrantRepo(db),
   invitationPendingGrant: createInvitationPendingGrantRepo(db),
   organization: createOrganizationRepo(db),

@@ -11,7 +11,9 @@ export interface ServiceDeploymentSummary {
     | "success"
     | "failure"
     | "skipped"
-    | "cancelled";
+    | "cancelled"
+    | "indeterminate"
+    | "missing";
   /** Why the row landed in its current status — "unchanged", "forced", etc. */
   reason?: string | null;
   errorMessage?: string | null;
@@ -23,7 +25,7 @@ export interface Deployment {
   id: string;
   /** Monotonic per-project version (v1, v2, …). Null for legacy rows. */
   version: number | null;
-  status: "success" | "failed" | "building" | "pending" | "canceled" | "cancelled" | "partial_failure" | "rejected";
+  status: "success" | "failed" | "building" | "pending" | "canceled" | "cancelled" | "partial_failure" | "rejected" | "reconciling";
   domain: string;
   framework: string;
   commit: {

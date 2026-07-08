@@ -70,6 +70,14 @@ export type TeardownRejectionKind =
   | "already_deleted"
   | "org_mismatch";
 
+/** A remote resource we couldn't destroy now (server unreachable, or a
+ *  force-orphaned failure) and recorded for the GC sweep to reclaim later. */
+export interface OrphanedResourceSummary {
+  ref: string;
+  label: string;
+  serverId: string | null;
+}
+
 export interface TeardownResult {
   /** True only when EVERY step is `ok` or `skipped`. */
   ok: boolean;
@@ -81,6 +89,11 @@ export interface TeardownResult {
   /** Steps that failed and the user should know about. Empty array on
    *  full success — drives the dashboard's "partial-success" warning. */
   unrecoverable: TeardownStep[];
+  /** Remote resources orphaned for later GC (server was unreachable, or
+   *  force-orphaned). The row still dropped — this is an INTENTIONAL outcome,
+   *  not a failure. Drives the "will be cleaned up when the server is back"
+   *  message. */
+  orphaned: OrphanedResourceSummary[];
   /** Set when teardown short-circuited before the step sequence; absent
    *  on the normal "ran to completion" path. */
   rejection?: TeardownRejectionKind;
@@ -113,6 +126,13 @@ export interface TeardownOptions {
    * runtime + rows but must NOT delete the webhook.
    */
   preserveWebhook?: boolean;
+  /**
+   * Orphan-and-drop even when a resource on a REACHABLE server fails to
+   * destroy (a persistent real error). Records the leaked resources for GC and
+   * lets the row drop instead of blocking forever. Unreachable-server resources
+   * are ALWAYS orphaned (enforced delete) regardless of this flag.
+   */
+  forceOrphan?: boolean;
 }
 
 // ─── Constants ────────────────────────────────────────────────────────────────
@@ -275,7 +295,14 @@ export async function teardownProject(
     // ── Step 3: Tear down runtime + edge + pages + routes + volumes via
     //   the existing manifest executor. Cloud workspaces destroy through
     //   the same path because the cloud runtime adapter implements destroy().
-    await stepRuntimeCleanup(project, opts.wipeVolumes ?? false, push);
+    //   Resources on an unreachable server are orphaned (not destroyed inline)
+    //   and returned here so we can record them for GC before the row drops.
+    const orphanCandidates = await stepRuntimeCleanup(
+      project,
+      opts.wipeVolumes ?? false,
+      opts.forceOrphan ?? false,
+      push,
+    );
 
     // ── Step 4: Webmail filesystem + mail-state. ─────────────────────────
     await stepWebmailTeardown(project, push);
@@ -309,11 +336,17 @@ export async function teardownProject(
       return finalize(steps, false);
     }
 
+    // About to drop the row — persist any orphaned resources FIRST so the GC
+    // sweep can still find + reclaim them after the project row (their only
+    // record) is gone. Only happens on the row-dropping path: a kept row keeps
+    // the resources tracked via the project itself, so no orphan record needed.
+    const orphaned = await persistOrphans(ctx.organizationId, projectId, orphanCandidates);
+
     // ── Step 5: Drop the DB row. FK CASCADE on project.id sweeps
     //   deployment, service, env_var, domain, backup_policy.
     rowDeleted = await stepDeleteRow(projectId, project.appId, push);
 
-    return finalize(steps, rowDeleted);
+    return finalize(steps, rowDeleted, undefined, orphaned);
   } finally {
     // Lock released on every non-deleting exit so a retry is always possible.
     if (!rowDeleted) {
@@ -326,6 +359,7 @@ function finalize(
   steps: TeardownStep[],
   rowDeleted: boolean,
   rejection?: TeardownRejectionKind,
+  orphaned: OrphanedResourceSummary[] = [],
 ): TeardownResult {
   const unrecoverable = steps.filter((s) => s.status === "failed");
   return {
@@ -333,6 +367,7 @@ function finalize(
     rowDeleted,
     steps,
     unrecoverable,
+    orphaned,
     ...(rejection !== undefined ? { rejection } : {}),
   };
 }
@@ -447,11 +482,22 @@ async function stepDeleteWebhook(
   }
 }
 
+/** A remote resource to record for GC (server unreachable, or force-orphaned). */
+interface OrphanCandidate {
+  serverId: string | null;
+  resourceType: string;
+  ref: string;
+  label: string;
+  runtimeMode: string | null;
+}
+
 async function stepRuntimeCleanup(
   project: Project,
   wipeVolumes: boolean,
+  forceOrphan: boolean,
   push: (s: TeardownStep) => void,
-): Promise<void> {
+): Promise<OrphanCandidate[]> {
+  const orphans: OrphanCandidate[] = [];
   let manifest;
   try {
     manifest = await collectProjectManifest(project, { wipeVolumes });
@@ -461,29 +507,125 @@ async function stepRuntimeCleanup(
       status: "failed",
       error: `Manifest collection failed: ${safeErrorMessage(err)}`,
     });
-    return;
+    return orphans;
   }
 
   if (manifest.resources.length === 0) {
     push({ step: "runtime_cleanup", status: "skipped", details: "no resources" });
-    return;
+    return orphans;
   }
 
-  const result = await executeCleanup(manifest);
-  const failed = result.failed.length;
-  const details = `${result.succeeded}/${result.total} ok` + (wipeVolumes ? " (volumes wiped)" : "");
+  // ENFORCED DELETE: resources on an UNREACHABLE server are never destroyed
+  // inline (that inline destroy is the ~81s hang). Orphan them for the GC sweep
+  // to reclaim once the server is back, and let the delete proceed. Everything
+  // else goes through the normal destroy path.
+  const unreachable = manifest.resources.filter((r) => r.type === "unreachable");
+  const destroyable = manifest.resources.filter((r) => r.type !== "unreachable");
 
-  if (failed === 0) {
+  for (const r of unreachable) {
+    orphans.push({
+      serverId: r.serverId ?? null,
+      resourceType: "container",
+      ref: r.ref,
+      label: r.label,
+      runtimeMode: r.runtimeMode ?? null,
+    });
+  }
+
+  const orphanNote = unreachable.length
+    ? `; ${unreachable.length} orphaned (server unreachable)`
+    : "";
+
+  if (destroyable.length === 0) {
+    // Nothing reachable to destroy — only unreachable orphans. The delete
+    // proceeds (row drops); GC reclaims the orphans later.
+    push({
+      step: "runtime_cleanup",
+      status: unreachable.length ? "ok" : "skipped",
+      details: unreachable.length ? orphanNote.slice(2) : "no resources",
+    });
+    return orphans;
+  }
+
+  const result = await executeCleanup({ projectId: manifest.projectId, resources: destroyable });
+  const realFailures = result.failed;
+  const details =
+    `${result.succeeded}/${result.total} ok` + (wipeVolumes ? " (volumes wiped)" : "") + orphanNote;
+
+  if (realFailures.length === 0) {
     push({ step: "runtime_cleanup", status: "ok", details });
-    return;
+    return orphans;
+  }
+
+  // Reachable server, but destroy kept failing. Default: mark failed so the
+  // atomicity gate keeps the row and a later retry can reclaim (a transient
+  // docker error might clear). forceOrphan: give up, orphan them, let the row
+  // drop — stamped with the project's primary target so GC can retry.
+  if (forceOrphan) {
+    const target = await resolvePrimaryTarget(project.id);
+    for (const f of realFailures) {
+      orphans.push({
+        serverId: target.serverId,
+        resourceType: f.type === "unreachable" ? "container" : f.type,
+        ref: f.ref,
+        label: f.label,
+        runtimeMode: target.runtimeMode,
+      });
+    }
+    push({
+      step: "runtime_cleanup",
+      status: "ok",
+      details: `${details}; ${realFailures.length} force-orphaned`,
+    });
+    return orphans;
   }
 
   push({
     step: "runtime_cleanup",
     status: "failed",
     details,
-    error: result.failed.map((f) => `${f.label}: ${f.error}`).join("; "),
+    error: realFailures.map((f) => `${f.label}: ${f.error}`).join("; "),
   });
+  return orphans;
+}
+
+/** Best-effort project target (serverId/runtimeMode) from its latest deployment
+ *  snapshot — used to stamp force-orphaned resources so GC can resolve a runtime. */
+async function resolvePrimaryTarget(
+  projectId: string,
+): Promise<{ serverId: string | null; runtimeMode: string | null }> {
+  const res = await repos.deployment
+    .listByProject(projectId, { perPage: 1 })
+    .catch(() => ({ rows: [] as Array<{ meta?: unknown }> }));
+  const meta = (res.rows[0]?.meta ?? {}) as { serverId?: string; runtimeMode?: string };
+  return { serverId: meta.serverId ?? null, runtimeMode: meta.runtimeMode ?? null };
+}
+
+/** Persist orphan candidates so the GC sweep can reclaim them after the project
+ *  row is gone. Best-effort per row — a failed insert is logged, not fatal. */
+async function persistOrphans(
+  organizationId: string,
+  projectId: string,
+  candidates: OrphanCandidate[],
+): Promise<OrphanedResourceSummary[]> {
+  const out: OrphanedResourceSummary[] = [];
+  for (const c of candidates) {
+    try {
+      await repos.orphanedResource.create({
+        organizationId,
+        serverId: c.serverId,
+        resourceType: c.resourceType,
+        ref: c.ref,
+        projectId,
+        label: c.label,
+        runtimeMode: c.runtimeMode,
+      });
+      out.push({ ref: c.ref, label: c.label, serverId: c.serverId });
+    } catch (err) {
+      console.error(`[teardown] failed to record orphan ${c.ref}:`, safeErrorMessage(err));
+    }
+  }
+  return out;
 }
 
 async function stepWebmailTeardown(

@@ -44,7 +44,12 @@ export type ContainerStatus =
   | "running"
   | "stopped"
   | "failed"
-  | "cancelled";
+  | "cancelled"
+  /** The runtime has NO record of this container/workspace — it was removed
+   *  out-of-band (deleted on the host, or the cloud workspace was destroyed).
+   *  Distinct from "stopped" (exists but not running) and from an unreachable
+   *  host (which throws). Drives drift detection. */
+  | "missing";
 
 export interface BuildConfig {
   /** Unique build session id */

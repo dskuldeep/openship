@@ -62,6 +62,14 @@ export const getStatusConfig = (status: string) => {
         borderColor: "border-blue-200",
         label: "Building",
       };
+    case "reconciling":
+      return {
+        icon: 'loading-51-1663582768.png',
+        color: "var(--color-amber-600)",
+        bgColor: "bg-amber-50",
+        borderColor: "border-amber-200",
+        label: "Verifying",
+      };
     default:
       return {
         icon: 'circle%20clock-39-1658435834.png',

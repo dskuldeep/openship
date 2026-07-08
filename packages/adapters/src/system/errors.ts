@@ -42,3 +42,21 @@ export function isRetryableRemoteConnectionError(err: unknown): boolean {
 export function isRemoteConnectionError(err: unknown): boolean {
   return isSshAuthError(err) || isRetryableRemoteConnectionError(err);
 }
+
+/**
+ * Detect "resource not found" errors from a runtime SDK (dockerode et al.).
+ * The Docker daemon returns HTTP 404 for missing containers/images/volumes/
+ * networks; dockerode surfaces this as an Error with `.statusCode === 404`
+ * (message containing "no such container/image/..."). Used to distinguish
+ * ABSENT (resource already gone → idempotent success / drift) from
+ * UNREACHABLE (server down → retry) and from a real error.
+ */
+export function isRuntimeNotFoundError(err: unknown): boolean {
+  if (!err || typeof err !== "object") return false;
+  const e = err as { statusCode?: number; message?: string };
+  if (e.statusCode === 404) return true;
+  return (
+    typeof e.message === "string" &&
+    /no such (container|image|volume|network)/i.test(e.message)
+  );
+}

@@ -463,6 +463,7 @@ const ProjectSettingsContent = () => {
     deleteApp = true,
     wipeVolumes = false,
     force = false,
+    forceOrphan = false,
   ) => {
     // Optimistic - immediately show "Deleting" status
     setProjectData((prev: any) => ({ ...prev, deletedAt: new Date().toISOString() }));
@@ -472,6 +473,7 @@ const ProjectSettingsContent = () => {
         deleteApp,
         wipeVolumes,
         force,
+        forceOrphan,
       });
       // 200: full success. 207 (partial success — row deleted but some
       // external cleanup failed) lands here too because ApiClient only
@@ -479,10 +481,21 @@ const ProjectSettingsContent = () => {
       // the project page so the user doesn't dwell on a half-deleted
       // resource.
       if (response.ok) {
-        showToast(
-          deleteApp ? "Project deleted successfully" : "Environment deleted successfully",
-          "success",
-        );
+        // Enforced delete: the server was unreachable, so its resources were
+        // recorded for GC and will be reclaimed once it's back.
+        const orphanCount = Array.isArray(response.orphaned) ? response.orphaned.length : 0;
+        if (orphanCount > 0) {
+          showToast(
+            `Project deleted. ${orphanCount} remote resource(s) will be cleaned up when the server is reachable.`,
+            "success",
+            "Deleted (cleanup pending)",
+          );
+        } else {
+          showToast(
+            deleteApp ? "Project deleted successfully" : "Environment deleted successfully",
+            "success",
+          );
+        }
         router.push("/");
         return;
       }
@@ -516,6 +529,7 @@ const ProjectSettingsContent = () => {
           error?: string;
           message?: string;
           active?: Record<string, unknown>;
+          canForceOrphan?: boolean;
           unrecoverable?: Array<{ step: string; error?: string }>;
         };
         // Graceful gate hit — there's active work. Show a toast that
@@ -536,12 +550,24 @@ const ProjectSettingsContent = () => {
           );
           return;
         }
-        // Teardown ran but couldn't complete (row not deleted).
+        // Teardown ran but couldn't complete (row not deleted). Only happens
+        // now when the server is REACHABLE but a destroy kept failing —
+        // `canForceOrphan` lets the user drop the row anyway and let GC reclaim
+        // the leaked resources later.
         const reasons = (body.unrecoverable ?? []).map((u) => u.step).join(", ");
         console.error("[delete-project] teardown failed", body.unrecoverable);
+        if (
+          body.canForceOrphan &&
+          window.confirm(
+            "Some resources couldn't be removed from the server. Delete the project anyway and clean them up automatically later?",
+          )
+        ) {
+          void handleDeleteProject(deleteApp, wipeVolumes, force, true);
+          return;
+        }
         showToast(
           reasons
-            ? `Teardown failed at: ${reasons}. Retry to attempt again.`
+            ? `Teardown failed at: ${reasons}. Retry, or force-delete to orphan them.`
             : body.message || body.error || "Teardown failed",
           "error",
           "Cleanup failed",

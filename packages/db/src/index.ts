@@ -104,6 +104,8 @@ export {
   type Invitation,
   type AuditEvent,
   type NewAuditEvent,
+  type OrphanedResource,
+  type NewOrphanedResource,
   type ResourceGrant,
   type Permission,
   type ResourceType,

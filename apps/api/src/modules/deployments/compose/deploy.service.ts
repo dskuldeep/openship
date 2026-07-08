@@ -29,6 +29,7 @@ import {
   type SystemManager,
 } from "@repo/adapters";
 import { decryptEnvMap } from "../../../lib/encryption";
+import { isConnectionLoss } from "../../../lib/remote-state";
 import {
   buildServiceRouteDomain,
   createTrackedSslProvider,
@@ -42,11 +43,17 @@ import { resolveServicePort } from "./domain-helpers";
 import { serviceKind } from "./project-services";
 
 export interface ComposeDeployResult {
-  status: "ready" | "failed";
+  /** `reconciling` when at least one service's outcome is UNKNOWN because the
+   *  connection dropped after its container started — the deploy can't be
+   *  finalized until reconciliation reads the true remote state. */
+  status: "ready" | "failed" | "reconciling";
   summary: {
     total: number;
     successful: number;
     failed: number;
+    /** Services whose container started but whose outcome is unverified
+     *  (connection lost mid-deploy). Neither success nor failure yet. */
+    indeterminate: number;
     failedServices: string[];
   };
   services: Array<{
@@ -306,6 +313,7 @@ export async function deployComposeServices(
         total: 0,
         successful: 0,
         failed: 0,
+        indeterminate: 0,
         failedServices: [],
       },
       services: [],
@@ -436,6 +444,10 @@ export async function deployComposeServices(
   let firstPublicUrl: string | undefined;
   const seenRouteDomains = new Set<string>();
   const unavailableServiceNames = new Set<string>();
+  // Services whose container STARTED but whose outcome we couldn't confirm
+  // because the connection dropped mid-deploy. Not counted as failed — the
+  // deploy resolves to `reconciling` and reconciliation reads the true state.
+  const indeterminateServiceNames = new Set<string>();
 
   for (const svc of ordered) {
     // Ownership guard - ensure this service actually belongs to the project
@@ -741,7 +753,13 @@ export async function deployComposeServices(
       );
 
       if (deployResult.status === "failed") {
-        if (deployedContainerId) {
+        // A CONNECTION-LOSS failure means the container STARTED but a post-start
+        // step (health / route) couldn't reach the host (e.g. a stale-connection
+        // "Channel open failure" during route registration). Keep it running —
+        // the catch below marks it `indeterminate` so the deploy RECONCILES
+        // instead of hard-failing and destroying a healthy container. Only a
+        // genuine failure destroys the container here.
+        if (deployedContainerId && !isConnectionLoss(deployResult.error)) {
           try {
             await runtime.destroy(deployedContainerId);
             deployedContainerCleaned = true;
@@ -847,44 +865,78 @@ export async function deployComposeServices(
           : undefined;
     } catch (err) {
       const message = err instanceof Error ? err.message : "Unknown error";
-      if (deployedContainerId && !deployedContainerCleaned) {
-        await runtime.destroy(deployedContainerId).catch((destroyErr) => {
-          const destroyMessage = destroyErr instanceof Error ? destroyErr.message : "Unknown error";
-          logger.log(
-            `Warning: failed to clean up "${svc.name}" after deploy failure: ${destroyMessage}\n`,
-            "warn",
-            {
-              serviceName: svc.name,
-            },
-          );
+
+      // INDETERMINATE: the container STARTED (we have its id) but a post-start
+      // step (health / route) lost the connection. Do NOT destroy it — it may
+      // be running fine — and do NOT mark it failed. Record `indeterminate` so
+      // the deploy resolves to `reconciling`; reconciliation reads the true
+      // remote state and settles it to ready/failed later.
+      if (isConnectionLoss(err) && deployedContainerId && !deployedContainerCleaned) {
+        logger.log(
+          `Service "${svc.name}" — connection lost after container start; will verify on reconcile.\n`,
+          "warn",
+          { serviceName: svc.name },
+        );
+        // SSE has no "indeterminate" — keep it "deploying" (accurate: verifying).
+        sessionManager.broadcastServiceStatus(dep.id, {
+          serviceName: svc.name,
+          serviceId: svc.id,
+          status: "deploying",
         });
+        await repos.service.createServiceDeployment({
+          deploymentId: dep.id,
+          serviceId: svc.id,
+          containerId: deployedContainerId,
+          status: "indeterminate",
+          imageRef: image,
+        });
+        results.push({
+          serviceId: svc.id,
+          serviceName: svc.name,
+          containerId: deployedContainerId,
+          status: "indeterminate",
+        });
+        indeterminateServiceNames.add(svc.name);
+      } else {
+        if (deployedContainerId && !deployedContainerCleaned) {
+          await runtime.destroy(deployedContainerId).catch((destroyErr) => {
+            const destroyMessage = destroyErr instanceof Error ? destroyErr.message : "Unknown error";
+            logger.log(
+              `Warning: failed to clean up "${svc.name}" after deploy failure: ${destroyMessage}\n`,
+              "warn",
+              {
+                serviceName: svc.name,
+              },
+            );
+          });
+        }
+        logger.log(`Service "${svc.name}" failed: ${message}\n`, "error", {
+          serviceName: svc.name,
+        });
+
+        // Broadcast per-service "failed" status to SSE subscribers
+        sessionManager.broadcastServiceStatus(dep.id, {
+          serviceName: svc.name,
+          serviceId: svc.id,
+          status: "failed",
+          error: message,
+        });
+
+        await repos.service.createServiceDeployment({
+          deploymentId: dep.id,
+          serviceId: svc.id,
+          status: "failed",
+          imageRef: image,
+        });
+
+        results.push({
+          serviceId: svc.id,
+          serviceName: svc.name,
+          status: "failed",
+          error: message,
+        });
+        unavailableServiceNames.add(svc.name);
       }
-      logger.log(`Service "${svc.name}" failed: ${message}\n`, "error", {
-        serviceName: svc.name,
-      });
-
-      // Broadcast per-service "failed" status to SSE subscribers
-      sessionManager.broadcastServiceStatus(dep.id, {
-        serviceName: svc.name,
-        serviceId: svc.id,
-        status: "failed",
-        error: message,
-      });
-
-      await repos.service.createServiceDeployment({
-        deploymentId: dep.id,
-        serviceId: svc.id,
-        status: "failed",
-        imageRef: image,
-      });
-
-      results.push({
-        serviceId: svc.id,
-        serviceName: svc.name,
-        status: "failed",
-        error: message,
-      });
-      unavailableServiceNames.add(svc.name);
     }
   }
 
@@ -930,11 +982,43 @@ export async function deployComposeServices(
 
   const failed = results.filter((r) => r.status === "failed");
   const failedNames = failed.map((r) => r.serviceName);
+  const indeterminate = results.filter((r) => r.status === "indeterminate");
   const warning =
     failed.length > 0
       ? `${failed.length}/${ordered.length} services failed: ${failedNames.join(", ")}`
       : undefined;
   const firstFailure = failed.find((service) => service.error?.trim())?.error;
+
+  // Any unverified service → the deploy's outcome is UNKNOWN. Resolve to
+  // `reconciling` (not ready/failed): reconciliation reads the real remote
+  // state and settles it, and — critically — this keeps the pipeline off the
+  // onFailure path, which would DESTROY the containers we're unsure about.
+  if (indeterminate.length > 0) {
+    const names = indeterminate.map((r) => r.serviceName).join(", ");
+    logger.step(
+      "deploy",
+      "running",
+      `Connection lost during deploy — ${indeterminate.length} service(s) pending verification: ${names}.`,
+    );
+    logger.log(
+      `Connection to the server was lost after ${indeterminate.length} container(s) started; ` +
+        `the deployment will be verified automatically (reconciling).\n`,
+      "warn",
+    );
+    return {
+      status: "reconciling",
+      summary: {
+        total: ordered.length,
+        successful,
+        failed: failed.length,
+        indeterminate: indeterminate.length,
+        failedServices: failedNames,
+      },
+      services: results,
+      warning: `Connection lost — verifying ${indeterminate.length} service(s): ${names}`,
+      publicUrl: firstPublicUrl,
+    };
+  }
 
   if (successful === ordered.length) {
     logger.step("deploy", "completed", `All ${ordered.length} services deployed.`);
@@ -959,6 +1043,7 @@ export async function deployComposeServices(
       total: ordered.length,
       successful,
       failed: failed.length,
+      indeterminate: 0,
       failedServices: failedNames,
     },
     services: results,

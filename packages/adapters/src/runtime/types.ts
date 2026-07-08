@@ -18,6 +18,7 @@ import type {
   LogEntry,
   LogCallback,
   ContainerInfo,
+  ContainerStatus,
   ResourceUsage,
   ResourceConfig,
   ShellOptions,
@@ -69,7 +70,16 @@ export type RuntimeCapability =
    * `openship.project=<id>` label — so teardown can reclaim it. Docker
    * implements this; Bare/Cloud don't (no label-queryable container set).
    */
-  | "projectContainerSweep";
+  | "projectContainerSweep"
+  /**
+   * Runtime can enumerate the containers for a specific DEPLOYMENT by its
+   * `openship.deployment=<id>` label and report their live state. Powers
+   * reconciliation: after a connection-loss deploy, we read back what's
+   * actually running to resolve `reconciling` → ready/failed and detect
+   * drift. Docker implements this; Bare/Cloud don't (no label-queryable set)
+   * and reconcile falls back to per-container `getContainerInfo`.
+   */
+  | "deploymentContainerQuery";
 
 // ─── Interface ───────────────────────────────────────────────────────────────
 
@@ -126,6 +136,16 @@ export interface RuntimeAdapter {
    * present when `supports("projectContainerSweep")`.
    */
   listProjectContainerIds?(projectId: string): Promise<string[]>;
+
+  /**
+   * List the containers this runtime owns for `deploymentId`, matched by the
+   * `openship.deployment` label, with their live status + service name. Used
+   * by reconciliation to read back the true state of a connection-loss deploy.
+   * Only present when `supports("deploymentContainerQuery")`.
+   */
+  listDeploymentContainers?(
+    deploymentId: string,
+  ): Promise<Array<{ containerId: string; status: ContainerStatus; serviceName?: string }>>;
 
   // ── Observability ────────────────────────────────────────────────────
 

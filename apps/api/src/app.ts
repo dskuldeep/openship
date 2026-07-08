@@ -37,6 +37,8 @@ import { reconcileAllSchedules } from "./modules/backups/triggers/cron";
 import { scheduleRetentionPrune } from "./modules/backups/retention-prune";
 import { scheduleAuditPrune } from "./modules/audit/audit-prune-schedule";
 import { schedulePendingGrantPrune } from "./modules/permissions/pending-grant-prune-schedule";
+import { scheduleOrphanGc } from "./modules/projects/orphan-gc-schedule";
+import { scheduleReconcile } from "./modules/deployments/reconcile-schedule";
 import { scheduleBillingAnniversary } from "./modules/billing/billing-anniversary.cron";
 import { backupOrchestrator } from "./modules/backups/backup.orchestrator";
 import { getJobRunner } from "./lib/job-runner";
@@ -236,6 +238,17 @@ if (env.CLOUD_MODE) {
 
   void scheduleAuditPrune().catch((err) =>
     console.warn("[boot] scheduleAuditPrune failed:", err),
+  );
+
+  // Hourly GC of resources orphaned by an enforced (server-unreachable) delete.
+  void scheduleOrphanGc().catch((err) =>
+    console.warn("[boot] scheduleOrphanGc failed:", err),
+  );
+
+  // Every 10 min: settle deployments left `reconciling` by a connection-loss
+  // deploy, once their host is reachable again.
+  void scheduleReconcile().catch((err) =>
+    console.warn("[boot] scheduleReconcile failed:", err),
   );
 
   // Hourly billing-period rollover — re-arms Oblien quota for orgs

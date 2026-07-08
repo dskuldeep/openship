@@ -322,7 +322,14 @@ async function finalizeComposeDeploy(opts: {
     console.warn(`[build] rollup/Checks emission failed for ${dep.id}:`, err);
   }
 
-  await archivePreviousDeployment(dep, project, logger);
+  // Don't archive the previous deployment while THIS one is still `reconciling`
+  // (connection lost, outcome unverified) — archiving now could prematurely
+  // retire a still-live predecessor before we know the new deploy succeeded.
+  // Reconciliation settles the status; archival waits for a confirmed ready.
+  const settled = await repos.deployment.findById(dep.id).catch(() => null);
+  if (settled?.status !== "reconciling") {
+    await archivePreviousDeployment(dep, project, logger);
+  }
 }
 
 async function executeBuildAndDeploy(project: Project, dep: Deployment, buildSessionId: string) {

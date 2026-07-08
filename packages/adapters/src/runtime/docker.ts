@@ -33,6 +33,7 @@ import type {
   LogEntry,
   LogCallback,
   ContainerInfo,
+  ContainerStatus,
   ResourceUsage,
   ShellOptions,
   ShellSession,
@@ -42,20 +43,13 @@ import { PassThrough, Writable } from "node:stream";
 
 /**
  * Detect "not found" errors from the Docker SDK (dockerode). The daemon
- * returns HTTP 404 for missing containers/images/volumes/networks; dockerode
- * surfaces this as an Error with `.statusCode === 404` (and a message
- * containing "no such container/image/..."). Used to make destroy /
- * removeImage idempotent across partial-cleanup retries.
+ * returns HTTP 404 for missing containers/images/volumes/networks. Used to make
+ * destroy / removeImage idempotent across partial-cleanup retries, and to
+ * distinguish ABSENT (drift / idempotent success) from UNREACHABLE. Shared
+ * implementation lives in system/errors so the reconcile/cleanup paths key off
+ * the same rule.
  */
-function isDockerNotFoundError(err: unknown): boolean {
-  if (!err || typeof err !== "object") return false;
-  const e = err as { statusCode?: number; reason?: string; message?: string };
-  if (e.statusCode === 404) return true;
-  if (typeof e.message === "string" && /no such (container|image|volume|network)/i.test(e.message)) {
-    return true;
-  }
-  return false;
-}
+const isDockerNotFoundError = isRuntimeNotFoundError;
 
 /** Clamp a terminal window dimension to a sane min/max with default. */
 function clampShellWindow(
@@ -70,6 +64,7 @@ function clampShellWindow(
   return Math.floor(n);
 }
 import type { Feature, SystemLog } from "../system/types";
+import { isRuntimeNotFoundError } from "../system/errors";
 
 import type {
   RuntimeAdapter,
@@ -304,6 +299,7 @@ export class DockerRuntime implements RuntimeAdapter {
     "rollback",
     "serviceShell",
     "projectContainerSweep",
+    "deploymentContainerQuery",
   ]);
 
   /** Docker honors every extended compose key we currently support. */
@@ -1346,6 +1342,35 @@ export class DockerRuntime implements RuntimeAdapter {
     return containers.map((c) => c.Id);
   }
 
+  /**
+   * Containers labeled for this deployment, with live state — the reconcile
+   * read-back. `State` is dockerode's `running | exited | paused | ...`; map it
+   * to ContainerStatus the same way getContainerInfo does. Absence is conveyed
+   * by an EMPTY list (no container carries the label), which the reconciler
+   * reads as drift for the expected services.
+   */
+  async listDeploymentContainers(
+    deploymentId: string,
+  ): Promise<Array<{ containerId: string; status: ContainerStatus; serviceName?: string }>> {
+    const containers = await this.docker.listContainers({
+      all: true,
+      filters: { label: [`openship.deployment=${deploymentId}`] },
+    });
+    const stateMap: Record<string, ContainerStatus> = {
+      running: "running",
+      restarting: "running",
+      exited: "stopped",
+      paused: "stopped",
+      created: "stopped",
+      dead: "failed",
+    };
+    return containers.map((c) => ({
+      containerId: c.Id,
+      status: stateMap[c.State] ?? "stopped",
+      serviceName: c.Labels?.["openship.service"],
+    }));
+  }
+
   // ── Rollback primitives ──────────────────────────────────────────────
   //
   // Docker semantics:
@@ -1464,7 +1489,19 @@ export class DockerRuntime implements RuntimeAdapter {
 
   async getContainerInfo(containerId: string): Promise<ContainerInfo> {
     const container = this.docker.getContainer(containerId);
-    const data = await container.inspect();
+    let data: Dockerode.ContainerInspectInfo;
+    try {
+      data = await container.inspect();
+    } catch (err) {
+      // ABSENT: the daemon has no such container — it was removed out-of-band.
+      // Report `missing` (drift) rather than throwing; a genuine connection
+      // failure (unreachable host) is NOT 404 and still propagates so callers
+      // can tell "gone" from "can't reach".
+      if (isDockerNotFoundError(err)) {
+        return { containerId, status: "missing" };
+      }
+      throw err;
+    }
 
     const statusMap: Record<string, ContainerInfo["status"]> = {
       running: "running",

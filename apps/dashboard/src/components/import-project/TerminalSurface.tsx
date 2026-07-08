@@ -107,6 +107,16 @@ const TerminalSurface: React.FC<TerminalSurfaceProps> = ({
 
       const containerElement = containerRef.current;
       const fit = () => {
+        // xterm's fit()/scrollToBottom() reach into the renderer, which has no
+        // `dimensions` until the container is actually laid out. Calling them on
+        // a 0-size or detached node (hidden panel, mid mount/unmount) leaves the
+        // renderer half-initialized and throws "reading 'dimensions'" in a LATER
+        // animation frame — outside this try/catch — which both crashes the
+        // overlay and corrupts the terminal so the stream won't paint until a
+        // refresh. Skip until it's visible and still mounted.
+        if (targetRef.current !== terminal) return;
+        if (!containerElement.isConnected) return;
+        if (containerElement.offsetWidth === 0 || containerElement.offsetHeight === 0) return;
         try {
           fitAddon.fit();
           terminal.scrollToBottom();

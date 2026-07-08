@@ -1,4 +1,4 @@
-import { eq, and, desc, inArray, sql } from "drizzle-orm";
+import { eq, and, desc, inArray, ne, sql } from "drizzle-orm";
 import { generateId } from "@repo/core";
 import type { Database } from "../client";
 import { deployment, buildSession } from "../schema";
@@ -20,6 +20,17 @@ export function createDeploymentRepo(db: Database) {
       return db.query.deployment.findFirst({
         where: eq(deployment.id, id),
       });
+    },
+
+    /** All deployments in a given status (e.g. "reconciling") — drives the
+     *  reconcile sweep. Bounded to avoid pulling an unbounded history. */
+    async listByStatus(status: string, limit = 200) {
+      return db
+        .select()
+        .from(deployment)
+        .where(eq(deployment.status, status))
+        .orderBy(desc(deployment.createdAt))
+        .limit(limit);
     },
 
     async listByProject(
@@ -147,6 +158,26 @@ export function createDeploymentRepo(db: Database) {
         .update(deployment)
         .set({ status, ...extra, updatedAt: new Date() })
         .where(eq(deployment.id, id));
+    },
+
+    /** Mark every `reconciling` deployment for a project (other than `exceptId`)
+     *  as failed — a newer deploy supersedes them. Status only; no runtime
+     *  teardown. Returns the number of rows affected is not needed by callers. */
+    async supersedeReconciling(projectId: string, exceptId: string) {
+      await db
+        .update(deployment)
+        .set({
+          status: "failed",
+          errorMessage: "Superseded by a newer deployment before verification completed.",
+          updatedAt: new Date(),
+        })
+        .where(
+          and(
+            eq(deployment.projectId, projectId),
+            eq(deployment.status, "reconciling"),
+            ne(deployment.id, exceptId),
+          ),
+        );
     },
 
     async setContainerId(id: string, containerId: string, url?: string) {

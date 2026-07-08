@@ -650,6 +650,17 @@ export async function createQueuedDeployment(opts: {
     throw err;
   }
 
+  // Supersede any lingering `reconciling` deployment for this project (a prior
+  // connection-loss deploy that never got verified). This new deploy replaces
+  // it, so mark the old one `failed` — status only, no container destroy: the
+  // compose in-place replacement path handles the old containers, and an
+  // unreachable host would just hang here. Best-effort.
+  await repos.deployment
+    .supersedeReconciling(opts.projectId, dep.id)
+    .catch((err) =>
+      console.warn(`[build] supersede reconciling for ${opts.projectId} failed:`, err),
+    );
+
   return dep;
 }
 
