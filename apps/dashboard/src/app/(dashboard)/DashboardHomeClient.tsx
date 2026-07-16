@@ -142,7 +142,7 @@ export default function DashboardHomeClient({ initialData }: DashboardHomeClient
                   {projects.length > 6 && (
                     <Link
                       href="/projects"
-                      className="block px-5 py-3 text-center text-sm font-medium text-muted-foreground hover:text-foreground hover:bg-muted/40 transition-colors"
+                      className="block px-5 py-3 text-center text-sm text-muted-foreground/70 hover:text-foreground hover:bg-muted/40 transition-colors"
                     >
                       View all {projects.length} projects →
                     </Link>

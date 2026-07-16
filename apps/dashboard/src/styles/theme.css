@@ -55,16 +55,16 @@
   --th-sf-06: rgba(0,0,0,.06);
   --th-sf-08: rgba(0,0,0,.08);
 
-  /* ─ Text ─ */
+  /* ─ Text ─ (gentle legibility bump; keeps the light/airy feel) */
   --th-text-heading:   rgba(0,0,0,1);
   --th-text-title:     rgba(0,0,0,.92);
   --th-text-strong:    rgba(0,0,0,.82);
-  --th-text-body:      rgba(0,0,0,.60);
-  --th-text-secondary: rgba(0,0,0,.50);
-  --th-text-muted:     rgba(0,0,0,.42);
-  --th-text-label:     rgba(0,0,0,.44);
-  --th-text-hint:      rgba(0,0,0,.38);
-  --th-text-ghost:     rgba(0,0,0,.18);
+  --th-text-body:      rgba(0,0,0,.66);
+  --th-text-secondary: rgba(0,0,0,.58);
+  --th-text-muted:     rgba(0,0,0,.52);
+  --th-text-label:     rgba(0,0,0,.52);
+  --th-text-hint:      rgba(0,0,0,.46);
+  --th-text-ghost:     rgba(0,0,0,.22);
 
   /* ─ Page / layout ─ */
   --th-bg-page:        #ffffff;
@@ -151,16 +151,16 @@
   --th-sf-06: rgba(255,255,255,.06);
   --th-sf-08: rgba(255,255,255,.08);
 
-  /* ─ Text ─ */
+  /* ─ Text ─ (gentle legibility bump; keeps the light/airy feel) */
   --th-text-heading:   #ffffff;
   --th-text-title:     rgba(255,255,255,.95);
   --th-text-strong:    rgba(255,255,255,.85);
-  --th-text-body:      rgba(255,255,255,.58);
-  --th-text-secondary: rgba(255,255,255,.48);
-  --th-text-muted:     rgba(255,255,255,.38);
-  --th-text-label:     rgba(255,255,255,.40);
-  --th-text-hint:      rgba(255,255,255,.22);
-  --th-text-ghost:     rgba(255,255,255,.14);
+  --th-text-body:      rgba(255,255,255,.66);
+  --th-text-secondary: rgba(255,255,255,.58);
+  --th-text-muted:     rgba(255,255,255,.50);
+  --th-text-label:     rgba(255,255,255,.50);
+  --th-text-hint:      rgba(255,255,255,.36);
+  --th-text-ghost:     rgba(255,255,255,.22);
 
   /* ─ Page / layout ─ */
   --th-bg-page:        #000000;

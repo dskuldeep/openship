@@ -45,7 +45,10 @@ export default function LibraryPage() {
   const isDesktop = deployMode === "desktop";
   const { connected: cloudConnected, startConnect: startCloudConnect } = useCloud();
 
-  const [activeTab, setActiveTab] = useState<Tab>(selfHosted ? "folder" : "repositories");
+  // Default to the GitHub tab everywhere. When GitHub isn't connected it shows
+  // the connect prompt (a fine call-to-action); the Folder/URL/Template tabs
+  // are one click away for local/self-hosted deploys.
+  const [activeTab, setActiveTab] = useState<Tab>("repositories");
 
   // One "Folder" tab, environment-dependent behavior:
   //   - self-hosted / desktop → deploy straight from a path on the box (native
