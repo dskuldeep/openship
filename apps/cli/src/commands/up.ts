@@ -9,6 +9,17 @@ import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 
 import { ensureDashboard } from "../lib/dashboard";
+import { installAndStart, preview } from "../lib/service";
+
+interface UpOpts {
+  port?: string;
+  dataDir?: string;
+  dashboardPort?: string;
+  ui?: boolean;
+  uiVersion?: string;
+  foreground?: boolean;
+  dryRun?: boolean;
+}
 
 // Inlined at build time by tsup (see tsup.config.ts `define`). Used to pin the
 // dashboard bundle to this CLI's release so the API and UI versions match.
@@ -31,13 +42,60 @@ function ensureAuthSecret(): string {
 }
 
 export const upCommand = new Command("up")
-  .description("Run the Openship control plane locally (bundled API + embedded database)")
+  .description("Start Openship as a persistent service (boot + auto-restart); --foreground to run attached")
   .option("--port <port>", "API port to listen on", "4000")
   .option("--data-dir <dir>", "Directory for the embedded database")
   .option("--dashboard-port <port>", "Dashboard port", "3001")
   .option("--no-ui", "Run the API only — don't download/serve the dashboard")
   .option("--ui-version <tag>", "Dashboard release tag to run (default: this CLI's version)")
-  .action(async (opts) => {
+  .option("-f, --foreground", "Run attached in this terminal instead of as a background service")
+  .option("--dry-run", "Print the service definition that would be installed, then exit")
+  .action(async (opts: UpOpts) => {
+    if (opts.foreground) return runForeground(opts);
+    startService(opts);
+  });
+
+/**
+ * Default `openship up`: install + start Openship as a persistent service that
+ * auto-restarts on crash and starts on boot, running until `openship stop`.
+ */
+function startService(opts: UpOpts): void {
+  const flags = {
+    port: opts.port,
+    dataDir: opts.dataDir,
+    dashboardPort: opts.dashboardPort,
+    ui: opts.ui,
+    uiVersion: opts.uiVersion,
+  };
+  if (opts.dryRun) {
+    const p = preview(flags);
+    console.log(
+      chalk.dim(`\n  service manager: ${p.kind}\n  path: ${p.path}\n\n`) + p.content + "\n",
+    );
+    return;
+  }
+  try {
+    const res = installAndStart(flags);
+    const port = String(opts.port || "4000");
+    const dashPort = String(opts.dashboardPort || "3001");
+    console.log(
+      chalk.green("\n  ✔ Openship is running as a service.\n") +
+        chalk.dim(`  API:       http://localhost:${port}/api\n`) +
+        (opts.ui !== false ? chalk.dim(`  Dashboard: http://localhost:${dashPort}\n`) : "") +
+        chalk.dim(`  ${res.detail}\n`) +
+        chalk.dim("  Starts on boot and auto-restarts. Stop with `openship stop`.\n"),
+    );
+  } catch (e) {
+    console.error(
+      chalk.red(`\n  Couldn't install the service: ${(e as Error).message}\n`) +
+        chalk.dim("  Run `openship up --foreground` to run it attached instead.\n"),
+    );
+    process.exit(1);
+  }
+}
+
+/** Run the API + dashboard attached to this terminal (also what the service runs). */
+async function runForeground(opts: UpOpts): Promise<void> {
     const serverEntry = join(SERVER_DIR, "index.js");
     if (!existsSync(serverEntry)) {
       console.error(
@@ -224,4 +282,4 @@ export const upCommand = new Command("up")
       stopAll();
       process.exit(code ?? 0);
     });
-  });
+}

@@ -85,12 +85,6 @@ export interface CloudClient {
       slug: string;
       target: string;
     }): Promise<{ ok: true; hostname: string } | null>;
-    /** Ownership handshake step 1 — challenge to serve on the target. */
-    requestVerification(
-      target: string,
-    ): Promise<{ id: number; token: string; path: string; target: string } | null>;
-    /** Ownership handshake step 2 — ask Oblien to probe the served token. */
-    checkVerification(id: number): Promise<{ status: string; error?: string } | null>;
   };
   analytics: {
     timeseries<T>(domain: string, params?: Record<string, unknown>): Promise<T | null>;

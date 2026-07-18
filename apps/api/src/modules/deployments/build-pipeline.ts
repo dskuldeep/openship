@@ -66,29 +66,15 @@ import {
 import { type DeploymentConfigSnapshot } from "./build.service";
 import * as settingsService from "../settings/settings.service";
 
-function buildScopedEnvVars(
-  envVars: Record<string, string>,
-  opts?: { forceProductionNodeEnv?: boolean },
-): {
+// Build env = CI/telemetry defaults (BUILD_ENV_VARS) + the customer's own env
+// vars. NODE_ENV is deliberately NOT set or overridden here: it's the customer's
+// to control via their project env vars. Forcing it (e.g. NODE_ENV=production)
+// makes npm/pnpm omit devDependencies, which breaks any build whose tooling
+// (tailwind, postcss, typescript, …) lives in devDependencies.
+function buildScopedEnvVars(envVars: Record<string, string>): {
   envVars: Record<string, string>;
-  ignoredNodeEnv?: string;
 } {
-  const scoped = { ...envVars };
-  let ignoredNodeEnv: string | undefined;
-
-  if (opts?.forceProductionNodeEnv) {
-    ignoredNodeEnv = scoped.NODE_ENV;
-    delete scoped.NODE_ENV;
-  }
-
-  return {
-    envVars: {
-      ...BUILD_ENV_VARS,
-      ...scoped,
-      ...(opts?.forceProductionNodeEnv ? { NODE_ENV: "production" } : {}),
-    },
-    ignoredNodeEnv,
-  };
+  return { envVars: { ...BUILD_ENV_VARS, ...envVars } };
 }
 
 function resolveStaticOutputDirectory(outputDirectory: string, targetPath?: string): string {
@@ -471,23 +457,13 @@ async function executeBuildAndDeploy(project: Project, dep: Deployment, buildSes
     // meta reused via rollback can arrive with it undefined — route through the
     // authority (idempotent for an already-resolved value) instead of a hardcoded
     // "server" fallback that would override the stack default ("local"). Resolved
-    // here, ABOVE isLocalBuild, so every reader in this function sees one value.
+    // here, at the point of use, so every reader below sees one value.
     const buildStrategy = await settingsService.resolveStrategy(
       snapshot.framework,
       snapshot.buildStrategy,
       { deployTarget: snapshot.deployTarget },
     );
-    const isLocalBuild = buildStrategy === "local";
-    const buildEnv = buildScopedEnvVars(envMap, {
-      forceProductionNodeEnv: isLocalBuild,
-    });
-
-    if (isLocalBuild && buildEnv.ignoredNodeEnv && buildEnv.ignoredNodeEnv !== "production") {
-      logger.log(
-        `Ignoring deployment NODE_ENV=${buildEnv.ignoredNodeEnv} during local build and forcing NODE_ENV=production.`,
-        "warn",
-      );
-    }
+    const buildEnv = buildScopedEnvVars(envMap);
 
     // Resolve a fresh GitHub token for cloning private repos.
     // Policy lives in resolveBuildGitToken - local builds keep the broad

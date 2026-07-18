@@ -1,47 +1,17 @@
 import { safeErrorMessage } from "@repo/core";
 import { cloudClient } from "./cloud/client";
-import type { CloudClient } from "./cloud/types";
 import { resolveServerHost } from "./server-target";
-import { armEdgeChallenge, disarmEdgeChallenge } from "./edge-challenge-store";
 
 const NO_CLOUD_MEMBER =
   "Cannot sync edge proxy: no member of this organization has linked Openship Cloud";
 
-/** Oblien rejects create/enable against a target it hasn't ownership-verified. */
-function isTargetUnverified(err: unknown): boolean {
-  return err instanceof Error && /target_unverified|ownership is not verified/i.test(err.message);
-}
-
-/**
- * Prove control of `target` to Oblien (one-time, reused ~90 days). Ask for a
- * challenge, serve the token at /.well-known/oblien-proxy-challenge/<token>
- * (via edge-challenge-store + the app route) so Oblien's synchronous probe in
- * checkVerification sees it, then confirm. Throws if the check doesn't pass.
- */
-async function verifyEdgeTarget(edge: CloudClient["edgeProxy"], target: string): Promise<void> {
-  const challenge = await edge.requestVerification(target);
-  if (!challenge) throw new Error(NO_CLOUD_MEMBER);
-  await armEdgeChallenge(challenge.token);
-  try {
-    const check = await edge.checkVerification(challenge.id);
-    if (!check || check.status !== "verified") {
-      throw new Error(
-        `Edge target ownership verification failed: ${check?.error ?? check?.status ?? "unknown"}`,
-      );
-    }
-  } finally {
-    await disarmEdgeChallenge(challenge.token);
-  }
-}
-
 /**
  * Ensure an Oblien edge proxy exists for a managed deploy slug.
  *
- * Sends slug + target host to the SaaS, which normalizes to `https://<host>`
- * and forwards to Oblien with the org's namespace token. If Oblien rejects the
- * target as unverified (its ownership gate), we run the one-time verification
- * handshake and retry — subsequent slugs to the same host reuse that
- * verification, so it only fires on the first unverified sync.
+ * Sends slug + target host to the SaaS, which forwards to Oblien with the org's
+ * namespace token. Oblien resolves + pins the target IP (its SSRF guard) and
+ * scopes the slug to the namespace — no ownership challenge needed, so this is
+ * a plain best-effort sync.
  */
 export async function ensureManagedEdgeProxy(
   organizationId: string,
@@ -54,20 +24,8 @@ export async function ensureManagedEdgeProxy(
   if (!target) {
     throw new Error("Cannot configure edge proxy: target host could not be resolved");
   }
-
-  const edge = cloudClient({ organizationId }).edgeProxy;
-  const sync = async () => {
-    const result = await edge.sync({ slug, target });
-    if (!result) throw new Error(NO_CLOUD_MEMBER);
-  };
-
-  try {
-    await sync();
-  } catch (err) {
-    if (!isTargetUnverified(err)) throw err;
-    await verifyEdgeTarget(edge, target);
-    await sync(); // target now verified → create/enable succeeds
-  }
+  const result = await cloudClient({ organizationId }).edgeProxy.sync({ slug, target });
+  if (!result) throw new Error(NO_CLOUD_MEMBER);
 }
 
 export interface ManagedEdgeTarget {

@@ -9,22 +9,6 @@
 import { SYSTEM } from "@repo/core";
 import { getNamespaceClient } from "../../lib/openship-cloud";
 
-/**
- * Normalize a target to a single canonical `https://<host[:port][/path]>` form.
- *
- * Two reasons this is forced to https, not "preserve what's given":
- *  - Oblien keys verification per EXACT target string and probes/proxies with
- *    redirects disabled. Our origins force http→https on :80, so an `http://`
- *    target always fails the check — and this service only ever handles the
- *    managed free-domain edge, whose origin is the :443 OpenResty edge.
- *  - Verification and create MUST use the identical string; normalizing in one
- *    place (used by request/check/create alike) guarantees that.
- */
-export function normalizeEdgeTarget(target: string): string {
-  const hostPart = target.trim().replace(/^https?:\/\//i, "");
-  return `https://${hostPart}`;
-}
-
 export async function syncCloudEdgeProxy(
   organizationId: string,
   input: { slug: string; target: string },
@@ -40,7 +24,10 @@ export async function syncCloudEdgeProxy(
 
   const baseDomain = SYSTEM.DOMAINS.CLOUD_DOMAIN;
   const hostname = `${slug}.${baseDomain}`;
-  const target = normalizeEdgeTarget(input.target);
+  const target =
+    input.target.startsWith("http://") || input.target.startsWith("https://")
+      ? input.target
+      : `http://${input.target}`;
 
   const { client, namespace } = await getNamespaceClient(organizationId);
 
@@ -69,33 +56,4 @@ export async function syncCloudEdgeProxy(
   }
 
   return { ok: true, hostname };
-}
-
-/**
- * Step 1 of the ownership handshake: ask Oblien for a challenge to prove control
- * of `target`. Returns the token + path the caller must serve (HTTP 200, exact
- * body) at `https://<host><path>` before {@link checkTargetVerification}.
- * Normalizes the target identically to create so the records line up.
- */
-export async function requestTargetVerification(
-  organizationId: string,
-  rawTarget: string,
-): Promise<{ id: number; token: string; path: string; target: string }> {
-  const target = normalizeEdgeTarget(rawTarget);
-  const { client } = await getNamespaceClient(organizationId);
-  const { verification } = await client.edgeProxy.requestVerification(target);
-  return { id: verification.id, token: verification.token, path: verification.path, target };
-}
-
-/**
- * Step 2: tell Oblien to probe the served token. On success the target is
- * verified for ~90 days (per user+target), reusable across every slug to it.
- */
-export async function checkTargetVerification(
-  organizationId: string,
-  verificationId: number,
-): Promise<{ status: string; error?: string }> {
-  const { client } = await getNamespaceClient(organizationId);
-  const { verification } = await client.edgeProxy.checkVerification(verificationId);
-  return { status: verification.status, error: verification.error };
 }

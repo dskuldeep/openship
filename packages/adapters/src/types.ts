@@ -21,11 +21,13 @@ export interface ResourceConfig {
   diskMb: number;
 }
 
-/** Single source of truth - production resources */
+/** Single source of truth - production/runtime resources (the free-tier limit).
+ *  Deliberately small: a runtime doesn't need build-sized resources, and cloud
+ *  runtimes are shrunk to this after the build so they don't hog the pool. */
 export const DEFAULT_RESOURCE_CONFIG: ResourceConfig = {
   cpuCores: 1,
   memoryMb: 512,
-  diskMb: 4096,
+  diskMb: 5120,
 };
 
 /** Single source of truth - build resources. Sized for memory-hungry

@@ -12,7 +12,6 @@ import { migrationGuard } from "./middleware/migration-guard";
 import { initPlatform } from "@repo/adapters";
 import { resolvePlatformConfig } from "./lib/controller-helpers";
 import { runWithRequestStore } from "./lib/request-store";
-import { isEdgeChallengeArmed } from "./lib/edge-challenge-store";
 
 import { authRoutes } from "./modules/auth/auth.routes";
 import { auth } from "./lib/auth";
@@ -139,15 +138,6 @@ app.route("/api/notifications", notificationsRoutes);
 // so `Authorization`-less requests to /api/mcp can be discovered end-to-end.
 app.get("/.well-known/oauth-authorization-server", (c) => oauthAuthServerMetadata(c.req.raw));
 app.get("/.well-known/oauth-protected-resource", (c) => oauthProtectedResourceMetadata(c.req.raw));
-
-/* ---------- Oblien edge ownership challenge ---------- */
-// Served (plain 200, body = exact token) only while a token is armed during the
-// edge target-verification handshake. The edge proxies this path to us on :443.
-app.get("/.well-known/oblien-proxy-challenge/:token", async (c) => {
-  const token = c.req.param("token");
-  if (await isEdgeChallengeArmed(token)) return c.text(token, 200);
-  return c.text("not found", 404);
-});
 
 /* ---------- OAuth callback landing pages ---------- */
 const authCallbackHtml = `<!DOCTYPE html><html><head><title>Success</title></head><body><script>window.close();</script><p>Authentication successful. You can close this window.</p></body></html>`;

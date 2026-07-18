@@ -150,6 +150,14 @@ export class CloudComposeSupport {
         builtArtifact?.workspaceId ?? (await this.createImageServiceWorkspace(config, log));
       const ws = this.deps.workspace(workspaceId);
 
+      // A source-built server reuses its build workspace as the runtime, so it
+      // must be shrunk from the build tier to its production tier before going
+      // live (mandatory — see shrinkToRuntimeTier). Image services skip this:
+      // createImageServiceWorkspace already sized them at the prod tier.
+      if (builtArtifact?.workspaceId) {
+        await this.shrinkToRuntimeTier(ws, config, log);
+      }
+
       await withCloudOperationTimeout(
         ws.lifecycle.makePermanent(),
         `Making cloud service "${config.serviceName}" permanent`,
@@ -311,6 +319,42 @@ export class CloudComposeSupport {
       }
       throw err;
     }
+  }
+
+  /**
+   * Shrink a source-built server's workspace from the BUILD tier (4cpu/8GB/10GB)
+   * down to its production/runtime tier. The build workspace is reused as the
+   * runtime, so without this every deployed app holds build-sized resources
+   * permanently and saturates the cloud pool — new builds then fail to place
+   * (CREATE_FAILED).
+   *
+   * Mandatory by design: a resize failure THROWS and fails the deploy. Leaving a
+   * service oversized is not an acceptable escape hatch — it silently poisons the
+   * shared pool. (cpu + memory are the pool/cost constraint; disk isn't in the
+   * deploy config and shrinking a data volume is unreliable, so it's left alone.)
+   */
+  private async shrinkToRuntimeTier(
+    ws: WorkspaceHandle,
+    config: MultiServiceDeployConfig,
+    log: LogCallback,
+  ): Promise<void> {
+    const cpus = config.resources?.cpuCores ?? DEFAULT_RESOURCE_CONFIG.cpuCores;
+    const memory_mb = config.resources?.memoryMb ?? DEFAULT_RESOURCE_CONFIG.memoryMb;
+    try {
+      await withCloudOperationTimeout(
+        ws.resources.update({ cpus, memory_mb, apply: true }),
+        `Resizing service "${config.serviceName}" to its runtime tier`,
+      );
+    } catch (err) {
+      throw new Error(
+        `Failed to shrink service "${config.serviceName}" from the build tier to its runtime tier: ${errorMessage(err)}`,
+      );
+    }
+    log({
+      timestamp: now(),
+      message: `Sized "${config.serviceName}" to its runtime tier (${cpus} vCPU · ${memory_mb} MB).\n`,
+      level: "info",
+    });
   }
 
   private async createImageServiceWorkspace(

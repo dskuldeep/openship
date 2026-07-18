@@ -1,10 +1,11 @@
 import React, { useCallback, useEffect, useState } from "react";
-import { KeyRound, Plus, Trash2, Loader2, Eye, EyeOff } from "lucide-react";
+import { KeyRound, Plus, Trash2, Loader2, Eye, EyeOff, RefreshCw } from "lucide-react";
 import { Modal } from "@/components/ui/Modal";
-import { projectsApi } from "@/lib/api";
+import { projectsApi, deployApi } from "@/lib/api";
 import { getApiErrorMessage } from "@/lib/api/client";
 import { useToast } from "@/context/ToastContext";
 import { useI18n } from "@/components/i18n-provider";
+import { useProjectSettings } from "@/context/ProjectSettingsContext";
 import { computeEnvDiff } from "./env-diff";
 
 /**
@@ -44,6 +45,8 @@ export function EnvVarsEditor({
 }) {
   const { showToast } = useToast();
   const { t } = useI18n();
+  const { projectData } = useProjectSettings();
+  const hasActiveDeployment = Boolean(projectData?.activeDeploymentId);
   const [rows, setRows] = useState<Row[]>([]);
   // Keys that existed when the editor loaded — needed to detect deletions
   // (a removed row is gone from `rows`, so its key must be remembered here).
@@ -51,6 +54,11 @@ export function EnvVarsEditor({
   const [loading, setLoading] = useState(false);
   const [saving, setSaving] = useState(false);
   const [reveal, setReveal] = useState<Record<string, boolean>>({});
+  // Set after a successful save when there's a live deployment: shows the
+  // "Apply (restart, no rebuild)" affordance so the change reaches the running
+  // service without a full clone+build.
+  const [pendingApply, setPendingApply] = useState(false);
+  const [applying, setApplying] = useState(false);
 
   const load = useCallback(async () => {
     setLoading(true);
@@ -78,6 +86,7 @@ export function EnvVarsEditor({
   useEffect(() => {
     if (isOpen) {
       setReveal({});
+      setPendingApply(false);
       void load();
     }
   }, [isOpen, load]);
@@ -110,11 +119,35 @@ export function EnvVarsEditor({
     try {
       await projectsApi.mergeEnv(projectId, { environment: ENVIRONMENT, upserts, deletes });
       showToast(t.projectSettings.envVars.toast.saved, "success", t.projectSettings.envVars.toast.savedTitle);
-      onClose();
+      // A persisted env change only reaches the RUNNING service on a deploy.
+      // If something is deployed, keep the editor open and offer the no-rebuild
+      // refresh; otherwise there's nothing to apply (it lands on the next deploy).
+      if (hasActiveDeployment) {
+        await load(); // re-sync so the diff resets to the saved state
+        setPendingApply(true);
+      } else {
+        onClose();
+      }
     } catch (err) {
       showToast(getApiErrorMessage(err, t.projectSettings.envVars.toast.saveFailed), "error", t.projectSettings.envVars.toast.saveFailedTitle);
     } finally {
       setSaving(false);
+    }
+  };
+
+  // Apply the saved env to the live service WITHOUT a rebuild: the server's
+  // `refresh` deploy mode recreates the service from its existing image with the
+  // new env (no git clone, no build). The full-rebuild "Redeploy" stays separate.
+  const handleApply = async () => {
+    setApplying(true);
+    try {
+      await deployApi.trigger({ projectId, refresh: true });
+      showToast(t.projectSettings.envVars.toast.applying, "success", t.projectSettings.envVars.toast.applyingTitle);
+      onClose();
+    } catch (err) {
+      showToast(getApiErrorMessage(err, t.projectSettings.envVars.toast.applyFailed), "error", t.projectSettings.envVars.toast.applyFailedTitle);
+    } finally {
+      setApplying(false);
     }
   };
 
@@ -129,24 +162,47 @@ export function EnvVarsEditor({
           <button
             type="button"
             onClick={onClose}
-            disabled={saving}
+            disabled={saving || applying}
             className="rounded-lg border border-border/60 bg-muted/30 px-3.5 py-2 text-sm font-medium text-foreground transition-colors hover:bg-muted/50 disabled:opacity-50"
           >
-            {t.projectSettings.envVars.cancel}
+            {pendingApply ? t.projectSettings.envVars.close : t.projectSettings.envVars.cancel}
           </button>
-          <button
-            type="button"
-            onClick={handleSave}
-            disabled={saving || loading}
-            className="inline-flex items-center gap-1.5 rounded-lg bg-foreground px-3.5 py-2 text-sm font-medium text-background transition-colors hover:bg-foreground/90 disabled:opacity-50"
-          >
-            {saving ? <Loader2 className="size-3.5 animate-spin" /> : null}
-            {t.projectSettings.envVars.saveChanges}
-          </button>
+          {pendingApply ? (
+            <button
+              type="button"
+              onClick={handleApply}
+              disabled={applying}
+              className="inline-flex items-center gap-1.5 rounded-lg bg-foreground px-3.5 py-2 text-sm font-medium text-background transition-colors hover:bg-foreground/90 disabled:opacity-50"
+            >
+              {applying ? <Loader2 className="size-3.5 animate-spin" /> : <RefreshCw className="size-3.5" />}
+              {t.projectSettings.envVars.applyButton}
+            </button>
+          ) : (
+            <button
+              type="button"
+              onClick={handleSave}
+              disabled={saving || loading}
+              className="inline-flex items-center gap-1.5 rounded-lg bg-foreground px-3.5 py-2 text-sm font-medium text-background transition-colors hover:bg-foreground/90 disabled:opacity-50"
+            >
+              {saving ? <Loader2 className="size-3.5 animate-spin" /> : null}
+              {t.projectSettings.envVars.saveChanges}
+            </button>
+          )}
         </div>
       }
     >
       <div className="space-y-4 p-6">
+        {pendingApply && (
+          <div className="flex items-start gap-3 rounded-xl border border-primary/25 bg-primary/5 px-4 py-3">
+            <RefreshCw className="mt-0.5 size-4 shrink-0 text-primary" />
+            <div className="min-w-0">
+              <p className="text-sm font-medium text-foreground">{t.projectSettings.envVars.applyTitle}</p>
+              <p className="mt-0.5 text-[13px] leading-relaxed text-muted-foreground">
+                {t.projectSettings.envVars.applyText}
+              </p>
+            </div>
+          </div>
+        )}
         <div className="flex items-start gap-3">
           <div className="flex h-9 w-9 shrink-0 items-center justify-center rounded-xl bg-muted/60 text-muted-foreground">
             <KeyRound className="size-4" />

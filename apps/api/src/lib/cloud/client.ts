@@ -236,35 +236,6 @@ export function cloudClient(scope: CloudClientScope): CloudClient {
         const body = await readCloudJson<{ ok: true; hostname: string }>(res);
         return body ?? null;
       },
-      async requestVerification(target) {
-        const res = await fetchScoped("/api/cloud/edge-proxy/verify-request", {
-          method: "POST",
-          body: JSON.stringify({ target }),
-        });
-        if (!res) return null;
-        if (!res.ok) {
-          const text = await res.text().catch(() => "");
-          throw new Error(`Edge verification request failed (${res.status}): ${text}`);
-        }
-        const body = await readCloudJson<{
-          ok: true;
-          verification: { id: number; token: string; path: string; target: string };
-        }>(res);
-        return body?.verification ?? null;
-      },
-      async checkVerification(id) {
-        const res = await fetchScoped("/api/cloud/edge-proxy/verify-check", {
-          method: "POST",
-          body: JSON.stringify({ id }),
-        });
-        if (!res) return null;
-        if (!res.ok) {
-          const text = await res.text().catch(() => "");
-          throw new Error(`Edge verification check failed (${res.status}): ${text}`);
-        }
-        const body = await readCloudJson<{ ok: true; status: string; error?: string }>(res);
-        return body ?? null;
-      },
     },
 
     analytics: {

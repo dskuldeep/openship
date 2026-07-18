@@ -36,7 +36,15 @@ The `curl | sh` one-liner targets Linux and macOS. On Windows, use the **Windows
 openship up
 ```
 
-This starts the full platform locally — the API on `:4000` and the dashboard on `:3001` (downloaded on first run) — backed by an embedded database, with no external services to configure. Local access needs no login. Pass `--no-ui` for API-only.
+This installs Openship as a background service that **starts on boot and auto-restarts** — the API on `:4000` and the dashboard on `:3001` (downloaded on first run), backed by an embedded database, no external services to configure. Local access needs no login.
+
+```bash
+openship stop              # stop the service (won't restart or return on reboot)
+openship up --foreground   # run attached in this terminal instead (one-off)
+openship up --no-ui        # API only, no dashboard
+```
+
+Under the hood it registers with your OS service manager: **systemd** on Linux (a `--user` unit with linger, or a system unit when run as root), **launchd** on macOS (a LaunchAgent), or a **Scheduled Task** on Windows (best-effort — `--foreground` or the desktop app are the reliable options there).
 
 ### Docker Compose
 

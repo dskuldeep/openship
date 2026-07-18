@@ -10,6 +10,7 @@ import { openCommand } from "./commands/open";
 
 // Run & workspace
 import { upCommand } from "./commands/up";
+import { stopCommand } from "./commands/stop";
 import { initCommand } from "./commands/init";
 import { contextCommand } from "./commands/context";
 import { statusCommand } from "./commands/status";
@@ -56,6 +57,7 @@ program
 
 // Run the platform / auth / workspace
 program.addCommand(upCommand);
+program.addCommand(stopCommand);
 program.addCommand(installCommand);
 program.addCommand(updateCommand);
 program.addCommand(openCommand);

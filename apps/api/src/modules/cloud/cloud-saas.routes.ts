@@ -38,10 +38,6 @@ r.post("/preflight", { tag: "cloud:write" }, saas.preflight);
 
 r.use("/edge-proxy", cloudSessionAuth);
 r.post("/edge-proxy", { tag: "cloud:write" }, saas.syncEdgeProxy);
-r.use("/edge-proxy/verify-request", cloudSessionAuth);
-r.post("/edge-proxy/verify-request", { tag: "cloud:write" }, saas.requestEdgeVerification);
-r.use("/edge-proxy/verify-check", cloudSessionAuth);
-r.post("/edge-proxy/verify-check", { tag: "cloud:write" }, saas.checkEdgeVerification);
 
 r.use("/analytics", cloudSessionAuth);
 r.post("/analytics", { tag: "cloud:write" }, saas.analyticsProxy);

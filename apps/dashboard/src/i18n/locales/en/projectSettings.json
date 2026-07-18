@@ -154,6 +154,10 @@
   "envVars": {
     "cancel": "Cancel",
     "saveChanges": "Save changes",
+    "close": "Close",
+    "applyTitle": "Apply without a rebuild",
+    "applyText": "Saved. Apply these to the running service — it restarts with the new env, no clone or rebuild.",
+    "applyButton": "Apply (restart, no rebuild)",
     "title": "Environment variables",
     "description": "Production. Encrypted at rest. Secrets show as set — type to replace; leave blank to keep.",
     "empty": "No environment variables yet.",
@@ -173,7 +177,11 @@
       "saved": "Environment variables saved",
       "savedTitle": "Saved",
       "saveFailed": "Failed to save environment variables",
-      "saveFailedTitle": "Save failed"
+      "saveFailedTitle": "Save failed",
+      "applying": "Restarting the service with the new env — no rebuild.",
+      "applyingTitle": "Applying",
+      "applyFailed": "Couldn't apply the env to the running service",
+      "applyFailedTitle": "Apply failed"
     }
   },
   "gitInfo": {

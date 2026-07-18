@@ -39,10 +39,10 @@
 
 ```bash
 npm i -g openship     # or: curl -fsSL https://get.openship.io | sh
-openship up           # runs Openship locally (API + dashboard); prints the URL
+openship up           # installs Openship as a background service (starts on boot, auto-restarts)
 ```
 
-That's it — `openship open` opens the dashboard. To deploy a project:
+`openship open` opens the dashboard; `openship stop` stops the service. Want a one-off attached run instead? `openship up --foreground`. To deploy a project:
 
 ```bash
 cd your-project

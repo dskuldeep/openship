@@ -19,13 +19,22 @@ npm i -g openship      # or: pnpm add -g openship / yarn global add openship / b
 
 ### `openship up`
 
-Run the whole platform locally — bundled API + embedded database, plus the dashboard (lazy-downloaded on first run). Local access needs no login (loopback).
+Install + start Openship as a **persistent background service** — bundled API + embedded database, plus the dashboard (lazy-downloaded on first run). It **starts on boot and auto-restarts** until `openship stop`. Local access needs no login (loopback). Uses systemd (Linux), launchd (macOS), or a Scheduled Task (Windows, best-effort).
 
 ```bash
-openship up                       # API on :4000, dashboard on :3001
-openship up --port 4000 --dashboard-port 3001
+openship up                       # install + start the service (API :4000, dashboard :3001)
+openship up --foreground          # run attached in this terminal instead (one-off)
 openship up --no-ui               # API only, no dashboard
-openship up --data-dir ~/.openship/data
+openship up --dry-run             # print the service definition without installing
+openship up --port 4000 --dashboard-port 3001 --data-dir ~/.openship/data
+```
+
+### `openship stop`
+
+Stop the service started by `openship up` — it won't restart or return on reboot.
+
+```bash
+openship stop
 ```
 
 ### `openship install`

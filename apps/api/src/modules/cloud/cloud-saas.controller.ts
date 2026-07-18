@@ -38,11 +38,7 @@ import {
   type CloudAnalyticsOperation,
 } from "./cloud-analytics.service";
 import { revokeCloudSession } from "./cloud-session.service";
-import {
-  syncCloudEdgeProxy,
-  requestTargetVerification,
-  checkTargetVerification,
-} from "./cloud-edge-proxy.service";
+import { syncCloudEdgeProxy } from "./cloud-edge-proxy.service";
 import {
   createCloudPage,
   dispatchCloudPageAction,
@@ -407,39 +403,6 @@ export async function syncEdgeProxy(c: Context) {
     return c.json({ ok: true, hostname: result.hostname });
   } catch (err) {
     return oblienErrorResponse(c, err, "Failed to sync edge proxy");
-  }
-}
-
-/**
- * POST /api/cloud/edge-proxy/verify-request  { target }
- * Ownership handshake step 1 — proxied to Oblien's requestVerification. Returns
- * the challenge { id, token, path } the caller serves on the target's :443.
- */
-export async function requestEdgeVerification(c: Context) {
-  const ctx = getRequestContext(c);
-  const body = await c.req.json<{ target?: string }>();
-  if (!body.target) return c.json({ error: "target is required" }, 400);
-  try {
-    const verification = await requestTargetVerification(ctx.organizationId, body.target);
-    return c.json({ ok: true, verification });
-  } catch (err) {
-    return oblienErrorResponse(c, err, "Failed to request target verification");
-  }
-}
-
-/**
- * POST /api/cloud/edge-proxy/verify-check  { id }
- * Ownership handshake step 2 — proxied to Oblien's checkVerification.
- */
-export async function checkEdgeVerification(c: Context) {
-  const ctx = getRequestContext(c);
-  const body = await c.req.json<{ id?: number }>();
-  if (typeof body.id !== "number") return c.json({ error: "id is required" }, 400);
-  try {
-    const result = await checkTargetVerification(ctx.organizationId, body.id);
-    return c.json({ ok: true, ...result });
-  } catch (err) {
-    return oblienErrorResponse(c, err, "Failed to check target verification");
   }
 }
 
