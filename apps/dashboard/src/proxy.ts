@@ -19,6 +19,15 @@ const SESSION_COOKIE_SUFFIX = ".session_token";
 
 export function proxy(req: NextRequest) {
   const { pathname, search } = req.nextUrl;
+
+  // Never redirect API routes. The page-auth redirect below is meant for
+  // navigations; applying it to /api/* breaks single-host proxy mode
+  // (NEXT_PUBLIC_API_PROXY=true), where the sign-in POST itself goes to
+  // /api/proxy/api/auth/sign-in/email — with no session cookie yet, it
+  // was being bounced to /login, making login impossible. API auth is
+  // enforced by the API process, which returns 401 rather than a redirect.
+  if (pathname.startsWith("/api/")) return NextResponse.next();
+
   const isPublic = PUBLIC_ROUTES.some((r) => pathname.startsWith(r));
   const hasCookie = req.cookies.getAll().some((c) => c.name.endsWith(SESSION_COOKIE_SUFFIX));
 
