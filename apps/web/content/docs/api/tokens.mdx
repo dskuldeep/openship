@@ -56,7 +56,7 @@ Each entry in `grants` is a **TokenGrant**:
   type={{
     resourceType: { type: 'string', description: 'One of: project, server, mail_server, backup_destination, billing, audit, github_installation, github_repository.', required: true },
     resourceId: { type: 'string', description: 'The resource id. For github_repository use "owner/repo".', required: true },
-    permissions: { type: '("read" | "write" | "admin")[]', description: 'Actions the token may take on the resource.', required: true },
+    permissions: { type: '("read" | "write" | "admin" | "create")[]', description: 'Actions the token may take on the resource. "create" is a collection-only capability — see the "projects it creates" scope below.', required: true },
   }}
 />
 
@@ -81,6 +81,21 @@ returns the prefix. If you lose it, revoke the token and mint a new one.
 Every grant is validated against your own access before the token is created. An unknown `resourceType`
 returns `400 INVALID_RESOURCE_TYPE`; granting access you don't hold yourself returns `403 GRANT_EXCEEDS_ACCESS`.
 </Callout>
+
+### The "projects it creates" scope
+
+To hand an agent (e.g. an MCP client) the ability to **create new projects and fully manage only the ones
+it creates** — with zero visibility into anything else — give it a single `create` grant on the project
+collection:
+
+```json
+{ "name": "agent", "grants": [{ "resourceType": "project", "resourceId": "*", "permissions": ["create"] }] }
+```
+
+`create` is collection-only: it authorizes `POST /api/projects` and lets the token **list** projects
+(filtered to its own), but grants **no** read/write/admin on any existing project. Each project the token
+creates auto-adds a `{ project, <id>, [read, write, admin] }` grant, so it fully controls its own work and
+nothing else. In the dashboard this is the **"Only projects it creates"** option on the MCP authorize screen.
 
 ## List tokens
 
