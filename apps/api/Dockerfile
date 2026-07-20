@@ -15,8 +15,7 @@ COPY apps/ ./apps/
 # and the BuildKit cache mount reuses bun's download store across builds so a
 # rebuild doesn't re-fetch the graph. (Cache mount needs BuildKit — Compose v2
 # enables it by default.)
-RUN --mount=type=cache,id=bun-install-cache,target=/root/.bun/install/cache \
-    bun install --frozen-lockfile \
+RUN bun install --frozen-lockfile \
  && cd apps/api && bun run build
 
 # ─── Production stage ──────────────────────────────────
