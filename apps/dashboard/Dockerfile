@@ -8,6 +8,7 @@ COPY packages/ ./packages/
 COPY apps/ ./apps/
 
 ENV NEXT_TELEMETRY_DISABLED=1
+ENV NEXT_PUBLIC_API_PROXY=true
 RUN bun install && cd apps/dashboard && bun run build
 
 # ─── Production stage ──────────────────────────────────
@@ -19,5 +20,6 @@ COPY --from=builder /app/apps/dashboard/.next/static ./apps/dashboard/.next/stat
 COPY --from=builder /app/apps/dashboard/public ./apps/dashboard/public
 
 ENV NODE_ENV=production
+ENV NEXT_PUBLIC_API_PROXY=true
 EXPOSE 3001
 CMD ["node", "apps/dashboard/server.js"]
